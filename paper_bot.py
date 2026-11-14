@@ -28,7 +28,7 @@ FEATURES = [
     "Dist_EMA20", "Dist_EMA50", "Dist_EMA200"
 ]
 
-# Base catalog meta with dynamic fallback for any online/custom strategy
+# Comprehensive strategy metadata with dynamic fallback for any new online/local strategy added in app
 STRATEGY_CATALOG_META = {
     "xgb_mtf_v2": {"name": "XGBoost 1H/4H Momentum Classifier", "timeframes": ["1h", "4h"]},
     "xrp_donchian_breakout": {"name": "Donchian Breakout + Supertrend", "timeframes": ["1h", "4h"]},
@@ -74,6 +74,7 @@ class PaperStrategyTrainerAndTester:
     def __init__(self, paper_dir: str, models_dir: str):
         self.paper_dir = paper_dir
         self.models_dir = models_dir
+        # Strictly Paper isolated paths
         self.paper_master_path = os.path.join(models_dir, "PAPER", "UNIFIED_PORTFOLIO_MASTER.json")
         self.live_master_path = os.path.join(models_dir, "LIVE", "UNIFIED_PORTFOLIO_MASTER.json")
         self.legacy_master_path = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
@@ -89,13 +90,25 @@ class PaperStrategyTrainerAndTester:
         interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(timeframe.lower(), "60")
         try:
             resp = requests.get(
-                "https://api.bybit.com/v5/market/kline",
+                "https://api-testnet.bybit.com/v5/market/kline",
                 params={"category": "linear", "symbol": bybit_sym, "interval": interval, "limit": min(bars, 1000)},
                 timeout=12,
             ).json()
             rows = resp.get("result", {}).get("list", [])
         except Exception:
             rows = []
+
+        if not rows:
+            # Fallback to main endpoint public kline if testnet kline is restricted
+            try:
+                resp = requests.get(
+                    "https://api.bybit.com/v5/market/kline",
+                    params={"category": "linear", "symbol": bybit_sym, "interval": interval, "limit": min(bars, 1000)},
+                    timeout=12,
+                ).json()
+                rows = resp.get("result", {}).get("list", [])
+            except Exception:
+                rows = []
 
         if not rows:
             return pd.DataFrame()
@@ -217,8 +230,10 @@ class PaperStrategyTrainerAndTester:
             ))
         if "supertrend" in sid or "sar" in sid:
             return bool((prev["Supertrend"] == 1) if side == "LONG" else (prev["Supertrend"] == -1))
-        # Fallback for online strategies or custom indicators added dynamically
-        return bool((prev["DI_Spread"] > 0) if side == "LONG" else (prev["DI_Spread"] < 0))
+        # Dynamic fallback for any newly added online or custom strategy
+        return bool((prev["DI_Spread"] > 0 and prev["Vol_Surge"] >= 1.05) if side == "LONG" else (
+            prev["DI_Spread"] < 0 and prev["Vol_Surge"] >= 1.05
+        ))
 
     def _simulate_strategy_on_tf(
         self,
@@ -347,6 +362,7 @@ class PaperStrategyTrainerAndTester:
 
         strategies_to_test = active_strategies if active_strategies else ["xgb_mtf_v2"]
 
+        # Filter coins based on user's Crypto / Forex dashboard toggles
         filtered_coins = []
         for sym in added_coins:
             mkt = classify_market(sym)
@@ -459,6 +475,7 @@ class PaperStrategyTrainerAndTester:
             trained_coins[symbol] = coin_entry
             paper_portfolio[symbol] = coin_entry
 
+        # Save to Paper results vault
         with open(self.paper_results_path, "w", encoding="utf-8") as f:
             json.dump({"leverage": leverage, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
 
@@ -471,6 +488,7 @@ class PaperStrategyTrainerAndTester:
             "features": FEATURES,
             "portfolio": paper_portfolio,
         }
+        # Save strictly to PAPER model master path
         with open(self.paper_master_path, "w", encoding="utf-8") as f:
             json.dump(paper_master, f, indent=2)
 
@@ -591,8 +609,8 @@ if __name__ == "__main__":
     else:
         runtime_cfg = {}
 
-    coins = runtime_cfg.get("coins", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "LINK/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT"])
-    strategies = runtime_cfg.get("strategies", ["xgb_mtf_v2", "xrp_donchian_breakout", "cvd_orderflow_div", "funding_arb_mom"])
+    coins = runtime_cfg.get("coins", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "LINK/USDT"])
+    strategies = runtime_cfg.get("strategies", ["xgb_mtf_v2", "xrp_donchian_breakout"])
     timeframes = runtime_cfg.get("timeframes", DEFAULT_TEST_TIMEFRAMES)
     leverage = int(runtime_cfg.get("leverage", DEFAULT_LEVERAGE))
     crypto_enabled = bool(runtime_cfg.get("crypto_enabled", True))
@@ -609,8 +627,8 @@ if __name__ == "__main__":
             added_coins=coins,
             active_strategies=strategies,
             timeframes=timeframes,
-            leverage=leverage,
+        leverage=leverage,
             crypto_enabled=crypto_enabled,
             forex_enabled=forex_enabled,
         )
-        print(f"Trained & evaluated {len(results)} Paper coins successfully across dynamic strategies and timeframes.")
+        print(f"Trained & evaluated {len(results)} Paper coins successfully across dynamic app strategies and coins.")
