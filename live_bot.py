@@ -16,7 +16,12 @@ class LiveAccountTradingBot:
         self.api_key = api_key
         self.api_secret = api_secret
         self.models_dir = models_dir
-        self.master_path = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
+        
+        # Robust path resolution matching app export structure
+        p1 = os.path.join(models_dir, "LIVE", "UNIFIED_PORTFOLIO_MASTER.json")
+        p2 = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
+        self.master_path = p1 if os.path.exists(p1) else p2
+
         self.base_url = "https://api-testnet.bybit.com" if endpoint.lower() == "testnet" else "https://api.bybit.com"
         self.category = "linear"
         self.active_positions = {}
@@ -141,15 +146,15 @@ class LiveAccountTradingBot:
                 os.remove(tmp_path)
         return booster
 
-    def run_live_cycle(self, leverage: int = 10, risk_per_trade_pct: float = 1.0, max_open_positions: int = 2):
+    def run_live_cycle(self, leverage: int = 10, risk_per_trade_pct: float = 1.0, max_open_positions: int = 2, crypto_enabled: bool = True, forex_enabled: bool = False):
         """
-        Dynamically reads whatever coins are present in UNIFIED_PORTFOLIO_MASTER.json.
-        No coins are hardcoded; moving any coin from Paper to Live in the app adds it here automatically.
+        Dynamically reads coins from UNIFIED_PORTFOLIO_MASTER.json, respecting crypto/forex market filters
+        and executing live trades on Bybit with proper leverage, stop loss, and take profit.
         """
         if not os.path.exists(self.master_path):
             raise FileNotFoundError(f"Live Master ML Model not found at {self.master_path}")
 
-        leverage = min(max(int(leverage), 1), 20)  # Enforce max 20x leverage (default 10x)
+        leverage = min(max(int(leverage), 1), 20)
 
         with open(self.master_path, "r", encoding="utf-8") as f:
             master = json.load(f)
@@ -160,9 +165,15 @@ class LiveAccountTradingBot:
             return
 
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
-        avail_usdt = float(bal_res["result"]["list"][0]["totalAvailableBalance"])
+        avail_usdt = float(bal_res.get("result", {}).get("list", [{}])[0].get("totalAvailableBalance", 0.0))
 
         for symbol, entry in portfolio.items():
+            market_type = entry.get("market", "CRYPTO").upper()
+            if market_type == "CRYPTO" and not crypto_enabled:
+                continue
+            if market_type == "FOREX" and not forex_enabled:
+                continue
+
             cfg = entry["config"]
             bybit_sym = cfg.get("bybit_symbol") or symbol.replace("/", "")
             df_raw = self.fetch_bybit_1h_candles(bybit_sym)
