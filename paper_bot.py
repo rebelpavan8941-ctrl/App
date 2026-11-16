@@ -27,7 +27,7 @@ BARS_PER_DAY = {
 }
 
 DEFAULT_TEST_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
-TRAINING_WINDOW_DAYS = 135  # 4.5 months (optimal regime coverage + out-of-sample depth)
+TRAINING_WINDOW_DAYS = 135  # 4.5 months (~135 days) optimal regime coverage
 
 FEATURES = [
     "NATR", "BB_PctB", "BB_Width",
@@ -54,13 +54,21 @@ STRATEGY_CATALOG_META = {
     "macd_hist_zero_cross": {"name": "MACD Histogram Impulse + Zero Cross", "timeframes": ["1h", "4h"]},
     "doge_supertrend_scalp": {"name": "Supertrend Volatility Scalp", "timeframes": ["15m"]},
     "avax_fib_ml_confluence": {"name": "Fibonacci ML Confluence", "timeframes": ["1h"]},
-    "anchored_vwap_reclaim_v3": {"name": "Anchored VWAP Session Reclaim Pro", "timeframes": ["15m", "1h"]},
+    "near_vwap_profile": {"name": "Session VWAP Deviation Bounce", "timeframes": ["1h"]},
+    "vwap_reclaim_pro": {"name": "Anchored VWAP Session Reclaim", "timeframes": ["15m", "1h"]},
+    "cvd_orderflow_div": {"name": "CVD Orderflow & Delta Absorption", "timeframes": ["15m", "1h"]},
+    "funding_arb_mom": {"name": "Funding Rate Squeeze & OI Surge", "timeframes": ["1h", "4h"]},
+    "ict_fvg_retest": {"name": "Smart Money FVG + Orderblock Retest", "timeframes": ["1h", "4h"]},
+    "liq_sweep_reversal": {"name": "Swing High/Low Liquidity Sweep", "timeframes": ["30m", "1h"]},
+    "volume_profile_poc": {"name": "Volume Profile POC & VAH/VAL Bounce", "timeframes": ["1h"]},
+    "ichimoku_cloud_mtf": {"name": "Ichimoku Kumo Twist + TK Cross", "timeframes": ["1h", "4h"]},
+    "london_ny_orb": {"name": "London / NY Session Opening Range Breakout", "timeframes": ["15m", "1h"]},
+    "parabolic_sar_trail": {"name": "Parabolic SAR + Chaikin Money Flow", "timeframes": ["1h"]},
+    "anchored_vwap_reclaim_v3": {"name": "Anchored VWAP Session Reclaim Pro", "timeframes": ["1h"]},
     "ict_liquidity_sweep_ob": {"name": "ICT Liquidity Sweep & Orderblock Retest", "timeframes": ["1h"]},
-    "keltner_ttm_squeeze_pro": {"name": "TTM Bollinger-Keltner Volatility Squeeze", "timeframes": ["1h"]},
-    "london_ny_session_orb": {"name": "London / NY Session Opening Range Breakout", "timeframes": ["15m"]},
     "connors_rsi2_trend_pullback": {"name": "RSI-2 Trend Pullback & EMA200 Filter", "timeframes": ["1h"]},
+    "keltner_ttm_squeeze_pro": {"name": "TTM Bollinger-Keltner Volatility Squeeze", "timeframes": ["1h"]},
     "cvd_orderflow_absorption": {"name": "CVD Orderflow & Volume Surge Absorption", "timeframes": ["15m"]},
-    "ichimoku_kumo_twist_mtf": {"name": "Ichimoku Kumo Twist + TK Cross", "timeframes": ["4h"]},
 }
 
 
@@ -104,7 +112,7 @@ class PaperStrategyTrainerAndTester:
         return resp.json()
 
     def fetch_bybit_history(self, symbol: str, timeframe: str = "1h", days: int = TRAINING_WINDOW_DAYS) -> pd.DataFrame:
-        """Paginates backward via Bybit V5 `end` timestamp to fetch 4.5 months (135 days) + 210 warmup bars."""
+        """Paginates backward via Bybit V5 `end` timestamp to fetch 4.5 months (135 days) + warmup bars."""
         bybit_sym = symbol.replace("/", "").upper()
         tf_key = timeframe.lower()
         interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_key, "60")
@@ -205,6 +213,7 @@ class PaperStrategyTrainerAndTester:
         data["Dist_EMA50"] = (c - data["EMA_50"]) / (data["ATR"] + 1e-9)
         data["Dist_EMA200"] = (c - data["EMA_200"]) / (data["ATR"] + 1e-9)
 
+        # 18th Feature: Rolling 24-bar Session VWAP Deviation
         typical_px = (data["High"] + data["Low"] + c) / 3.0
         vol_safe = data["Volume"].clip(lower=1.0) if "Volume" in data.columns and not (data["Volume"] == 0).all() else pd.Series(1.0, index=data.index)
         session_vwap = (typical_px * vol_safe).rolling(24).sum() / (vol_safe.rolling(24).sum() + 1e-9)
@@ -222,6 +231,7 @@ class PaperStrategyTrainerAndTester:
                 uptrend = True
             st_dir.iloc[i] = 1 if uptrend else -1
         data["Supertrend"] = st_dir
+        data["Supertrend_Prev"] = data["Supertrend"].shift(1).fillna(data["Supertrend"])
         data["Donchian_High"] = data["High"].rolling(20).max().shift(1)
         data["Donchian_Low"] = data["Low"].rolling(20).min().shift(1)
         data["Vol_Surge"] = data["Volume"] / (data["Volume"].rolling(20).mean() + 1e-9) if "Volume" in data.columns and not (data["Volume"] == 0).all() else 1.0
@@ -273,8 +283,10 @@ class PaperStrategyTrainerAndTester:
                 prev["MACD_Hist"] < 0 and prev["Dist_EMA200"] < 0
             ))
         if "supertrend" in sid or "sar" in sid:
-            return bool((prev["Supertrend"] == 1) if side == "LONG" else (prev["Supertrend"] == -1))
-        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid or "orb" in sid:
+            return bool((prev["Supertrend"] == 1 and prev["Supertrend_Prev"] == -1) if side == "LONG" else (
+                prev["Supertrend"] == -1 and prev["Supertrend_Prev"] == 1
+            ))
+        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid:
             return bool((prev["VWAP_Dev"] < -0.45 and prev["Vol_Surge"] >= 1.15) if side == "LONG" else (
                 prev["VWAP_Dev"] > 0.45 and prev["Vol_Surge"] >= 1.15
             ))
@@ -295,9 +307,9 @@ class PaperStrategyTrainerAndTester:
     ) -> dict:
         round_trip_fee = BYBIT_TAKER_FEE * 2.0
         param_configs = [
-            (0.35, 1.20, 1.8),
-            (0.40, 1.50, 2.0),
-            (0.46, 1.80, 2.2),
+            (0.36, 1.20, 1.8),
+            (0.42, 1.50, 2.0),
+            (0.48, 1.80, 2.2),
         ]
 
         best_eval = None
@@ -393,7 +405,7 @@ class PaperStrategyTrainerAndTester:
             net_usdt = round(float(equity - initial_capital), 2)
             net_pct = round((net_usdt / initial_capital) * 100.0, 2)
             sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
-            score = ((net_usdt * (sample_conf / 4.0)) if (total_trades >= 12 and pf >= 1.20) else -99999.0) + (pf * 25.0) + (wr * 0.4)
+            score = ((net_usdt * (sample_conf / 4.0)) if (total_trades >= 12 and pf >= 1.25) else -99999.0) + (pf * 25.0) + (wr * 0.4)
 
             if best_eval is None or score > best_score:
                 best_score = score
@@ -546,13 +558,13 @@ class PaperStrategyTrainerAndTester:
             paper_portfolio[symbol] = coin_entry
 
         with open(self.paper_results_path, "w", encoding="utf-8") as f:
-            json.dump({"leverage": leverage, "training_days": TRAINING_WINDOW_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
+            json.dump({"leverage": leverage, "training_days": TRAINING_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
 
         avg_accuracy = round(sum(win_rates) / len(win_rates), 2) if win_rates else 0.0
         paper_master = {
             "version": f"UNIFIED_PAPER_{len(paper_portfolio)}C_135D",
             "exported_at": int(time.time()),
-            "training_days": TRAINING_WINDOW_DAYS,
+            "training_days": TRAINING_DAYS,
             "model_accuracy_pct": avg_accuracy,
             "total_net_pnl": round(total_net_pnl, 2),
             "features": FEATURES,
