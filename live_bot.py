@@ -7,6 +7,7 @@ import hmac
 import hashlib
 import tempfile
 import urllib.parse
+import datetime
 import requests
 import numpy as np
 import pandas as pd
@@ -53,7 +54,7 @@ class LiveAccountTradingBot:
                     return json.load(f)
             except Exception:
                 pass
-        return {"traded_candle_ts": {}, "last_trade_epoch_ms": {}}
+        return {"traded_candle_ts": {}, "last_trade_epoch_ms": {}, "daily_coin_trades": {}, "tp1_partial_done": {}}
 
     def _save_state(self, state: dict):
         with open(self.state_path, "w", encoding="utf-8") as f:
@@ -257,9 +258,9 @@ class LiveAccountTradingBot:
             ))
         if "supertrend" in sid or "sar" in sid:
             return bool((prev["Supertrend"] == 1) if side == "LONG" else (prev["Supertrend"] == -1))
-        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid:
-            return bool((prev["VWAP_Dev"] < -0.5 and prev["Vol_Surge"] >= 1.15) if side == "LONG" else (
-                prev["VWAP_Dev"] > 0.5 and prev["Vol_Surge"] >= 1.15
+        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid or "orb" in sid:
+            return bool((prev["VWAP_Dev"] < -0.45 and prev["Vol_Surge"] >= 1.15) if side == "LONG" else (
+                prev["VWAP_Dev"] > 0.45 and prev["Vol_Surge"] >= 1.15
             ))
         return bool((prev["DI_Spread"] > 0 and prev["Vol_Surge"] >= 1.05) if side == "LONG" else (
             prev["DI_Spread"] < 0 and prev["Vol_Surge"] >= 1.05
@@ -277,10 +278,15 @@ class LiveAccountTradingBot:
                 os.remove(tmp_path)
         return booster
 
-    def sync_positions_and_trail_stops(self) -> list:
-        """Polls Bybit V5 open positions and trails Stop-Loss once trade reaches >= 50% of TP distance."""
+    def sync_positions_and_trail_stops(self, state: dict) -> list:
+        """
+        Polls Bybit V5 open positions, executes 50% partial TP1 take-profit when >= 55% of TP distance is reached,
+        locks breakeven+, and trails Stop-Loss behind mark price.
+        """
         res = self._bybit_request("GET", "/v5/position/list", {"category": self.category, "settleCoin": "USDT"})
+        tp1_done_map = state.setdefault("tp1_partial_done", {})
         active_list = []
+
         for item in res.get("result", {}).get("list", []):
             size = float(item.get("size", 0.0))
             if size <= 0.0:
@@ -297,17 +303,36 @@ class LiveAccountTradingBot:
                 tp_dist = abs(cur_tp - entry)
                 profit_dist = (mark - entry) if side == "LONG" else (entry - mark)
                 if tp_dist > 0.0 and profit_dist >= tp_dist * 0.50:
-                    trail_offset = tp_dist * 0.45
-                    cand_sl = max(entry + tp_dist * 0.12, mark - trail_offset) if side == "LONG" else min(
-                        entry - tp_dist * 0.12, mark + trail_offset
-                    )
-                    should_tighten = (cur_sl == 0.0 or cand_sl > cur_sl * 1.0005) if side == "LONG" else (
-                        cur_sl == 0.0 or cand_sl < cur_sl * 0.9995
-                    )
-                    if should_tighten:
-                        filters = self._get_instrument_filters(bybit_sym)
-                        if filters:
-                            new_sl_str = self._format_step(cand_sl, filters[3])
+                    filters = self._get_instrument_filters(bybit_sym)
+                    if filters:
+                        qty_step, min_qty, min_notional, tick_size = filters
+                        pos_key = f"{bybit_sym}_{entry:.6f}"
+                        if not tp1_done_map.get(pos_key, False):
+                            half_qty = size * 0.5
+                            if half_qty >= min_qty and (half_qty * mark) >= min_notional:
+                                close_side = "Sell" if side == "LONG" else "Buy"
+                                p_res = self._bybit_request("POST", "/v5/order/create", body={
+                                    "category": self.category,
+                                    "symbol": bybit_sym,
+                                    "side": close_side,
+                                    "orderType": "Market",
+                                    "qty": self._format_step(half_qty, qty_step),
+                                    "timeInForce": "IOC",
+                                    "reduceOnly": True,
+                                    "positionIdx": 0,
+                                })
+                                if p_res.get("retCode") == 0:
+                                    tp1_done_map[pos_key] = True
+
+                        trail_offset = tp_dist * 0.45
+                        cand_sl = max(entry + tp_dist * 0.15, mark - trail_offset) if side == "LONG" else min(
+                            entry - tp_dist * 0.15, mark + trail_offset
+                        )
+                        should_tighten = (cur_sl == 0.0 or cand_sl > cur_sl * 1.0005) if side == "LONG" else (
+                            cur_sl == 0.0 or cand_sl < cur_sl * 0.9995
+                        )
+                        if should_tighten:
+                            new_sl_str = self._format_step(cand_sl, tick_size)
                             self._bybit_request("POST", "/v5/position/trading-stop", body={
                                 "category": self.category,
                                 "symbol": bybit_sym,
@@ -326,8 +351,8 @@ class LiveAccountTradingBot:
         return active_list
 
     def emergency_close_all(self) -> list:
-        """Emergency Kill Switch: closes all open Live positions using reduceOnly Market orders."""
-        open_positions = self.sync_positions_and_trail_stops()
+        state = self._load_state()
+        open_positions = self.sync_positions_and_trail_stops(state)
         closed = []
         for pos in open_positions:
             close_side = "Sell" if pos["side"] == "LONG" else "Buy"
@@ -342,6 +367,7 @@ class LiveAccountTradingBot:
                 "positionIdx": 0,
             })
             closed.append({"symbol": pos["symbol"], "ok": res.get("retCode") == 0})
+        self._save_state(state)
         return closed
 
     def run_live_cycle(
@@ -372,15 +398,20 @@ class LiveAccountTradingBot:
         state = self._load_state()
         traded_candle_ts = state.setdefault("traded_candle_ts", {})
         last_trade_epoch_ms = state.setdefault("last_trade_epoch_ms", {})
+        daily_coin_trades = state.setdefault("daily_coin_trades", {})
+        today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        if daily_coin_trades.get("_date") != today_str:
+            daily_coin_trades.clear()
+            daily_coin_trades["_date"] = today_str
+
         now_ms = int(time.time() * 1000)
 
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         avail_usdt = float(bal_res.get("result", {}).get("list", [{}])[0].get("totalAvailableBalance", 0.0))
 
-        open_positions = self.sync_positions_and_trail_stops()
+        open_positions = self.sync_positions_and_trail_stops(state)
         open_syms = {p["symbol"] for p in open_positions}
 
-        # BTC 4H Macro Regime Filter
         btc_macro_bearish = False
         if btc_macro_guard:
             btc_4h_raw = self.fetch_bybit_candles("BTCUSDT", interval="240", limit=220)
@@ -389,8 +420,8 @@ class LiveAccountTradingBot:
                 if not btc_4h_df.empty and int(btc_4h_df.iloc[-1]["Supertrend"]) == -1:
                     btc_macro_bearish = True
 
-        live_trades_this_cycle = 0
-
+        # Score all trained portfolio coins first & sort by highest ML edge for fair multi-coin rotation
+        candidates = []
         for symbol, entry in portfolio.items():
             market_type = entry.get("market", "CRYPTO").upper()
             if (market_type == "CRYPTO" and not crypto_enabled) or (market_type == "FOREX" and not forex_enabled):
@@ -398,6 +429,9 @@ class LiveAccountTradingBot:
 
             cfg = entry.get("config", {})
             bybit_sym = (cfg.get("bybit_symbol") or symbol.replace("/", "")).upper()
+            if bybit_sym in open_syms or int(daily_coin_trades.get(bybit_sym, 0)) >= 2:
+                continue
+
             tf_str = (cfg.get("timeframe") or entry.get("timeframe") or "1h").lower()
             interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_str, "60")
             strat_id = cfg.get("strategy_id") or entry.get("strategy_id") or "xgb_mtf_v2"
@@ -421,7 +455,6 @@ class LiveAccountTradingBot:
             raw_prob = p_long if direction == "LONG" else p_short
             req_thresh = float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh", 0.36))
 
-            # 4H MTF Supertrend Alignment + BTC Macro Guard
             if interval == "240":
                 trend_4h = int(curr["Supertrend"])
             else:
@@ -430,43 +463,55 @@ class LiveAccountTradingBot:
                 trend_4h = int(df_4h.iloc[-1]["Supertrend"]) if not df_4h.empty else 0
 
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
+            high_conv_rev = (raw_prob >= req_thresh + 0.08) and (float(curr["Vol_Surge"]) >= 1.25)
             guard_blocked = btc_macro_bearish and direction == "LONG" and not bybit_sym.startswith("BTC")
             if mtf_mode.upper() == "OFF":
                 mtf_aligned = not guard_blocked
             elif mtf_mode.upper() == "SOFT":
-                mtf_aligned = (raw_4h_ok or raw_prob >= (req_thresh + 0.12)) and not guard_blocked
+                mtf_aligned = (raw_4h_ok or raw_prob >= (req_thresh + 0.06)) and not guard_blocked
             else:
-                mtf_aligned = raw_4h_ok and not guard_blocked
+                mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
             strat_ok = self._strategy_entry_filter(strat_id, curr, prev, direction)
-            effective_min_prob = max(req_thresh, 0.42)
+            effective_min_prob = max(req_thresh, 0.38)
 
-            if not (mtf_aligned and strat_ok and raw_prob >= effective_min_prob):
-                continue
+            if mtf_aligned and strat_ok and raw_prob >= effective_min_prob:
+                candidates.append({
+                    "edge": raw_prob - req_thresh,
+                    "bybit_sym": bybit_sym,
+                    "direction": direction,
+                    "cfg": cfg,
+                    "curr": curr,
+                    "latest_bar_ms": latest_bar_ms,
+                })
 
-            # Real-Money Execution Guards
+        candidates.sort(key=lambda x: x["edge"], reverse=True)
+        live_trades_this_cycle = 0
+
+        for cand in candidates:
+            bybit_sym = cand["bybit_sym"]
             if not live_orders_armed:
-                continue
+                break
             if daily_drawdown_pct >= max_daily_loss_pct and max_daily_loss_pct > 0.0:
-                continue
-            if bybit_sym in open_syms or len(open_syms) >= max_open_positions or avail_usdt < 2.0:
-                continue
-            if traded_candle_ts.get(bybit_sym) == latest_bar_ms:
+                break
+            if len(open_syms) >= max_open_positions or avail_usdt < 2.0 or live_trades_this_cycle >= 1:
+                break
+            if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
                 continue
             if (now_ms - int(last_trade_epoch_ms.get(bybit_sym, 0))) < 15 * 60 * 1000:
                 continue
-            if live_trades_this_cycle >= 1:
-                break
 
             filters = self._get_instrument_filters(bybit_sym)
             if filters is None:
                 continue
             qty_step, min_qty, min_notional, tick_size = filters
 
+            curr = cand["curr"]
+            cfg = cand["cfg"]
             price = float(curr["Close"])
             atr = float(curr["ATR"])
             sl_atr = max(float(cfg.get("sl_atr", 1.35)), 0.80)
-            tp_rr = max(float(cfg.get("tp1_rr", 2.0)), 1.8)
+            tp_rr = max(float(cfg.get("tp2_rr", 3.0)), 2.2)
             risk_dist = max(sl_atr * atr, price * 0.0085)
 
             max_buying_power = max(avail_usdt * leverage * 0.35, 5.5)
@@ -474,7 +519,7 @@ class LiveAccountTradingBot:
             notional = min(max(risk_usdt / (risk_dist / price), min_notional * 1.05, 5.5), max_buying_power)
             qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)
 
-            is_long = direction == "LONG"
+            is_long = cand["direction"] == "LONG"
             sl_raw = (price - risk_dist) if is_long else (price + risk_dist)
             tp_raw = (price + risk_dist * tp_rr) if is_long else (price - risk_dist * tp_rr)
             sl_str = self._format_step(sl_raw, tick_size)
@@ -499,8 +544,9 @@ class LiveAccountTradingBot:
             })
             if res.get("retCode") == 0:
                 open_syms.add(bybit_sym)
-                traded_candle_ts[bybit_sym] = latest_bar_ms
+                traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
                 last_trade_epoch_ms[bybit_sym] = now_ms
+                daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
                 live_trades_this_cycle += 1
 
         self._save_state(state)

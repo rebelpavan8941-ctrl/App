@@ -19,7 +19,15 @@ TIMEFRAME_TO_BYBIT_INTERVAL = {
     "4h": "240",
 }
 
+BARS_PER_DAY = {
+    "15m": 96,
+    "30m": 48,
+    "1h": 24,
+    "4h": 6,
+}
+
 DEFAULT_TEST_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
+TRAINING_WINDOW_DAYS = 135  # 4.5 months (optimal regime coverage + out-of-sample depth)
 
 FEATURES = [
     "NATR", "BB_PctB", "BB_Width",
@@ -46,16 +54,13 @@ STRATEGY_CATALOG_META = {
     "macd_hist_zero_cross": {"name": "MACD Histogram Impulse + Zero Cross", "timeframes": ["1h", "4h"]},
     "doge_supertrend_scalp": {"name": "Supertrend Volatility Scalp", "timeframes": ["15m"]},
     "avax_fib_ml_confluence": {"name": "Fibonacci ML Confluence", "timeframes": ["1h"]},
-    "near_vwap_profile": {"name": "Session VWAP Deviation Bounce", "timeframes": ["1h"]},
-    "vwap_reclaim_pro": {"name": "Anchored VWAP Session Reclaim", "timeframes": ["15m", "1h"]},
-    "cvd_orderflow_div": {"name": "CVD Orderflow & Delta Absorption", "timeframes": ["15m", "1h"]},
-    "funding_arb_mom": {"name": "Funding Rate Squeeze & OI Surge", "timeframes": ["1h", "4h"]},
-    "ict_fvg_retest": {"name": "Smart Money FVG + Orderblock Retest", "timeframes": ["1h", "4h"]},
-    "liq_sweep_reversal": {"name": "Swing High/Low Liquidity Sweep", "timeframes": ["30m", "1h"]},
-    "volume_profile_poc": {"name": "Volume Profile POC & VAH/VAL Bounce", "timeframes": ["1h"]},
-    "ichimoku_cloud_mtf": {"name": "Ichimoku Kumo Twist + TK Cross", "timeframes": ["1h", "4h"]},
-    "london_ny_orb": {"name": "London / NY Session Opening Range Breakout", "timeframes": ["15m", "1h"]},
-    "parabolic_sar_trail": {"name": "Parabolic SAR + Chaikin Money Flow", "timeframes": ["1h"]},
+    "anchored_vwap_reclaim_v3": {"name": "Anchored VWAP Session Reclaim Pro", "timeframes": ["15m", "1h"]},
+    "ict_liquidity_sweep_ob": {"name": "ICT Liquidity Sweep & Orderblock Retest", "timeframes": ["1h"]},
+    "keltner_ttm_squeeze_pro": {"name": "TTM Bollinger-Keltner Volatility Squeeze", "timeframes": ["1h"]},
+    "london_ny_session_orb": {"name": "London / NY Session Opening Range Breakout", "timeframes": ["15m"]},
+    "connors_rsi2_trend_pullback": {"name": "RSI-2 Trend Pullback & EMA200 Filter", "timeframes": ["1h"]},
+    "cvd_orderflow_absorption": {"name": "CVD Orderflow & Volume Surge Absorption", "timeframes": ["15m"]},
+    "ichimoku_kumo_twist_mtf": {"name": "Ichimoku Kumo Twist + TK Cross", "timeframes": ["4h"]},
 }
 
 
@@ -98,30 +103,58 @@ class PaperStrategyTrainerAndTester:
             self.rate_limit_cap = int(cap)
         return resp.json()
 
-    def fetch_bybit_history(self, symbol: str, timeframe: str = "1h", bars: int = 1000) -> pd.DataFrame:
+    def fetch_bybit_history(self, symbol: str, timeframe: str = "1h", days: int = TRAINING_WINDOW_DAYS) -> pd.DataFrame:
+        """Paginates backward via Bybit V5 `end` timestamp to fetch 4.5 months (135 days) + 210 warmup bars."""
         bybit_sym = symbol.replace("/", "").upper()
-        interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(timeframe.lower(), "60")
-        rows = []
-        for base in ("https://api.bybit.com", "https://api-demo.bybit.com"):
-            try:
-                resp = self._public_get(
-                    f"{base}/v5/market/kline",
-                    {"category": "linear", "symbol": bybit_sym, "interval": interval, "limit": min(bars, 1000)},
-                )
-                rows = resp.get("result", {}).get("list", [])
-                if rows:
-                    break
-            except Exception:
-                rows = []
+        tf_key = timeframe.lower()
+        interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_key, "60")
+        target_bars = (days * BARS_PER_DAY.get(tf_key, 24)) + 210
 
-        if not rows:
+        collected = {}
+        cursor_end = None
+        pages = 0
+
+        while len(collected) < target_bars and pages < 14:
+            params = {"category": "linear", "symbol": bybit_sym, "interval": interval, "limit": 1000}
+            if cursor_end is not None:
+                params["end"] = cursor_end
+
+            rows = []
+            for base in ("https://api.bybit.com", "https://api-demo.bybit.com"):
+                try:
+                    resp = self._public_get(f"{base}/v5/market/kline", params)
+                    rows = resp.get("result", {}).get("list", [])
+                    if rows:
+                        break
+                except Exception:
+                    rows = []
+
+            if not rows:
+                break
+
+            oldest_ts = None
+            for r in rows:
+                ts_ms = int(r[0])
+                collected[ts_ms] = r
+                if oldest_ts is None or ts_ms < oldest_ts:
+                    oldest_ts = ts_ms
+
+            if oldest_ts is None or (cursor_end is not None and oldest_ts >= cursor_end):
+                break
+            cursor_end = oldest_ts - 1
+            pages += 1
+            if len(rows) < 950:
+                break
+
+        if not collected:
             return pd.DataFrame()
 
-        df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"])
+        ordered_rows = [collected[k] for k in sorted(collected.keys())][-target_bars:]
+        df = pd.DataFrame(ordered_rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"])
         df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
         for col in ["Open", "High", "Low", "Close", "Volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.sort_values("timestamp").set_index("timestamp")
+        return df.set_index("timestamp")
 
     def build_matrix(self, df: pd.DataFrame, max_dd: float = 0.95, expansion: float = 1.6, horizon: int = 8) -> pd.DataFrame:
         data = df.copy()
@@ -172,7 +205,6 @@ class PaperStrategyTrainerAndTester:
         data["Dist_EMA50"] = (c - data["EMA_50"]) / (data["ATR"] + 1e-9)
         data["Dist_EMA200"] = (c - data["EMA_200"]) / (data["ATR"] + 1e-9)
 
-        # 18th Feature: 24-bar Rolling Session VWAP Deviation (aligned with NativeTradingEngine.kt)
         typical_px = (data["High"] + data["Low"] + c) / 3.0
         vol_safe = data["Volume"].clip(lower=1.0) if "Volume" in data.columns and not (data["Volume"] == 0).all() else pd.Series(1.0, index=data.index)
         session_vwap = (typical_px * vol_safe).rolling(24).sum() / (vol_safe.rolling(24).sum() + 1e-9)
@@ -242,9 +274,9 @@ class PaperStrategyTrainerAndTester:
             ))
         if "supertrend" in sid or "sar" in sid:
             return bool((prev["Supertrend"] == 1) if side == "LONG" else (prev["Supertrend"] == -1))
-        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid:
-            return bool((prev["VWAP_Dev"] < -0.5 and prev["Vol_Surge"] >= 1.15) if side == "LONG" else (
-                prev["VWAP_Dev"] > 0.5 and prev["Vol_Surge"] >= 1.15
+        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid or "orb" in sid:
+            return bool((prev["VWAP_Dev"] < -0.45 and prev["Vol_Surge"] >= 1.15) if side == "LONG" else (
+                prev["VWAP_Dev"] > 0.45 and prev["Vol_Surge"] >= 1.15
             ))
         return bool((prev["DI_Spread"] > 0 and prev["Vol_Surge"] >= 1.05) if side == "LONG" else (
             prev["DI_Spread"] < 0 and prev["Vol_Surge"] >= 1.05
@@ -262,11 +294,10 @@ class PaperStrategyTrainerAndTester:
         htf_trend_series: pd.Series = None,
     ) -> dict:
         round_trip_fee = BYBIT_TAKER_FEE * 2.0
-        # Wick-safe ATR stop-loss & R:R grid matching NativeTradingEngine.kt
         param_configs = [
-            (0.36, 1.20, 1.8),
-            (0.42, 1.50, 2.0),
-            (0.48, 1.80, 2.2),
+            (0.35, 1.20, 1.8),
+            (0.40, 1.50, 2.0),
+            (0.46, 1.80, 2.2),
         ]
 
         best_eval = None
@@ -306,8 +337,10 @@ class PaperStrategyTrainerAndTester:
                         prior_htf = htf_trend_series[htf_trend_series.index <= ts]
                         if len(prior_htf) > 0:
                             htf_dir = prior_htf.iloc[-1]
-                            le = le and (htf_dir == 1)
-                            se = se and (htf_dir == -1)
+                            high_conv_l = (p_long[i - 1] >= thresh + 0.08) and (prev["Vol_Surge"] >= 1.25)
+                            high_conv_s = (p_short[i - 1] >= thresh + 0.08) and (prev["Vol_Surge"] >= 1.25)
+                            le = le and (htf_dir == 1 or high_conv_l)
+                            se = se and (htf_dir == -1 or high_conv_s)
 
                     if le != se:
                         in_pos = True
@@ -360,7 +393,7 @@ class PaperStrategyTrainerAndTester:
             net_usdt = round(float(equity - initial_capital), 2)
             net_pct = round((net_usdt / initial_capital) * 100.0, 2)
             sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
-            score = ((net_usdt * (sample_conf / 4.0)) if (total_trades >= 10 and pf >= 1.20) else -99999.0) + (pf * 25.0) + (wr * 0.4)
+            score = ((net_usdt * (sample_conf / 4.0)) if (total_trades >= 12 and pf >= 1.20) else -99999.0) + (pf * 25.0) + (wr * 0.4)
 
             if best_eval is None or score > best_score:
                 best_score = score
@@ -409,8 +442,8 @@ class PaperStrategyTrainerAndTester:
 
         for symbol in filtered_coins:
             htf_trend = None
-            raw_4h = self.fetch_bybit_history(symbol, timeframe="4h", bars=600)
-            if len(raw_4h) >= 60:
+            raw_4h = self.fetch_bybit_history(symbol, timeframe="4h", days=TRAINING_WINDOW_DAYS)
+            if len(raw_4h) >= 210:
                 df_4h = self.build_matrix(raw_4h)
                 if not df_4h.empty:
                     htf_trend = df_4h["Supertrend"]
@@ -419,12 +452,12 @@ class PaperStrategyTrainerAndTester:
             all_tf_runs = []
 
             for tf in test_tfs:
-                raw = raw_4h if (tf == "4h" and not raw_4h.empty) else self.fetch_bybit_history(symbol, timeframe=tf, bars=1000)
-                if len(raw) < 350:
+                raw = raw_4h if (tf == "4h" and not raw_4h.empty) else self.fetch_bybit_history(symbol, timeframe=tf, days=TRAINING_WINDOW_DAYS)
+                if len(raw) < 400:
                     continue
 
                 df = self.build_matrix(raw)
-                if len(df) < 250:
+                if len(df) < 280:
                     continue
 
                 split = int(len(df) * 0.65)
@@ -434,8 +467,8 @@ class PaperStrategyTrainerAndTester:
                 f_means = train_df[FEATURES].mean().tolist()
                 f_stds = train_df[FEATURES].std().replace(0, 1.0).fillna(1.0).tolist()
 
-                clf_long = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.04, subsample=0.8, colsample_bytree=0.8, eval_metric="logloss", random_state=42)
-                clf_short = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.04, subsample=0.8, colsample_bytree=0.8, eval_metric="logloss", random_state=42)
+                clf_long = xgb.XGBClassifier(n_estimators=120, max_depth=3, learning_rate=0.04, subsample=0.8, colsample_bytree=0.8, eval_metric="logloss", random_state=42)
+                clf_short = xgb.XGBClassifier(n_estimators=120, max_depth=3, learning_rate=0.04, subsample=0.8, colsample_bytree=0.8, eval_metric="logloss", random_state=42)
                 clf_long.fit(train_df[FEATURES], train_df["Target_Long"])
                 clf_short.fit(train_df[FEATURES], train_df["Target_Short"])
 
@@ -513,12 +546,13 @@ class PaperStrategyTrainerAndTester:
             paper_portfolio[symbol] = coin_entry
 
         with open(self.paper_results_path, "w", encoding="utf-8") as f:
-            json.dump({"leverage": leverage, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
+            json.dump({"leverage": leverage, "training_days": TRAINING_WINDOW_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
 
         avg_accuracy = round(sum(win_rates) / len(win_rates), 2) if win_rates else 0.0
         paper_master = {
-            "version": f"UNIFIED_PAPER_{len(paper_portfolio)}C",
+            "version": f"UNIFIED_PAPER_{len(paper_portfolio)}C_135D",
             "exported_at": int(time.time()),
+            "training_days": TRAINING_WINDOW_DAYS,
             "model_accuracy_pct": avg_accuracy,
             "total_net_pnl": round(total_net_pnl, 2),
             "features": FEATURES,
@@ -591,10 +625,6 @@ class PaperStrategyTrainerAndTester:
             json.dump(live_master, f, indent=2)
 
     def move_coin_to_live_model(self, symbol: str) -> bool:
-        """
-        Copies ONLY the selected coin's trained weights, strategy, stats, and config
-        into LIVE/UNIFIED_PORTFOLIO_MASTER.json without touching existing Live coins.
-        """
         if not os.path.exists(self.paper_results_path):
             return False
 
@@ -638,7 +668,6 @@ class PaperStrategyTrainerAndTester:
         return True
 
     def remove_coin_from_live_model(self, symbol: str) -> bool:
-        """Removes a coin from LIVE/UNIFIED_PORTFOLIO_MASTER.json so Live trading stops for that coin."""
         if not os.path.exists(self.live_master_path):
             return False
         with open(self.live_master_path, "r", encoding="utf-8") as f:
@@ -661,14 +690,13 @@ if __name__ == "__main__":
     models_dir = os.environ.get("MODELS_DIR", os.path.join(base_dir, "ml_models"))
 
     config_file = os.path.join(paper_dir, "paper_runtime_config.json")
+    runtime_cfg = {}
     if os.path.exists(config_file):
         try:
             with open(config_file, "r", encoding="utf-8") as f:
                 runtime_cfg = json.load(f)
         except Exception:
             runtime_cfg = {}
-    else:
-        runtime_cfg = {}
 
     coins = runtime_cfg.get("coins", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "LINK/USDT"])
     strategies = runtime_cfg.get("strategies", ["xgb_mtf_v2", "xrp_donchian_breakout"])
@@ -694,4 +722,4 @@ if __name__ == "__main__":
             crypto_enabled=crypto_enabled,
             forex_enabled=forex_enabled,
         )
-        print(f"Trained & evaluated {len(results)} Paper coins across 18 features & dynamic strategies.")
+        print(f"Trained & evaluated {len(results)} Paper coins across 4.5 months (135 days) & 18 features.")
