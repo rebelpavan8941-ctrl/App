@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import json
 import time
@@ -924,6 +924,63 @@ class PaperStrategyTrainerAndTester:
         self._save_live_master(live_master)
         return True
 
+    def remove_coin_from_paper_model(self, symbol: str) -> bool:
+        norm_sym = symbol.strip().upper()
+        if "/" not in norm_sym and norm_sym.endswith("USDT"):
+            norm_sym = f"{norm_sym[:-4]}/USDT"
+
+        removed_any = False
+
+        if os.path.exists(self.paper_master_path):
+            try:
+                with open(self.paper_master_path, "r", encoding="utf-8") as f:
+                    master = json.load(f)
+                portfolio = master.setdefault("portfolio", {})
+                if norm_sym in portfolio or norm_sym.replace("/", "") in portfolio:
+                    portfolio.pop(norm_sym, None)
+                    portfolio.pop(norm_sym.replace("/", ""), None)
+                    removed_any = True
+                    wrs = [v.get("win_rate_pct", 0.0) for v in portfolio.values() if isinstance(v, dict)]
+                    pnls = [v.get("net_pnl_usdt", 0.0) for v in portfolio.values() if isinstance(v, dict)]
+                    master["version"] = f"UNIFIED_PAPER_{len(portfolio)}C_135D"
+                    master["model_accuracy_pct"] = round(sum(wrs) / len(wrs), 2) if wrs else 0.0
+                    master["total_net_pnl"] = round(sum(pnls), 2)
+                    with open(self.paper_master_path, "w", encoding="utf-8") as wf:
+                        json.dump(master, wf, indent=2)
+            except Exception:
+                pass
+
+        if os.path.exists(self.paper_results_path):
+            try:
+                with open(self.paper_results_path, "r", encoding="utf-8") as f:
+                    res_data = json.load(f)
+                coins_map = res_data.setdefault("coins", {})
+                if norm_sym in coins_map or norm_sym.replace("/", "") in coins_map:
+                    coins_map.pop(norm_sym, None)
+                    coins_map.pop(norm_sym.replace("/", ""), None)
+                    removed_any = True
+                    with open(self.paper_results_path, "w", encoding="utf-8") as wf:
+                        json.dump(res_data, wf, indent=2)
+            except Exception:
+                pass
+
+        config_file = os.path.join(self.paper_dir, "paper_runtime_config.json")
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                coins_list = cfg.get("coins", [])
+                new_coins = [c for c in coins_list if c.strip().upper() not in (norm_sym, norm_sym.replace("/", ""))]
+                if len(new_coins) != len(coins_list):
+                    cfg["coins"] = new_coins
+                    removed_any = True
+                    with open(config_file, "w", encoding="utf-8") as wf:
+                        json.dump(cfg, wf, indent=2)
+            except Exception:
+                pass
+
+        return removed_any
+
     def remove_coin_from_live_model(self, symbol: str) -> bool:
         if not os.path.exists(self.live_master_path):
             return False
@@ -969,6 +1026,9 @@ if __name__ == "__main__":
         print(json.dumps({"ok": ok, "promoted": sys.argv[2].upper()}))
     elif len(sys.argv) >= 3 and sys.argv[1] == "--remove":
         ok = trainer.remove_coin_from_live_model(sys.argv[2].upper())
+        print(json.dumps({"ok": ok, "removed": sys.argv[2].upper()}))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--remove-paper":
+        ok = trainer.remove_coin_from_paper_model(sys.argv[2].upper())
         print(json.dumps({"ok": ok, "removed": sys.argv[2].upper()}))
     else:
         results = trainer.train_and_evaluate_paper_coins(
