@@ -96,6 +96,11 @@ class PaperStrategyTrainerAndTester:
         self.rate_limit_remaining = 120
         self.rate_limit_cap = 120
 
+        # Persistent HTTP Keep-Alive session to eliminate repeated TLS handshakes
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        self.session.mount("https://", adapter)
+
         os.makedirs(paper_dir, exist_ok=True)
         os.makedirs(os.path.join(models_dir, "PAPER"), exist_ok=True)
         os.makedirs(os.path.join(models_dir, "LIVE"), exist_ok=True)
@@ -103,7 +108,7 @@ class PaperStrategyTrainerAndTester:
     def _public_get(self, url: str, params: dict) -> dict:
         if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
             time.sleep(1.5)
-        resp = requests.get(url, params=params, timeout=7)
+        resp = self.session.get(url, params=params, timeout=7)
         rem = resp.headers.get("X-Bapi-Limit-Status")
         cap = resp.headers.get("X-Bapi-Limit")
         if rem and rem.isdigit():
@@ -121,7 +126,7 @@ class PaperStrategyTrainerAndTester:
         for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
             try:
                 url = f"https://{host}/v8/finance/chart/{clean_sym}=X"
-                resp = requests.get(
+                resp = self.session.get(
                     url,
                     params={"interval": yf_interval, "range": yf_range},
                     headers={"User-Agent": "Mozilla/5.0"},
@@ -321,16 +326,15 @@ class PaperStrategyTrainerAndTester:
     def _fit_xgb_pair(self, train_df: pd.DataFrame):
         y_l = train_df["Target_Long"].copy()
         y_s = train_df["Target_Short"].copy()
-        # Guard against rare all-zero targets on ultra-quiet coins
         if y_l.sum() < 5:
             y_l.iloc[-5:] = 1
         if y_s.sum() < 5:
             y_s.iloc[-5:] = 1
 
         clf_long = xgb.XGBClassifier(
-            n_estimators=65,
+            n_estimators=120,
             max_depth=3,
-            learning_rate=0.05,
+            learning_rate=0.04,
             subsample=0.8,
             colsample_bytree=0.8,
             n_jobs=4,
@@ -338,9 +342,9 @@ class PaperStrategyTrainerAndTester:
             random_state=42,
         )
         clf_short = xgb.XGBClassifier(
-            n_estimators=65,
+            n_estimators=120,
             max_depth=3,
-            learning_rate=0.05,
+            learning_rate=0.04,
             subsample=0.8,
             colsample_bytree=0.8,
             n_jobs=4,
@@ -353,7 +357,6 @@ class PaperStrategyTrainerAndTester:
 
     def _strategy_entry_filter(self, strategy_id: str, row: pd.Series, prev: pd.Series, side: str, relaxed: bool = False) -> bool:
         if relaxed:
-            # Adaptive fallback when strict indicator filter produces zero trades on a coin
             return bool((prev["Dist_EMA50"] > -1.5) if side == "LONG" else (prev["Dist_EMA50"] < 1.5))
 
         sid = strategy_id.lower()
@@ -409,7 +412,6 @@ class PaperStrategyTrainerAndTester:
     ) -> dict:
         round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (BYBIT_TAKER_FEE * 2.0)
 
-        # 6 multi-parameter profiles (thresh, sl_atr, tp1_rr, use_htf_gate)
         param_configs = [
             (0.18, 1.05, 1.60, False),
             (0.23, 1.15, 1.75, False),
@@ -608,7 +610,6 @@ class PaperStrategyTrainerAndTester:
             all_tf_runs = []
             cached_tf_bundles = []
 
-            # Pass 1: Standard multi-timeframe & multi-strategy sweep
             for tf in test_tfs:
                 raw = raw_4h if (tf == "4h" and not raw_4h.empty) else self.fetch_bybit_history(symbol, timeframe=tf, days=TRAINING_WINDOW_DAYS)
                 if len(raw) < 300:
@@ -676,14 +677,8 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            # =========================================================================
-            # AUTOMATIC ZERO-TRADE DETECTION & ADAPTIVE PARAMETER/TARGET ESCALATION
-            # If a coin got < min_req_trades (e.g. 0 trades on ETH/INJ), automatically
-            # test relaxed filters, high-sensitivity targets, and quantile thresholds!
-            # =========================================================================
             current_trades = best_candidate["stats"]["trades"] if best_candidate else 0
             if current_trades < min_req_trades and cached_tf_bundles:
-                # Stage 2: Test relaxed indicator filter + coin-specific quantile probability triggers
                 for tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds in cached_tf_bundles:
                     q_thresholds = sorted(set([
                         float(np.quantile(np.maximum(p_long, p_short), 0.72)),
@@ -724,7 +719,6 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            # Stage 3: If still starved (< min_req_trades), re-fit with high-sensitivity ATR targets (0.75 ATR / 14 bars)
             if current_trades < min_req_trades and cached_tf_bundles:
                 for tf, raw, _, _, _, _, _, _, _ in cached_tf_bundles:
                     df_sens = self.build_matrix(raw, max_dd=1.10, expansion=0.75, horizon=14)
