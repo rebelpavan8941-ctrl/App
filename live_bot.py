@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 import json
 import time
@@ -487,9 +487,16 @@ class LiveAccountTradingBot:
             curr = df.iloc[-1]
             latest_bar_ms = int(df.index[-1].timestamp() * 1000)
 
+            models_map = entry.get("models", {})
+            long_data = models_map.get("long") or models_map.get("long_weights")
+            short_data = models_map.get("short") or models_map.get("short_weights")
+
+            if not long_data or not short_data:
+                continue
+
             dmat = xgb.DMatrix(df.iloc[[-1]][features])
-            p_long = float(self._load_booster(f"{bybit_sym}_long", entry["models"]["long"]).predict(dmat)[0])
-            p_short = float(self._load_booster(f"{bybit_sym}_short", entry["models"]["short"]).predict(dmat)[0])
+            p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
+            p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
 
             direction = "LONG" if p_long >= p_short else "SHORT"
             raw_prob = p_long if direction == "LONG" else p_short
