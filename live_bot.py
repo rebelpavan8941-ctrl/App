@@ -35,6 +35,10 @@ def is_forex_symbol(symbol: str) -> bool:
     return len(clean) == 6 and clean[:3] in forex_bases and clean[3:] in (forex_bases | {"USD"})
 
 
+def is_valid_xgb_model(model_dict) -> bool:
+    return isinstance(model_dict, dict) and "learner" in model_dict and isinstance(model_dict.get("learner"), dict)
+
+
 class LiveAccountTradingBot:
     def __init__(self, api_key: str, api_secret: str, models_dir: str, live_dir: str = None, endpoint: str = "Mainnet"):
         self.api_key = api_key
@@ -48,7 +52,13 @@ class LiveAccountTradingBot:
         p2 = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
         self.master_path = p1 if os.path.exists(p1) else p2
 
-        self.base_url = "https://api-demo.bybit.com" if endpoint.lower() in ("testnet", "demo") else "https://api.bybit.com"
+        self.is_demo = str(endpoint).lower() in ("testnet", "demo")
+        self.host_candidates = (
+            ["https://api-demo.bybit.com", "https://api.bytick.com", "https://api.bybit.com"]
+            if self.is_demo
+            else ["https://api.bytick.com", "https://api.bybit.com"]
+        )
+        self.base_url = self.host_candidates[0]
         self.category = "linear"
         self.rate_limit_remaining = 120
         self.rate_limit_cap = 120
@@ -79,55 +89,72 @@ class LiveAccountTradingBot:
         if cap and cap.isdigit() and int(cap) > 0:
             self.rate_limit_cap = int(cap)
 
+    def _public_get(self, path: str, params: dict, timeout: float = 6.0) -> dict:
+        for base in self.host_candidates:
+            try:
+                resp = requests.get(f"{base}{path}", params=params, timeout=timeout)
+                self._update_rate_limits(resp)
+                if resp.status_code == 200:
+                    return resp.json()
+            except Exception:
+                continue
+        return {}
+
     def _bybit_request(self, method: str, path: str, params: dict = None, body: dict = None) -> dict:
         if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
             time.sleep(1.5)
 
-        ts = str(int(time.time() * 1000))
-        recv_window = "5000"
-        if method == "GET":
-            qs = urllib.parse.urlencode(params or {})
-            sig = self._sign(ts, recv_window, qs)
-            url = f"{self.base_url}{path}?{qs}" if qs else f"{self.base_url}{path}"
-            headers = {
-                "X-BAPI-API-KEY": self.api_key,
-                "X-BAPI-SIGN": sig,
-                "X-BAPI-TIMESTAMP": ts,
-                "X-BAPI-RECV-WINDOW": recv_window,
-            }
-            resp = requests.get(url, headers=headers, timeout=10)
-            self._update_rate_limits(resp)
-            if resp.status_code == 429:
-                time.sleep(2.5)
-                resp = requests.get(url, headers=headers, timeout=10)
-                self._update_rate_limits(resp)
-            return resp.json()
-        else:
-            raw_body = json.dumps(body or {})
-            sig = self._sign(ts, recv_window, raw_body)
-            headers = {
-                "X-BAPI-API-KEY": self.api_key,
-                "X-BAPI-SIGN": sig,
-                "X-BAPI-TIMESTAMP": ts,
-                "X-BAPI-RECV-WINDOW": recv_window,
-                "Content-Type": "application/json",
-            }
-            resp = requests.post(f"{self.base_url}{path}", headers=headers, data=raw_body, timeout=10)
-            self._update_rate_limits(resp)
-            if resp.status_code == 429:
-                time.sleep(2.5)
-                resp = requests.post(f"{self.base_url}{path}", headers=headers, data=raw_body, timeout=10)
-                self._update_rate_limits(resp)
-            return resp.json()
+        last_err = None
+        for base in self.host_candidates:
+            ts = str(int(time.time() * 1000))
+            recv_window = "5000"
+            try:
+                if method == "GET":
+                    qs = urllib.parse.urlencode(params or {})
+                    sig = self._sign(ts, recv_window, qs)
+                    url = f"{base}{path}?{qs}" if qs else f"{base}{path}"
+                    headers = {
+                        "X-BAPI-API-KEY": self.api_key,
+                        "X-BAPI-SIGN": sig,
+                        "X-BAPI-TIMESTAMP": ts,
+                        "X-BAPI-RECV-WINDOW": recv_window,
+                    }
+                    resp = requests.get(url, headers=headers, timeout=8)
+                    self._update_rate_limits(resp)
+                    if resp.status_code == 429:
+                        time.sleep(2.5)
+                        resp = requests.get(url, headers=headers, timeout=8)
+                        self._update_rate_limits(resp)
+                    if resp.status_code == 200:
+                        return resp.json()
+                else:
+                    raw_body = json.dumps(body or {})
+                    sig = self._sign(ts, recv_window, raw_body)
+                    headers = {
+                        "X-BAPI-API-KEY": self.api_key,
+                        "X-BAPI-SIGN": sig,
+                        "X-BAPI-TIMESTAMP": ts,
+                        "X-BAPI-RECV-WINDOW": recv_window,
+                        "Content-Type": "application/json",
+                    }
+                    resp = requests.post(f"{base}{path}", headers=headers, data=raw_body, timeout=8)
+                    self._update_rate_limits(resp)
+                    if resp.status_code == 429:
+                        time.sleep(2.5)
+                        resp = requests.post(f"{base}{path}", headers=headers, data=raw_body, timeout=8)
+                        self._update_rate_limits(resp)
+                    if resp.status_code == 200:
+                        return resp.json()
+            except Exception as e:
+                last_err = e
+                continue
+        if last_err:
+            raise last_err
+        return {}
 
     def _get_instrument_filters(self, bybit_symbol: str):
-        resp = requests.get(
-            f"{self.base_url}/v5/market/instruments-info",
-            params={"category": self.category, "symbol": bybit_symbol},
-            timeout=10,
-        )
-        self._update_rate_limits(resp)
-        items = resp.json().get("result", {}).get("list", [])
+        data = self._public_get("/v5/market/instruments-info", {"category": self.category, "symbol": bybit_symbol})
+        items = data.get("result", {}).get("list", [])
         if not items:
             return None
         lot = items[0].get("lotSizeFilter", {})
@@ -148,13 +175,12 @@ class LiveAccountTradingBot:
         return f"{scaled:.{decimals}f}"
 
     def fetch_bybit_candles(self, bybit_symbol: str, interval: str = "60", limit: int = 230) -> pd.DataFrame:
-        resp = requests.get(
-            f"{self.base_url}/v5/market/kline",
-            params={"category": self.category, "symbol": bybit_symbol, "interval": interval, "limit": limit},
-            timeout=10,
+        data = self._public_get(
+            "/v5/market/kline",
+            {"category": self.category, "symbol": bybit_symbol, "interval": interval, "limit": limit},
+            timeout=6.0,
         )
-        self._update_rate_limits(resp)
-        rows = resp.json().get("result", {}).get("list", [])
+        rows = data.get("result", {}).get("list", [])
         if rows:
             df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"])
             df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
@@ -170,7 +196,7 @@ class LiveAccountTradingBot:
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
                     params={"interval": yf_interval, "range": yf_range},
                     headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=10,
+                    timeout=8,
                 )
                 res0 = y_resp.json().get("chart", {}).get("result", [])[0]
                 ts_list = res0.get("timestamp", [])
@@ -192,7 +218,13 @@ class LiveAccountTradingBot:
                     avg_range = bar_range.rolling(20, min_periods=1).mean().clip(lower=1e-6)
                     df["Volume"] = ((bar_range / avg_range) * 1000.0).clip(lower=200.0, upper=5000.0)
                     if interval == "240":
-                        df = df.resample("4h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+                        df = df.resample("4h").agg({
+                            "Open": "first",
+                            "High": "max",
+                            "Low": "min",
+                            "Close": "last",
+                            "Volume": "sum",
+                        }).dropna()
                     return df.tail(limit)
             except Exception:
                 pass
@@ -309,6 +341,8 @@ class LiveAccountTradingBot:
         ))
 
     def _load_booster(self, cache_key: str, model_dict: dict) -> xgb.Booster:
+        if not is_valid_xgb_model(model_dict):
+            raise ValueError(f"Invalid XGBoost booster format for {cache_key} (missing 'learner'). Retrain Paper model.")
         if cache_key in self._booster_cache:
             return self._booster_cache[cache_key]
         booster = xgb.Booster()
@@ -425,7 +459,7 @@ class LiveAccountTradingBot:
         max_daily_loss_pct: float = 3.0,
     ):
         if not os.path.exists(self.master_path):
-            raise FileNotFoundError(f"Live Master ML Model not found at {self.master_path}")
+            raise FileNotFoundError(f"Master ML Model not found at {self.master_path}")
 
         leverage = min(max(int(leverage), 1), 20)
         with open(self.master_path, "r", encoding="utf-8") as f:
@@ -463,6 +497,9 @@ class LiveAccountTradingBot:
 
         candidates = []
         for symbol, entry in portfolio.items():
+            if not isinstance(entry, dict):
+                continue
+
             market_type = entry.get("market", "FOREX" if is_forex_symbol(symbol) else "CRYPTO").upper()
             if (market_type == "CRYPTO" and not crypto_enabled) or (market_type == "FOREX" and not forex_enabled):
                 continue
@@ -470,6 +507,12 @@ class LiveAccountTradingBot:
             cfg = entry.get("config", {})
             bybit_sym = (cfg.get("bybit_symbol") or symbol.replace("/", "")).upper()
             if bybit_sym in open_syms or int(daily_coin_trades.get(bybit_sym, 0)) >= 2:
+                continue
+
+            models_map = entry.get("models", {})
+            long_data = models_map.get("long") or models_map.get("long_model")
+            short_data = models_map.get("short") or models_map.get("short_model")
+            if not is_valid_xgb_model(long_data) or not is_valid_xgb_model(short_data):
                 continue
 
             tf_str = (cfg.get("timeframe") or entry.get("timeframe") or "1h").lower()
@@ -487,16 +530,12 @@ class LiveAccountTradingBot:
             curr = df.iloc[-1]
             latest_bar_ms = int(df.index[-1].timestamp() * 1000)
 
-            models_map = entry.get("models", {})
-            long_data = models_map.get("long") or models_map.get("long_weights")
-            short_data = models_map.get("short") or models_map.get("short_weights")
-
-            if not long_data or not short_data:
+            try:
+                dmat = xgb.DMatrix(df.iloc[[-1]][features])
+                p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
+                p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
+            except Exception:
                 continue
-
-            dmat = xgb.DMatrix(df.iloc[[-1]][features])
-            p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
-            p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
 
             direction = "LONG" if p_long >= p_short else "SHORT"
             raw_prob = p_long if direction == "LONG" else p_short
