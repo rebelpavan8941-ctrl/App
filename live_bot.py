@@ -29,6 +29,12 @@ FEATURES = [
 ]
 
 
+def is_forex_symbol(symbol: str) -> bool:
+    clean = symbol.replace("/", "").upper()
+    forex_bases = {"EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
+    return len(clean) == 6 and clean[:3] in forex_bases and clean[3:] in (forex_bases | {"USD"})
+
+
 class LiveAccountTradingBot:
     def __init__(self, api_key: str, api_secret: str, models_dir: str, live_dir: str = None, endpoint: str = "Mainnet"):
         self.api_key = api_key
@@ -46,6 +52,7 @@ class LiveAccountTradingBot:
         self.category = "linear"
         self.rate_limit_remaining = 120
         self.rate_limit_cap = 120
+        self._booster_cache = {}
 
     def _load_state(self) -> dict:
         if os.path.exists(self.state_path):
@@ -148,13 +155,48 @@ class LiveAccountTradingBot:
         )
         self._update_rate_limits(resp)
         rows = resp.json().get("result", {}).get("list", [])
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"])
-        df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.sort_values("timestamp").set_index("timestamp")
+        if rows:
+            df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"])
+            df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
+            for col in ["Open", "High", "Low", "Close", "Volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df.sort_values("timestamp").set_index("timestamp")
+
+        if is_forex_symbol(bybit_symbol):
+            yf_interval = "15m" if interval == "15" else ("30m" if interval == "30" else "1h")
+            yf_range = "15d" if yf_interval in ("15m", "30m") else "60d"
+            try:
+                y_resp = requests.get(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
+                    params={"interval": yf_interval, "range": yf_range},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=10,
+                )
+                res0 = y_resp.json().get("chart", {}).get("result", [])[0]
+                ts_list = res0.get("timestamp", [])
+                quote = res0.get("indicators", {}).get("quote", [{}])[0]
+                f_rows = []
+                for i, ts_sec in enumerate(ts_list):
+                    c = quote["close"][i]
+                    if c is None or c <= 0:
+                        continue
+                    o = quote["open"][i] or c
+                    h = quote["high"][i] or c
+                    l = quote["low"][i] or c
+                    f_rows.append([ts_sec * 1000, float(o), float(h), float(l), float(c), 1000.0])
+                if f_rows:
+                    df = pd.DataFrame(f_rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                    df = df.set_index("timestamp").sort_index()
+                    bar_range = (df["High"] - df["Low"]).clip(lower=1e-6)
+                    avg_range = bar_range.rolling(20, min_periods=1).mean().clip(lower=1e-6)
+                    df["Volume"] = ((bar_range / avg_range) * 1000.0).clip(lower=200.0, upper=5000.0)
+                    if interval == "240":
+                        df = df.resample("4h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna()
+                    return df.tail(limit)
+            except Exception:
+                pass
+        return pd.DataFrame()
 
     def build_features(self, df: pd.DataFrame) -> pd.DataFrame:
         data = df.copy()
@@ -266,23 +308,22 @@ class LiveAccountTradingBot:
             prev["DI_Spread"] < 0 and prev["Vol_Surge"] >= 1.05
         ))
 
-    def _load_booster(self, model_dict: dict) -> xgb.Booster:
+    def _load_booster(self, cache_key: str, model_dict: dict) -> xgb.Booster:
+        if cache_key in self._booster_cache:
+            return self._booster_cache[cache_key]
         booster = xgb.Booster()
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
             json.dump(model_dict, tmp)
             tmp_path = tmp.name
         try:
             booster.load_model(tmp_path)
+            self._booster_cache[cache_key] = booster
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
         return booster
 
     def sync_positions_and_trail_stops(self, state: dict) -> list:
-        """
-        Polls Bybit V5 open positions, executes 50% partial TP1 take-profit when >= 55% of TP distance is reached,
-        locks breakeven+, and trails Stop-Loss behind mark price.
-        """
         res = self._bybit_request("GET", "/v5/position/list", {"category": self.category, "settleCoin": "USDT"})
         tp1_done_map = state.setdefault("tp1_partial_done", {})
         active_list = []
@@ -420,10 +461,9 @@ class LiveAccountTradingBot:
                 if not btc_4h_df.empty and int(btc_4h_df.iloc[-1]["Supertrend"]) == -1:
                     btc_macro_bearish = True
 
-        # Score all trained portfolio coins first & sort by highest ML edge for fair multi-coin rotation
         candidates = []
         for symbol, entry in portfolio.items():
-            market_type = entry.get("market", "CRYPTO").upper()
+            market_type = entry.get("market", "FOREX" if is_forex_symbol(symbol) else "CRYPTO").upper()
             if (market_type == "CRYPTO" and not crypto_enabled) or (market_type == "FOREX" and not forex_enabled):
                 continue
 
@@ -448,12 +488,13 @@ class LiveAccountTradingBot:
             latest_bar_ms = int(df.index[-1].timestamp() * 1000)
 
             dmat = xgb.DMatrix(df.iloc[[-1]][features])
-            p_long = float(self._load_booster(entry["models"]["long"]).predict(dmat)[0])
-            p_short = float(self._load_booster(entry["models"]["short"]).predict(dmat)[0])
+            p_long = float(self._load_booster(f"{bybit_sym}_long", entry["models"]["long"]).predict(dmat)[0])
+            p_short = float(self._load_booster(f"{bybit_sym}_short", entry["models"]["short"]).predict(dmat)[0])
 
             direction = "LONG" if p_long >= p_short else "SHORT"
             raw_prob = p_long if direction == "LONG" else p_short
-            req_thresh = float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh", 0.36))
+            default_th = 0.25 if market_type == "FOREX" else 0.36
+            req_thresh = float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh", default_th))
 
             if interval == "240":
                 trend_4h = int(curr["Supertrend"])
@@ -464,7 +505,7 @@ class LiveAccountTradingBot:
 
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.08) and (float(curr["Vol_Surge"]) >= 1.25)
-            guard_blocked = btc_macro_bearish and direction == "LONG" and not bybit_sym.startswith("BTC")
+            guard_blocked = btc_macro_bearish and direction == "LONG" and market_type == "CRYPTO" and not bybit_sym.startswith("BTC")
             if mtf_mode.upper() == "OFF":
                 mtf_aligned = not guard_blocked
             elif mtf_mode.upper() == "SOFT":
@@ -473,12 +514,13 @@ class LiveAccountTradingBot:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
             strat_ok = self._strategy_entry_filter(strat_id, curr, prev, direction)
-            effective_min_prob = max(req_thresh, 0.38)
+            effective_min_prob = req_thresh if market_type == "FOREX" else max(req_thresh, 0.36)
 
             if mtf_aligned and strat_ok and raw_prob >= effective_min_prob:
                 candidates.append({
                     "edge": raw_prob - req_thresh,
                     "bybit_sym": bybit_sym,
+                    "market_type": market_type,
                     "direction": direction,
                     "cfg": cfg,
                     "curr": curr,
@@ -512,9 +554,12 @@ class LiveAccountTradingBot:
             atr = float(curr["ATR"])
             sl_atr = max(float(cfg.get("sl_atr", 1.35)), 0.80)
             tp_rr = max(float(cfg.get("tp2_rr", 3.0)), 2.2)
-            risk_dist = max(sl_atr * atr, price * 0.0085)
+            min_sl_floor = price * (0.0010 if cand["market_type"] == "FOREX" else 0.0075)
+            risk_dist = max(sl_atr * atr, min_sl_floor)
 
-            max_buying_power = max(avail_usdt * leverage * 0.35, 5.5)
+            max_buying_power = avail_usdt * leverage * 0.85
+            if max_buying_power < min_notional * 1.05:
+                continue
             risk_usdt = max(avail_usdt * (risk_per_trade_pct / 100.0), 0.15)
             notional = min(max(risk_usdt / (risk_dist / price), min_notional * 1.05, 5.5), max_buying_power)
             qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)

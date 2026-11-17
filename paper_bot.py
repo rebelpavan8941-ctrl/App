@@ -8,7 +8,8 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-BYBIT_TAKER_FEE = 0.00055  # 0.055% per side (0.11% round-trip)
+BYBIT_TAKER_FEE = 0.00055   # 0.055% per side (0.11% round-trip for Crypto)
+FOREX_HALF_SPREAD = 0.00006 # 0.6 pip per side (1.2 pips = 0.012% round-trip for Forex)
 MAX_LEVERAGE = 20
 DEFAULT_LEVERAGE = 10
 
@@ -111,8 +112,73 @@ class PaperStrategyTrainerAndTester:
             self.rate_limit_cap = int(cap)
         return resp.json()
 
+    def _fetch_forex_yahoo_history(self, symbol: str, timeframe: str = "1h") -> pd.DataFrame:
+        clean_sym = symbol.replace("/", "").upper()
+        tf_key = timeframe.lower()
+        yf_interval = "15m" if tf_key == "15m" else ("30m" if tf_key == "30m" else "1h")
+        yf_range = "60d" if yf_interval in ("15m", "30m") else "6mo"
+
+        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+            try:
+                url = f"https://{host}/v8/finance/chart/{clean_sym}=X"
+                resp = requests.get(
+                    url,
+                    params={"interval": yf_interval, "range": yf_range},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=12,
+                )
+                data = resp.json().get("chart", {}).get("result", [])
+                if not data:
+                    continue
+                res0 = data[0]
+                ts_list = res0.get("timestamp", [])
+                quote = res0.get("indicators", {}).get("quote", [{}])[0]
+                opens = quote.get("open", [])
+                highs = quote.get("high", [])
+                lows = quote.get("low", [])
+                closes = quote.get("close", [])
+
+                rows = []
+                for i, ts_sec in enumerate(ts_list):
+                    c = closes[i] if i < len(closes) else None
+                    if c is None or c <= 0:
+                        continue
+                    o = opens[i] if (i < len(opens) and opens[i] is not None) else c
+                    h = highs[i] if (i < len(highs) and highs[i] is not None) else c
+                    l = lows[i] if (i < len(lows) and lows[i] is not None) else c
+                    rows.append([ts_sec * 1000, float(o), float(h), float(l), float(c), 1000.0])
+
+                if not rows:
+                    continue
+
+                df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                df = df.set_index("timestamp").sort_index()
+
+                # Synthetic range-based volume proxy so Forex VWAP & Vol_Surge reflect real session volatility
+                bar_range = (df["High"] - df["Low"]).clip(lower=1e-6)
+                avg_range = bar_range.rolling(20, min_periods=1).mean().clip(lower=1e-6)
+                df["Volume"] = ((bar_range / avg_range) * 1000.0).clip(lower=200.0, upper=5000.0)
+
+                if tf_key == "4h":
+                    df = df.resample("4h").agg({
+                        "Open": "first",
+                        "High": "max",
+                        "Low": "min",
+                        "Close": "last",
+                        "Volume": "sum",
+                    }).dropna()
+
+                return df
+            except Exception:
+                continue
+        return pd.DataFrame()
+
     def fetch_bybit_history(self, symbol: str, timeframe: str = "1h", days: int = TRAINING_WINDOW_DAYS) -> pd.DataFrame:
-        """Paginates backward via Bybit V5 `end` timestamp to fetch 4.5 months (135 days) + warmup bars."""
+        """Fetches 4.5 months (135 days) + warmup bars for Crypto (Bybit V5) or Forex (Yahoo Spot Feed)."""
+        if classify_market(symbol) == "FOREX":
+            return self._fetch_forex_yahoo_history(symbol, timeframe=timeframe)
+
         bybit_sym = symbol.replace("/", "").upper()
         tf_key = timeframe.lower()
         interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_key, "60")
@@ -213,7 +279,6 @@ class PaperStrategyTrainerAndTester:
         data["Dist_EMA50"] = (c - data["EMA_50"]) / (data["ATR"] + 1e-9)
         data["Dist_EMA200"] = (c - data["EMA_200"]) / (data["ATR"] + 1e-9)
 
-        # 18th Feature: Rolling 24-bar Session VWAP Deviation
         typical_px = (data["High"] + data["Low"] + c) / 3.0
         vol_safe = data["Volume"].clip(lower=1.0) if "Volume" in data.columns and not (data["Volume"] == 0).all() else pd.Series(1.0, index=data.index)
         session_vwap = (typical_px * vol_safe).rolling(24).sum() / (vol_safe.rolling(24).sum() + 1e-9)
@@ -283,10 +348,8 @@ class PaperStrategyTrainerAndTester:
                 prev["MACD_Hist"] < 0 and prev["Dist_EMA200"] < 0
             ))
         if "supertrend" in sid or "sar" in sid:
-            return bool((prev["Supertrend"] == 1 and prev["Supertrend_Prev"] == -1) if side == "LONG" else (
-                prev["Supertrend"] == -1 and prev["Supertrend_Prev"] == 1
-            ))
-        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid:
+            return bool((prev["Supertrend"] == 1) if side == "LONG" else (prev["Supertrend"] == -1))
+        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid or "orb" in sid:
             return bool((prev["VWAP_Dev"] < -0.45 and prev["Vol_Surge"] >= 1.15) if side == "LONG" else (
                 prev["VWAP_Dev"] > 0.45 and prev["Vol_Surge"] >= 1.15
             ))
@@ -303,14 +366,20 @@ class PaperStrategyTrainerAndTester:
         timeframe: str,
         leverage: int,
         initial_capital: float,
+        is_forex: bool = False,
         htf_trend_series: pd.Series = None,
     ) -> dict:
-        round_trip_fee = BYBIT_TAKER_FEE * 2.0
+        round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (BYBIT_TAKER_FEE * 2.0)
         param_configs = [
+            (0.22, 1.15, 1.70),
+            (0.28, 1.20, 1.75),
+            (0.34, 1.25, 1.80),
+        ] if is_forex else [
             (0.36, 1.20, 1.8),
             (0.42, 1.50, 2.0),
             (0.48, 1.80, 2.2),
         ]
+        min_req_trades = 5 if is_forex else 10
 
         best_eval = None
         best_score = -999999.0
@@ -405,7 +474,7 @@ class PaperStrategyTrainerAndTester:
             net_usdt = round(float(equity - initial_capital), 2)
             net_pct = round((net_usdt / initial_capital) * 100.0, 2)
             sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
-            score = ((net_usdt * (sample_conf / 4.0)) if (total_trades >= 12 and pf >= 1.25) else -99999.0) + (pf * 25.0) + (wr * 0.4)
+            score = ((net_usdt * (sample_conf / 4.0)) if (total_trades >= min_req_trades and pf >= 1.20 and net_usdt > 0) else -99999.0) + (pf * 25.0) + (wr * 0.4)
 
             if best_eval is None or score > best_score:
                 best_score = score
@@ -453,10 +522,15 @@ class PaperStrategyTrainerAndTester:
         win_rates = []
 
         for symbol in filtered_coins:
+            is_fx = (classify_market(symbol) == "FOREX")
+            exp_atr = 0.90 if is_fx else 1.25
+            dd_atr = 0.85 if is_fx else 0.95
+            hor_bars = 12 if is_fx else 10
+
             htf_trend = None
             raw_4h = self.fetch_bybit_history(symbol, timeframe="4h", days=TRAINING_WINDOW_DAYS)
             if len(raw_4h) >= 210:
-                df_4h = self.build_matrix(raw_4h)
+                df_4h = self.build_matrix(raw_4h, max_dd=dd_atr, expansion=exp_atr, horizon=hor_bars)
                 if not df_4h.empty:
                     htf_trend = df_4h["Supertrend"]
 
@@ -465,11 +539,11 @@ class PaperStrategyTrainerAndTester:
 
             for tf in test_tfs:
                 raw = raw_4h if (tf == "4h" and not raw_4h.empty) else self.fetch_bybit_history(symbol, timeframe=tf, days=TRAINING_WINDOW_DAYS)
-                if len(raw) < 400:
+                if len(raw) < 300:
                     continue
 
-                df = self.build_matrix(raw)
-                if len(df) < 280:
+                df = self.build_matrix(raw, max_dd=dd_atr, expansion=exp_atr, horizon=hor_bars)
+                if len(df) < 180:
                     continue
 
                 split = int(len(df) * 0.65)
@@ -496,6 +570,7 @@ class PaperStrategyTrainerAndTester:
                         timeframe=tf.upper(),
                         leverage=leverage,
                         initial_capital=initial_capital,
+                        is_forex=is_fx,
                         htf_trend_series=htf_trend if tf != "4h" else None,
                     )
                     st = eval_res["stats"]
@@ -558,13 +633,13 @@ class PaperStrategyTrainerAndTester:
             paper_portfolio[symbol] = coin_entry
 
         with open(self.paper_results_path, "w", encoding="utf-8") as f:
-            json.dump({"leverage": leverage, "training_days": TRAINING_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
+            json.dump({"leverage": leverage, "training_days": TRAINING_WINDOW_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
 
         avg_accuracy = round(sum(win_rates) / len(win_rates), 2) if win_rates else 0.0
         paper_master = {
             "version": f"UNIFIED_PAPER_{len(paper_portfolio)}C_135D",
             "exported_at": int(time.time()),
-            "training_days": TRAINING_DAYS,
+            "training_days": TRAINING_WINDOW_DAYS,
             "model_accuracy_pct": avg_accuracy,
             "total_net_pnl": round(total_net_pnl, 2),
             "features": FEATURES,
