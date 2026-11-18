@@ -5,7 +5,6 @@ import time
 import math
 import hmac
 import hashlib
-import tempfile
 import urllib.parse
 import datetime
 import requests
@@ -63,6 +62,12 @@ class LiveAccountTradingBot:
         self.rate_limit_remaining = 120
         self.rate_limit_cap = 120
         self._booster_cache = {}
+        self._instrument_cache = {}
+
+        # Persistent HTTP Keep-Alive session to avoid repeated TLS handshakes
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
+        self.session.mount("https://", adapter)
 
     def _load_state(self) -> dict:
         if os.path.exists(self.state_path):
@@ -71,7 +76,13 @@ class LiveAccountTradingBot:
                     return json.load(f)
             except Exception:
                 pass
-        return {"traded_candle_ts": {}, "last_trade_epoch_ms": {}, "daily_coin_trades": {}, "tp1_partial_done": {}}
+        return {
+            "traded_candle_ts": {},
+            "last_trade_epoch_ms": {},
+            "daily_coin_trades": {},
+            "tp1_partial_done": {},
+            "last_diagnostics": [],
+        }
 
     def _save_state(self, state: dict):
         with open(self.state_path, "w", encoding="utf-8") as f:
@@ -92,7 +103,7 @@ class LiveAccountTradingBot:
     def _public_get(self, path: str, params: dict, timeout: float = 6.0) -> dict:
         for base in self.host_candidates:
             try:
-                resp = requests.get(f"{base}{path}", params=params, timeout=timeout)
+                resp = self.session.get(f"{base}{path}", params=params, timeout=timeout)
                 self._update_rate_limits(resp)
                 if resp.status_code == 200:
                     return resp.json()
@@ -119,11 +130,11 @@ class LiveAccountTradingBot:
                         "X-BAPI-TIMESTAMP": ts,
                         "X-BAPI-RECV-WINDOW": recv_window,
                     }
-                    resp = requests.get(url, headers=headers, timeout=8)
+                    resp = self.session.get(url, headers=headers, timeout=8)
                     self._update_rate_limits(resp)
                     if resp.status_code == 429:
                         time.sleep(2.5)
-                        resp = requests.get(url, headers=headers, timeout=8)
+                        resp = self.session.get(url, headers=headers, timeout=8)
                         self._update_rate_limits(resp)
                     if resp.status_code == 200:
                         return resp.json()
@@ -137,11 +148,11 @@ class LiveAccountTradingBot:
                         "X-BAPI-RECV-WINDOW": recv_window,
                         "Content-Type": "application/json",
                     }
-                    resp = requests.post(f"{base}{path}", headers=headers, data=raw_body, timeout=8)
+                    resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=8)
                     self._update_rate_limits(resp)
                     if resp.status_code == 429:
                         time.sleep(2.5)
-                        resp = requests.post(f"{base}{path}", headers=headers, data=raw_body, timeout=8)
+                        resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=8)
                         self._update_rate_limits(resp)
                     if resp.status_code == 200:
                         return resp.json()
@@ -153,18 +164,22 @@ class LiveAccountTradingBot:
         return {}
 
     def _get_instrument_filters(self, bybit_symbol: str):
+        if bybit_symbol in self._instrument_cache:
+            return self._instrument_cache[bybit_symbol]
         data = self._public_get("/v5/market/instruments-info", {"category": self.category, "symbol": bybit_symbol})
         items = data.get("result", {}).get("list", [])
         if not items:
             return None
         lot = items[0].get("lotSizeFilter", {})
         pf = items[0].get("priceFilter", {})
-        return (
+        res = (
             lot.get("qtyStep", "0.001"),
             float(lot.get("minOrderQty", "0.001")),
             float(lot.get("minNotionalValue", "5.0")),
             pf.get("tickSize", "0.0001"),
         )
+        self._instrument_cache[bybit_symbol] = res
+        return res
 
     @staticmethod
     def _format_step(val: float, step_str: str, round_up: bool = False) -> str:
@@ -192,7 +207,7 @@ class LiveAccountTradingBot:
             yf_interval = "15m" if interval == "15" else ("30m" if interval == "30" else "1h")
             yf_range = "15d" if yf_interval in ("15m", "30m") else "60d"
             try:
-                y_resp = requests.get(
+                y_resp = self.session.get(
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
                     params={"interval": yf_interval, "range": yf_range},
                     headers={"User-Agent": "Mozilla/5.0"},
@@ -284,28 +299,33 @@ class LiveAccountTradingBot:
         session_vwap = (typical_px * vol_safe).rolling(24).sum() / (vol_safe.rolling(24).sum() + 1e-9)
         data["VWAP_Dev"] = (c - session_vwap) / (data["ATR"] + 1e-9)
 
-        hl2 = (data["High"] + data["Low"]) / 2
-        upper = hl2 + 3.0 * data["ATR"]
-        lower = hl2 - 3.0 * data["ATR"]
-        st_dir = pd.Series(1, index=data.index)
+        hl2 = ((data["High"] + data["Low"]) * 0.5).to_numpy()
+        atr_arr = data["ATR"].fillna(0.0).to_numpy()
+        c_arr = c.to_numpy()
+        upper_arr = hl2 + 3.0 * atr_arr
+        lower_arr = hl2 - 3.0 * atr_arr
+        st_arr = np.ones(len(data), dtype=np.int8)
         uptrend = True
-        for i in range(10, len(data)):
-            if uptrend and c.iloc[i] < lower.iloc[i - 1]:
+        for i in range(10, len(c_arr)):
+            if uptrend and c_arr[i] < lower_arr[i - 1]:
                 uptrend = False
-            elif not uptrend and c.iloc[i] > upper.iloc[i - 1]:
+            elif not uptrend and c_arr[i] > upper_arr[i - 1]:
                 uptrend = True
-            st_dir.iloc[i] = 1 if uptrend else -1
-        data["Supertrend"] = st_dir
+            st_arr[i] = 1 if uptrend else -1
+
+        data["Supertrend"] = st_arr
         data["Donchian_High"] = data["High"].rolling(20).max().shift(1)
         data["Donchian_Low"] = data["Low"].rolling(20).min().shift(1)
         data["Vol_Surge"] = data["Volume"] / (data["Volume"].rolling(20).mean() + 1e-9)
         data["BB_Width_Med"] = data["BB_Width"].rolling(30).median()
         return data.dropna()
 
-    def _strategy_entry_filter(self, strategy_id: str, curr: pd.Series, prev: pd.Series, side: str) -> bool:
+    def _strategy_entry_filter(self, strategy_id: str, curr: pd.Series, prev: pd.Series, side: str, relaxed: bool = False) -> bool:
         sid = strategy_id.lower()
-        c = curr["Close"]
+        if relaxed or "adaptive_quantile" in sid or "high_sensitivity" in sid:
+            return bool((prev["Dist_EMA50"] > -1.5) if side == "LONG" else (prev["Dist_EMA50"] < 1.5))
 
+        c = curr["Close"]
         if "donchian" in sid:
             return (c > prev["Donchian_High"] and prev["Supertrend"] == 1) if side == "LONG" else (
                 c < prev["Donchian_Low"] and prev["Supertrend"] == -1
@@ -346,15 +366,20 @@ class LiveAccountTradingBot:
         if cache_key in self._booster_cache:
             return self._booster_cache[cache_key]
         booster = xgb.Booster()
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
-            json.dump(model_dict, tmp)
-            tmp_path = tmp.name
+        # Use persistent live_dir instead of volatile Android /cache/tmp/
+        os.makedirs(self.live_dir, exist_ok=True)
+        tmp_path = os.path.join(self.live_dir, f"_tmp_live_{cache_key}_{os.getpid()}.json")
         try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(model_dict, f)
             booster.load_model(tmp_path)
             self._booster_cache[cache_key] = booster
         finally:
             if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
         return booster
 
     def sync_positions_and_trail_stops(self, state: dict) -> list:
@@ -468,12 +493,13 @@ class LiveAccountTradingBot:
         features = master.get("features", FEATURES)
         portfolio = master.get("portfolio", {})
         if not portfolio:
-            return
+            raise ValueError("No coins found in Live ML Model. Promote trained coins from Paper to Live first.")
 
         state = self._load_state()
         traded_candle_ts = state.setdefault("traded_candle_ts", {})
         last_trade_epoch_ms = state.setdefault("last_trade_epoch_ms", {})
         daily_coin_trades = state.setdefault("daily_coin_trades", {})
+        diagnostics = []
         today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         if daily_coin_trades.get("_date") != today_str:
             daily_coin_trades.clear()
@@ -513,14 +539,17 @@ class LiveAccountTradingBot:
             long_data = models_map.get("long") or models_map.get("long_model")
             short_data = models_map.get("short") or models_map.get("short_model")
             if not is_valid_xgb_model(long_data) or not is_valid_xgb_model(short_data):
+                diagnostics.append(f"{bybit_sym}: Missing valid XGBoost booster weights")
                 continue
 
             tf_str = (cfg.get("timeframe") or entry.get("timeframe") or "1h").lower()
             interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_str, "60")
             strat_id = cfg.get("strategy_id") or entry.get("strategy_id") or "xgb_mtf_v2"
+            is_relaxed = bool(cfg.get("relaxed_filter", False))
 
             df_raw = self.fetch_bybit_candles(bybit_sym, interval=interval, limit=230)
             if len(df_raw) < 210:
+                diagnostics.append(f"{bybit_sym}: Insufficient candles ({len(df_raw)}/210)")
                 continue
 
             df = self.build_features(df_raw)
@@ -534,12 +563,13 @@ class LiveAccountTradingBot:
                 dmat = xgb.DMatrix(df.iloc[[-1]][features])
                 p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
                 p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
-            except Exception:
+            except Exception as e:
+                diagnostics.append(f"{bybit_sym}: Booster predict error ({e})")
                 continue
 
             direction = "LONG" if p_long >= p_short else "SHORT"
             raw_prob = p_long if direction == "LONG" else p_short
-            default_th = 0.25 if market_type == "FOREX" else 0.36
+            default_th = 0.24 if market_type == "FOREX" else 0.30
             req_thresh = float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh", default_th))
 
             if interval == "240":
@@ -550,17 +580,18 @@ class LiveAccountTradingBot:
                 trend_4h = int(df_4h.iloc[-1]["Supertrend"]) if not df_4h.empty else 0
 
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
-            high_conv_rev = (raw_prob >= req_thresh + 0.08) and (float(curr["Vol_Surge"]) >= 1.25)
+            high_conv_rev = (raw_prob >= req_thresh + 0.07) and (float(curr["Vol_Surge"]) >= 1.20)
             guard_blocked = btc_macro_bearish and direction == "LONG" and market_type == "CRYPTO" and not bybit_sym.startswith("BTC")
             if mtf_mode.upper() == "OFF":
                 mtf_aligned = not guard_blocked
             elif mtf_mode.upper() == "SOFT":
-                mtf_aligned = (raw_4h_ok or raw_prob >= (req_thresh + 0.06)) and not guard_blocked
+                mtf_aligned = (raw_4h_ok or raw_prob >= (req_thresh + 0.05)) and not guard_blocked
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
-            strat_ok = self._strategy_entry_filter(strat_id, curr, prev, direction)
-            effective_min_prob = req_thresh if market_type == "FOREX" else max(req_thresh, 0.36)
+            strat_ok = self._strategy_entry_filter(strat_id, curr, prev, direction, relaxed=is_relaxed)
+            # Honor exact calibrated threshold from Paper training (floored safely at 0.20)
+            effective_min_prob = max(req_thresh, 0.20)
 
             if mtf_aligned and strat_ok and raw_prob >= effective_min_prob:
                 candidates.append({
@@ -572,6 +603,17 @@ class LiveAccountTradingBot:
                     "curr": curr,
                     "latest_bar_ms": latest_bar_ms,
                 })
+            else:
+                reasons = []
+                if guard_blocked:
+                    reasons.append("BTC 4H Macro Guard")
+                elif not mtf_aligned:
+                    reasons.append("4H MTF misaligned")
+                if not strat_ok:
+                    reasons.append(f"Strategy filter ({strat_id})")
+                if raw_prob < effective_min_prob:
+                    reasons.append(f"Prob {raw_prob:.2f} < {effective_min_prob:.2f}")
+                diagnostics.append(f"{bybit_sym} {direction}: skipped ({', '.join(reasons)})")
 
         candidates.sort(key=lambda x: x["edge"], reverse=True)
         live_trades_this_cycle = 0
@@ -579,8 +621,10 @@ class LiveAccountTradingBot:
         for cand in candidates:
             bybit_sym = cand["bybit_sym"]
             if not live_orders_armed:
+                diagnostics.append("Live Orders Armed is OFF")
                 break
             if daily_drawdown_pct >= max_daily_loss_pct and max_daily_loss_pct > 0.0:
+                diagnostics.append(f"Daily drawdown limit reached ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)")
                 break
             if len(open_syms) >= max_open_positions or avail_usdt < 2.0 or live_trades_this_cycle >= 1:
                 break
@@ -591,6 +635,7 @@ class LiveAccountTradingBot:
 
             filters = self._get_instrument_filters(bybit_sym)
             if filters is None:
+                diagnostics.append(f"{bybit_sym}: Instrument info unavailable on Bybit")
                 continue
             qty_step, min_qty, min_notional, tick_size = filters
 
@@ -604,10 +649,15 @@ class LiveAccountTradingBot:
             risk_dist = max(sl_atr * atr, min_sl_floor)
 
             max_buying_power = avail_usdt * leverage * 0.85
-            if max_buying_power < min_notional * 1.05:
+            min_required_notional = max(min_notional * 1.05, min_qty * price)
+            if max_buying_power < min_required_notional:
+                diagnostics.append(
+                    f"{bybit_sym}: Min order (${min_required_notional:.2f}) > max buying power (${max_buying_power:.2f})"
+                )
                 continue
+
             risk_usdt = max(avail_usdt * (risk_per_trade_pct / 100.0), 0.15)
-            notional = min(max(risk_usdt / (risk_dist / price), min_notional * 1.05, 5.5), max_buying_power)
+            notional = min(max(risk_usdt / (risk_dist / price), min_required_notional, 5.5), max_buying_power)
             qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)
 
             is_long = cand["direction"] == "LONG"
@@ -639,7 +689,10 @@ class LiveAccountTradingBot:
                 last_trade_epoch_ms[bybit_sym] = now_ms
                 daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
                 live_trades_this_cycle += 1
+            else:
+                diagnostics.append(f"{bybit_sym} Order Rejected: [{res.get('retCode')}] {res.get('retMsg', 'Unknown error')}")
 
+        state["last_diagnostics"] = diagnostics[-25:]
         self._save_state(state)
 
 
