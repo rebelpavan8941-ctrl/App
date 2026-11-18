@@ -2,7 +2,7 @@
 import sys
 import json
 import time
-import tempfile
+import glob
 import requests
 import numpy as np
 import pandas as pd
@@ -29,6 +29,7 @@ BARS_PER_DAY = {
 
 DEFAULT_TEST_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
 TRAINING_WINDOW_DAYS = 135  # 4.5 months (~135 days) optimal regime coverage
+MAX_KEPT_MODEL_VERSIONS = 2  # Keep only latest 2 trained ML models and prune older ones
 
 FEATURES = [
     "NATR", "BB_PctB", "BB_Width",
@@ -89,6 +90,7 @@ class PaperStrategyTrainerAndTester:
         self.paper_dir = paper_dir
         self.models_dir = models_dir
         self.paper_master_path = os.path.join(models_dir, "PAPER", "UNIFIED_PORTFOLIO_MASTER.json")
+        self.paper_history_dir = os.path.join(models_dir, "PAPER", "history")
         self.live_master_path = os.path.join(models_dir, "LIVE", "UNIFIED_PORTFOLIO_MASTER.json")
         self.legacy_master_path = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
         self.paper_results_path = os.path.join(paper_dir, "paper_trained_results.json")
@@ -96,14 +98,30 @@ class PaperStrategyTrainerAndTester:
         self.rate_limit_remaining = 120
         self.rate_limit_cap = 120
 
-        # Persistent HTTP Keep-Alive session to eliminate repeated TLS handshakes
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
         self.session.mount("https://", adapter)
 
         os.makedirs(paper_dir, exist_ok=True)
         os.makedirs(os.path.join(models_dir, "PAPER"), exist_ok=True)
+        os.makedirs(self.paper_history_dir, exist_ok=True)
         os.makedirs(os.path.join(models_dir, "LIVE"), exist_ok=True)
+
+    def _prune_old_trained_models(self, keep_latest: int = MAX_KEPT_MODEL_VERSIONS):
+        """Keeps only the latest `keep_latest` trained ML model snapshots and deletes older ones."""
+        try:
+            snapshots = sorted(
+                glob.glob(os.path.join(self.paper_history_dir, "UNIFIED_PAPER_*.json")),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+            for old_file in snapshots[keep_latest:]:
+                try:
+                    os.remove(old_file)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _public_get(self, url: str, params: dict) -> dict:
         if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
@@ -313,15 +331,23 @@ class PaperStrategyTrainerAndTester:
         return data.dropna()
 
     def _serialize_booster(self, clf: xgb.XGBClassifier) -> dict:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
-            path = tmp.name
+        """Serializes booster directly in memory (or persistent paper_dir fallback) so Android cache cleanup never causes FileNotFoundError."""
         try:
-            clf.save_model(path)
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        finally:
-            if os.path.exists(path):
-                os.remove(path)
+            raw_bytes = bytes(clf.get_booster().save_raw("json"))
+            return json.loads(raw_bytes.decode("utf-8"))
+        except Exception:
+            os.makedirs(self.paper_dir, exist_ok=True)
+            safe_tmp = os.path.join(self.paper_dir, f"_tmp_booster_{os.getpid()}_{int(time.time() * 1000)}.json")
+            try:
+                clf.save_model(safe_tmp)
+                with open(safe_tmp, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            finally:
+                if os.path.exists(safe_tmp):
+                    try:
+                        os.remove(safe_tmp)
+                    except Exception:
+                        pass
 
     def _fit_xgb_pair(self, train_df: pd.DataFrame):
         y_l = train_df["Target_Long"].copy()
@@ -799,10 +825,11 @@ class PaperStrategyTrainerAndTester:
         with open(self.paper_results_path, "w", encoding="utf-8") as f:
             json.dump({"leverage": leverage, "training_days": TRAINING_WINDOW_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
 
+        now_ts = int(time.time())
         avg_accuracy = round(sum(win_rates) / len(win_rates), 2) if win_rates else 0.0
         paper_master = {
             "version": f"UNIFIED_PAPER_{len(paper_portfolio)}C_135D",
-            "exported_at": int(time.time()),
+            "exported_at": now_ts,
             "training_days": TRAINING_WINDOW_DAYS,
             "model_accuracy_pct": avg_accuracy,
             "total_net_pnl": round(total_net_pnl, 2),
@@ -811,6 +838,12 @@ class PaperStrategyTrainerAndTester:
         }
         with open(self.paper_master_path, "w", encoding="utf-8") as f:
             json.dump(paper_master, f, indent=2)
+
+        # Save versioned backup & keep only latest 2 trained ML models
+        hist_snapshot = os.path.join(self.paper_history_dir, f"UNIFIED_PAPER_{now_ts}.json")
+        with open(hist_snapshot, "w", encoding="utf-8") as hf:
+            json.dump(paper_master, hf, indent=2)
+        self._prune_old_trained_models(keep_latest=MAX_KEPT_MODEL_VERSIONS)
 
         self.auto_compare_with_live(trained_coins)
         return trained_coins
