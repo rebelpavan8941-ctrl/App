@@ -70,7 +70,6 @@ class LiveAccountTradingBot:
         self.master_path = p1 if os.path.exists(p1) else p2
 
         self.is_demo = str(endpoint).lower() in ("testnet", "demo")
-        # Prioritize api.bytick.com first (reliable where api.bybit.com DNS is blocked)
         self.host_candidates = (
             ["https://api-demo.bybit.com", "https://api.bytick.com", "https://api.bybit.com"]
             if self.is_demo
@@ -98,6 +97,7 @@ class LiveAccountTradingBot:
             "traded_candle_ts": {},
             "last_trade_epoch_ms": {},
             "daily_coin_trades": {},
+            "daily_total_trades": 0,
             "tp1_partial_done": {},
             "last_diagnostics": [],
             "last_order_rejections": [],
@@ -386,7 +386,6 @@ class LiveAccountTradingBot:
             raise ValueError(f"Invalid XGBoost booster format for {cache_key} (missing 'learner'). Retrain Paper model.")
         if cache_key in self._booster_cache:
             return self._booster_cache[cache_key]
-        # Keep booster cache bounded to max 16 boosters for 4-6GB RAM phones
         if len(self._booster_cache) >= 16:
             oldest_key = next(iter(self._booster_cache))
             self._booster_cache.pop(oldest_key, None)
@@ -531,6 +530,10 @@ class LiveAccountTradingBot:
         if daily_coin_trades.get("_date") != today_str:
             daily_coin_trades.clear()
             daily_coin_trades["_date"] = today_str
+            state["daily_total_trades"] = 0
+
+        daily_total_trades = int(state.get("daily_total_trades", 0))
+        need_daily_first_trade = (daily_total_trades == 0)
 
         now_ms = int(time.time() * 1000)
 
@@ -539,6 +542,8 @@ class LiveAccountTradingBot:
 
         open_positions = self.sync_positions_and_trail_stops(state)
         open_syms = {p["symbol"] for p in open_positions}
+        if open_positions and need_daily_first_trade:
+            need_daily_first_trade = False
 
         btc_macro_bearish = False
         if btc_macro_guard:
@@ -551,6 +556,7 @@ class LiveAccountTradingBot:
             del btc_4h_raw
 
         candidates = []
+        daily_hunter_backups = []
         coins_scanned_count = 0
 
         for symbol, entry in portfolio.items():
@@ -566,9 +572,6 @@ class LiveAccountTradingBot:
             bybit_sym = (cfg.get("bybit_symbol") or symbol.replace("/", "")).upper()
             if bybit_sym in open_syms:
                 trade_blocks.append(f"{bybit_sym}: Already has an open position")
-                continue
-            if int(daily_coin_trades.get(bybit_sym, 0)) >= 2:
-                trade_blocks.append(f"{bybit_sym}: Daily max 2 trades per coin reached")
                 continue
 
             models_map = entry.get("models", {})
@@ -631,9 +634,13 @@ class LiveAccountTradingBot:
             strat_ok = self._strategy_entry_filter(strat_id, curr, prev, direction, relaxed=is_relaxed)
             effective_min_prob = max(req_thresh, 0.20)
 
+            adx_val = float(curr.get("ADX", 0.0))
+            vol_surge_val = float(curr.get("Vol_Surge", 1.0))
+            quality_edge = (raw_prob - effective_min_prob) + (0.03 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 22.0 else 0.0)
+
             if mtf_aligned and strat_ok and raw_prob >= effective_min_prob:
                 candidates.append({
-                    "edge": raw_prob - req_thresh,
+                    "edge": quality_edge,
                     "bybit_sym": bybit_sym,
                     "market_type": market_type,
                     "direction": direction,
@@ -642,6 +649,26 @@ class LiveAccountTradingBot:
                     "latest_bar_ms": latest_bar_ms,
                 })
             else:
+                # Daily Minimum-1 Trade Hunter: qualify strong directional setups if 0 trades have fired today
+                hunter_thresh = max(effective_min_prob - 0.04, 0.24)
+                if (
+                    need_daily_first_trade
+                    and not guard_blocked
+                    and (raw_4h_ok or mtf_mode.upper() != "STRICT")
+                    and raw_prob >= hunter_thresh
+                    and adx_val >= 18.0
+                    and vol_surge_val >= 1.15
+                ):
+                    daily_hunter_backups.append({
+                        "edge": quality_edge,
+                        "bybit_sym": bybit_sym,
+                        "market_type": market_type,
+                        "direction": direction,
+                        "cfg": cfg,
+                        "curr": curr.copy(),
+                        "latest_bar_ms": latest_bar_ms,
+                    })
+
                 reasons = []
                 if guard_blocked:
                     reasons.append("BTC 4H Macro Guard (BTC bearish)")
@@ -653,7 +680,6 @@ class LiveAccountTradingBot:
                     reasons.append(f"ML prob {raw_prob:.2f} < {effective_min_prob:.2f}")
                 block_msg = f"{bybit_sym} {direction} blocked: {', '.join(reasons)}"
                 diagnostics.append(block_msg)
-                # Surface high-probability signals that got blocked by guards
                 if raw_prob >= effective_min_prob:
                     trade_blocks.append(block_msg)
 
@@ -661,6 +687,11 @@ class LiveAccountTradingBot:
             gc.collect()
 
         candidates.sort(key=lambda x: x["edge"], reverse=True)
+        if not candidates and need_daily_first_trade and daily_hunter_backups:
+            daily_hunter_backups.sort(key=lambda x: x["edge"], reverse=True)
+            candidates = [daily_hunter_backups[0]]
+            diagnostics.append(f"Daily 1-Trade Hunter selected top setup: {candidates[0]['bybit_sym']} {candidates[0]['direction']}")
+
         live_trades_this_cycle = 0
 
         for cand in candidates:
@@ -684,8 +715,6 @@ class LiveAccountTradingBot:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT balance too low (${avail_usdt:.2f})"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
-                break
-            if live_trades_this_cycle >= 1:
                 break
             if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
                 trade_blocks.append(f"{bybit_sym}: Already traded on this candle")
@@ -751,7 +780,10 @@ class LiveAccountTradingBot:
                 traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
                 last_trade_epoch_ms[bybit_sym] = now_ms
                 daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
+                daily_total_trades += 1
+                state["daily_total_trades"] = daily_total_trades
                 live_trades_this_cycle += 1
+                avail_usdt = max(0.0, avail_usdt - (notional / leverage))
             else:
                 code = int(res.get("retCode", -1))
                 raw_msg = str(res.get("retMsg", "Unknown Bybit rejection"))
@@ -770,6 +802,7 @@ class LiveAccountTradingBot:
         return {
             "ok": True,
             "coins_scanned": coins_scanned_count,
+            "daily_total_trades": daily_total_trades,
             "open_positions_count": len(open_syms),
             "order_rejections": order_rejections,
             "trade_blocks": trade_blocks,
