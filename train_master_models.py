@@ -2,7 +2,8 @@
 """
 Standalone Master ML Trainer for AutonomousAITrading (PC / GitHub Release Builder)
 Trains the exact same 135-day, 18-feature XGBoost multi-timeframe models as paper_bot.py
-with live per-coin progress logging and incremental saving.
+for all specified coins in a single batch call and outputs a clean, compact
+UNIFIED_PORTFOLIO_MASTER.json ready for GitHub upload & instant new-user sync.
 """
 
 import os
@@ -39,24 +40,6 @@ DEFAULT_STRATEGIES = [
 ]
 
 
-def save_master_bundle(out_dir: str, trained_map: dict):
-    win_rates = [v["win_rate_pct"] for v in trained_map.values()]
-    total_pnl = sum(v["net_pnl_usdt"] for v in trained_map.values())
-    master_payload = {
-        "version": f"UNIFIED_MASTER_{len(trained_map)}C_{TRAINING_WINDOW_DAYS}D",
-        "exported_at": int(time.time()),
-        "training_days": TRAINING_WINDOW_DAYS,
-        "model_accuracy_pct": round(sum(win_rates) / len(win_rates), 2) if win_rates else 0.0,
-        "total_net_pnl": round(total_pnl, 2),
-        "features": FEATURES,
-        "portfolio": trained_map,
-    }
-    root_master_path = os.path.join(out_dir, "UNIFIED_PORTFOLIO_MASTER.json")
-    with open(root_master_path, "w", encoding="utf-8") as f:
-        json.dump(master_payload, f, indent=2)
-    return root_master_path
-
-
 def main():
     parser = argparse.ArgumentParser(description="Train Master XGBoost Portfolio JSON for GitHub Sync")
     parser.add_argument("--coins", nargs="+", default=DEFAULT_MASTER_COINS, help="List of symbols to train")
@@ -75,45 +58,54 @@ def main():
     t0 = time.time()
 
     trainer = PaperStrategyTrainerAndTester(paper_dir=paper_dir, models_dir=models_dir)
-    all_trained = {}
+    
+    # Train all coins in one batch call so all 15 symbols are correctly evaluated and saved together
+    trained = trainer.train_and_evaluate_paper_coins(
+        added_coins=args.coins,
+        active_strategies=DEFAULT_STRATEGIES,
+        timeframes=["15m", "30m", "1h", "4h"],
+        leverage=args.leverage,
+        crypto_enabled=True,
+        forex_enabled=args.forex,
+    )
+
+    if not trained:
+        print("Error: No coins were successfully trained.", flush=True)
+        return
+
+    win_rates = [v["win_rate_pct"] for v in trained.values()]
+    total_pnl = sum(v["net_pnl_usdt"] for v in trained.values())
+    master_payload = {
+        "version": f"UNIFIED_MASTER_{len(trained)}C_{TRAINING_WINDOW_DAYS}D",
+        "exported_at": int(time.time()),
+        "training_days": TRAINING_WINDOW_DAYS,
+        "model_accuracy_pct": round(sum(win_rates) / len(win_rates), 2) if win_rates else 0.0,
+        "total_net_pnl": round(total_pnl, 2),
+        "features": FEATURES,
+        "portfolio": trained,
+    }
+
+    # Save compact JSON (separators without extra whitespace) so file size is ~2.5 MB instead of 14 MB
     root_master_path = os.path.join(args.out_dir, "UNIFIED_PORTFOLIO_MASTER.json")
+    with open(root_master_path, "w", encoding="utf-8") as f:
+        json.dump(master_payload, f, separators=(",", ":"))
 
-    for idx, sym in enumerate(args.coins, start=1):
-        c_start = time.time()
-        print(f"[{idx}/{total}] Fetching 135d candles & training {sym}...", end=" ", flush=True)
-        res = trainer.train_and_evaluate_paper_coins(
-            added_coins=[sym],
-            active_strategies=DEFAULT_STRATEGIES,
-            timeframes=["15m", "30m", "1h", "4h"],
-            leverage=args.leverage,
-            crypto_enabled=True,
-            forex_enabled=args.forex,
-        )
-        c_sec = round(time.time() - c_start, 1)
-        if sym in res:
-            all_trained[sym] = res[sym]
-            info = res[sym]
-            root_master_path = save_master_bundle(args.out_dir, all_trained)
-            print(
-                f"DONE ({c_sec}s) | {info['strategy']} | WR: {info['win_rate_pct']:.1f}% | "
-                f"PF: {info['profit_factor']:.2f} | Trades: {info['trades']} | PnL: ${info['net_pnl_usdt']:.2f}",
-                flush=True,
-            )
-        else:
-            print(f"SKIPPED ({c_sec}s - insufficient candle data or network timeout)", flush=True)
-
-    # Also write complete portfolio into PAPER & LIVE master paths
-    if all_trained:
-        master_json = json.load(open(root_master_path, "r", encoding="utf-8"))
-        for sub in ("PAPER", "LIVE"):
-            sub_dir = os.path.join(models_dir, sub)
-            os.makedirs(sub_dir, exist_ok=True)
-            with open(os.path.join(sub_dir, "UNIFIED_PORTFOLIO_MASTER.json"), "w", encoding="utf-8") as sf:
-                json.dump(master_json, sf, indent=2)
+    # Copy into PAPER & LIVE subdirectories as well
+    for sub in ("PAPER", "LIVE"):
+        sub_dir = os.path.join(models_dir, sub)
+        os.makedirs(sub_dir, exist_ok=True)
+        with open(os.path.join(sub_dir, "UNIFIED_PORTFOLIO_MASTER.json"), "w", encoding="utf-8") as sf:
+            json.dump(master_payload, sf, separators=(",", ":"))
 
     elapsed = round(time.time() - t0, 1)
-    print(f"\nCompleted in {elapsed}s! Trained {len(all_trained)}/{total} symbols.", flush=True)
-    print(f"Saved GitHub-ready master model to: {os.path.abspath(root_master_path)}", flush=True)
+    print(f"\nCompleted in {elapsed}s! Successfully trained {len(trained)}/{total} symbols:", flush=True)
+    for sym, info in sorted(trained.items(), key=lambda x: x[1]["net_pnl_usdt"], reverse=True):
+        print(
+            f"  - {sym:<10} | {info['strategy']:<38} | WR: {info['win_rate_pct']:>5.1f}% | "
+            f"PF: {info['profit_factor']:>4.2f} | Trades: {info['trades']:>3} | PnL: ${info['net_pnl_usdt']:>8.2f}",
+            flush=True,
+        )
+    print(f"\nSaved GitHub-ready master model to: {os.path.abspath(root_master_path)}", flush=True)
 
 
 if __name__ == "__main__":

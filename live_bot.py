@@ -1,4 +1,5 @@
 ﻿import os
+import gc
 import sys
 import json
 import time
@@ -27,6 +28,23 @@ FEATURES = [
     "VWAP_Dev"
 ]
 
+BYBIT_ERROR_HINTS = {
+    10001: "Invalid order parameter / quantity step or price precision",
+    10003: "API key invalid or Mainnet/Demo endpoint mismatch",
+    10004: "API signature mismatch — check API Secret",
+    10006: "Bybit API rate limit exceeded",
+    110001: "Order does not exist or already filled",
+    110003: "Order price exceeds allowable range",
+    110004: "Wallet balance is insufficient for margin",
+    110007: "Available USDT balance is insufficient to open position",
+    110012: "Insufficient available balance",
+    110013: "Cannot set leverage due to risk limit tier — lower leverage",
+    110016: "Order quantity exceeds max risk limit tier",
+    110043: "Leverage unchanged or position margin mode conflict",
+    110044: "Available margin is insufficient",
+    110132: "Contract not available in your region",
+}
+
 
 def is_forex_symbol(symbol: str) -> bool:
     clean = symbol.replace("/", "").upper()
@@ -52,6 +70,7 @@ class LiveAccountTradingBot:
         self.master_path = p1 if os.path.exists(p1) else p2
 
         self.is_demo = str(endpoint).lower() in ("testnet", "demo")
+        # Prioritize api.bytick.com first (reliable where api.bybit.com DNS is blocked)
         self.host_candidates = (
             ["https://api-demo.bybit.com", "https://api.bytick.com", "https://api.bybit.com"]
             if self.is_demo
@@ -64,9 +83,8 @@ class LiveAccountTradingBot:
         self._booster_cache = {}
         self._instrument_cache = {}
 
-        # Persistent HTTP Keep-Alive session to avoid repeated TLS handshakes
         self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=6, pool_maxsize=6)
         self.session.mount("https://", adapter)
 
     def _load_state(self) -> dict:
@@ -82,6 +100,9 @@ class LiveAccountTradingBot:
             "daily_coin_trades": {},
             "tp1_partial_done": {},
             "last_diagnostics": [],
+            "last_order_rejections": [],
+            "last_trade_blocks": [],
+            "coins_scanned": 0,
         }
 
     def _save_state(self, state: dict):
@@ -200,7 +221,7 @@ class LiveAccountTradingBot:
             df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"])
             df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
             for col in ["Open", "High", "Low", "Close", "Volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
             return df.sort_values("timestamp").set_index("timestamp")
 
         if is_forex_symbol(bybit_symbol):
@@ -365,8 +386,12 @@ class LiveAccountTradingBot:
             raise ValueError(f"Invalid XGBoost booster format for {cache_key} (missing 'learner'). Retrain Paper model.")
         if cache_key in self._booster_cache:
             return self._booster_cache[cache_key]
+        # Keep booster cache bounded to max 16 boosters for 4-6GB RAM phones
+        if len(self._booster_cache) >= 16:
+            oldest_key = next(iter(self._booster_cache))
+            self._booster_cache.pop(oldest_key, None)
+
         booster = xgb.Booster()
-        # Use persistent live_dir instead of volatile Android /cache/tmp/
         os.makedirs(self.live_dir, exist_ok=True)
         tmp_path = os.path.join(self.live_dir, f"_tmp_live_{cache_key}_{os.getpid()}.json")
         try:
@@ -482,7 +507,7 @@ class LiveAccountTradingBot:
         btc_macro_guard: bool = True,
         daily_drawdown_pct: float = 0.0,
         max_daily_loss_pct: float = 3.0,
-    ):
+    ) -> dict:
         if not os.path.exists(self.master_path):
             raise FileNotFoundError(f"Master ML Model not found at {self.master_path}")
 
@@ -500,6 +525,8 @@ class LiveAccountTradingBot:
         last_trade_epoch_ms = state.setdefault("last_trade_epoch_ms", {})
         daily_coin_trades = state.setdefault("daily_coin_trades", {})
         diagnostics = []
+        order_rejections = []
+        trade_blocks = []
         today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         if daily_coin_trades.get("_date") != today_str:
             daily_coin_trades.clear()
@@ -520,8 +547,12 @@ class LiveAccountTradingBot:
                 btc_4h_df = self.build_features(btc_4h_raw)
                 if not btc_4h_df.empty and int(btc_4h_df.iloc[-1]["Supertrend"]) == -1:
                     btc_macro_bearish = True
+                del btc_4h_df
+            del btc_4h_raw
 
         candidates = []
+        coins_scanned_count = 0
+
         for symbol, entry in portfolio.items():
             if not isinstance(entry, dict):
                 continue
@@ -530,9 +561,14 @@ class LiveAccountTradingBot:
             if (market_type == "CRYPTO" and not crypto_enabled) or (market_type == "FOREX" and not forex_enabled):
                 continue
 
+            coins_scanned_count += 1
             cfg = entry.get("config", {})
             bybit_sym = (cfg.get("bybit_symbol") or symbol.replace("/", "")).upper()
-            if bybit_sym in open_syms or int(daily_coin_trades.get(bybit_sym, 0)) >= 2:
+            if bybit_sym in open_syms:
+                trade_blocks.append(f"{bybit_sym}: Already has an open position")
+                continue
+            if int(daily_coin_trades.get(bybit_sym, 0)) >= 2:
+                trade_blocks.append(f"{bybit_sym}: Daily max 2 trades per coin reached")
                 continue
 
             models_map = entry.get("models", {})
@@ -553,6 +589,7 @@ class LiveAccountTradingBot:
                 continue
 
             df = self.build_features(df_raw)
+            del df_raw
             if len(df) < 2:
                 continue
             prev = df.iloc[-2]
@@ -563,6 +600,7 @@ class LiveAccountTradingBot:
                 dmat = xgb.DMatrix(df.iloc[[-1]][features])
                 p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
                 p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
+                del dmat
             except Exception as e:
                 diagnostics.append(f"{bybit_sym}: Booster predict error ({e})")
                 continue
@@ -578,6 +616,7 @@ class LiveAccountTradingBot:
                 raw_4h = self.fetch_bybit_candles(bybit_sym, interval="240", limit=220)
                 df_4h = self.build_features(raw_4h) if len(raw_4h) >= 210 else pd.DataFrame()
                 trend_4h = int(df_4h.iloc[-1]["Supertrend"]) if not df_4h.empty else 0
+                del raw_4h, df_4h
 
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.07) and (float(curr["Vol_Surge"]) >= 1.20)
@@ -590,7 +629,6 @@ class LiveAccountTradingBot:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
             strat_ok = self._strategy_entry_filter(strat_id, curr, prev, direction, relaxed=is_relaxed)
-            # Honor exact calibrated threshold from Paper training (floored safely at 0.20)
             effective_min_prob = max(req_thresh, 0.20)
 
             if mtf_aligned and strat_ok and raw_prob >= effective_min_prob:
@@ -600,20 +638,27 @@ class LiveAccountTradingBot:
                     "market_type": market_type,
                     "direction": direction,
                     "cfg": cfg,
-                    "curr": curr,
+                    "curr": curr.copy(),
                     "latest_bar_ms": latest_bar_ms,
                 })
             else:
                 reasons = []
                 if guard_blocked:
-                    reasons.append("BTC 4H Macro Guard")
+                    reasons.append("BTC 4H Macro Guard (BTC bearish)")
                 elif not mtf_aligned:
-                    reasons.append("4H MTF misaligned")
+                    reasons.append(f"4H MTF trend misaligned ({mtf_mode})")
                 if not strat_ok:
                     reasons.append(f"Strategy filter ({strat_id})")
                 if raw_prob < effective_min_prob:
-                    reasons.append(f"Prob {raw_prob:.2f} < {effective_min_prob:.2f}")
-                diagnostics.append(f"{bybit_sym} {direction}: skipped ({', '.join(reasons)})")
+                    reasons.append(f"ML prob {raw_prob:.2f} < {effective_min_prob:.2f}")
+                block_msg = f"{bybit_sym} {direction} blocked: {', '.join(reasons)}"
+                diagnostics.append(block_msg)
+                # Surface high-probability signals that got blocked by guards
+                if raw_prob >= effective_min_prob:
+                    trade_blocks.append(block_msg)
+
+            del df
+            gc.collect()
 
         candidates.sort(key=lambda x: x["edge"], reverse=True)
         live_trades_this_cycle = 0
@@ -621,21 +666,39 @@ class LiveAccountTradingBot:
         for cand in candidates:
             bybit_sym = cand["bybit_sym"]
             if not live_orders_armed:
-                diagnostics.append("Live Orders Armed is OFF")
+                msg = f"{bybit_sym} {cand['direction']} blocked: Live Orders Armed switch is OFF"
+                diagnostics.append(msg)
+                trade_blocks.append(msg)
                 break
             if daily_drawdown_pct >= max_daily_loss_pct and max_daily_loss_pct > 0.0:
-                diagnostics.append(f"Daily drawdown limit reached ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)")
+                msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit reached ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
+                diagnostics.append(msg)
+                trade_blocks.append(msg)
                 break
-            if len(open_syms) >= max_open_positions or avail_usdt < 2.0 or live_trades_this_cycle >= 1:
+            if len(open_syms) >= max_open_positions:
+                msg = f"{bybit_sym} {cand['direction']} blocked: Max open positions reached ({len(open_syms)}/{max_open_positions})"
+                diagnostics.append(msg)
+                trade_blocks.append(msg)
+                break
+            if avail_usdt < 2.0:
+                msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT balance too low (${avail_usdt:.2f})"
+                diagnostics.append(msg)
+                trade_blocks.append(msg)
+                break
+            if live_trades_this_cycle >= 1:
                 break
             if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
+                trade_blocks.append(f"{bybit_sym}: Already traded on this candle")
                 continue
             if (now_ms - int(last_trade_epoch_ms.get(bybit_sym, 0))) < 15 * 60 * 1000:
+                trade_blocks.append(f"{bybit_sym}: 15-minute cooldown active")
                 continue
 
             filters = self._get_instrument_filters(bybit_sym)
             if filters is None:
-                diagnostics.append(f"{bybit_sym}: Instrument info unavailable on Bybit")
+                msg = f"{bybit_sym} blocked: Instrument specs unavailable on Bybit"
+                diagnostics.append(msg)
+                trade_blocks.append(msg)
                 continue
             qty_step, min_qty, min_notional, tick_size = filters
 
@@ -651,9 +714,9 @@ class LiveAccountTradingBot:
             max_buying_power = avail_usdt * leverage * 0.85
             min_required_notional = max(min_notional * 1.05, min_qty * price)
             if max_buying_power < min_required_notional:
-                diagnostics.append(
-                    f"{bybit_sym}: Min order (${min_required_notional:.2f}) > max buying power (${max_buying_power:.2f})"
-                )
+                msg = f"{bybit_sym} {cand['direction']} blocked: Min order ${min_required_notional:.2f} > buying power ${max_buying_power:.2f}"
+                diagnostics.append(msg)
+                trade_blocks.append(msg)
                 continue
 
             risk_usdt = max(avail_usdt * (risk_per_trade_pct / 100.0), 0.15)
@@ -690,10 +753,28 @@ class LiveAccountTradingBot:
                 daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
                 live_trades_this_cycle += 1
             else:
-                diagnostics.append(f"{bybit_sym} Order Rejected: [{res.get('retCode')}] {res.get('retMsg', 'Unknown error')}")
+                code = int(res.get("retCode", -1))
+                raw_msg = str(res.get("retMsg", "Unknown Bybit rejection"))
+                hint = BYBIT_ERROR_HINTS.get(code, raw_msg)
+                rej_msg = f"{bybit_sym} {cand['direction']} (qty {qty_str}) rejected by Bybit [{code}]: {hint} ({raw_msg})"
+                diagnostics.append(rej_msg)
+                order_rejections.append(rej_msg)
 
+        state["coins_scanned"] = coins_scanned_count
         state["last_diagnostics"] = diagnostics[-25:]
+        state["last_order_rejections"] = order_rejections[-10:]
+        state["last_trade_blocks"] = trade_blocks[-15:]
         self._save_state(state)
+        gc.collect()
+
+        return {
+            "ok": True,
+            "coins_scanned": coins_scanned_count,
+            "open_positions_count": len(open_syms),
+            "order_rejections": order_rejections,
+            "trade_blocks": trade_blocks,
+            "diagnostics": diagnostics[-10:],
+        }
 
 
 if __name__ == "__main__":
@@ -725,7 +806,7 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2 and sys.argv[1] == "--kill":
         print(json.dumps({"ok": True, "closed": bot.emergency_close_all()}))
     elif api_key and api_secret:
-        bot.run_live_cycle(
+        out = bot.run_live_cycle(
             leverage=int(runtime_cfg.get("leverage", 10)),
             risk_per_trade_pct=float(runtime_cfg.get("risk_per_trade_pct", 1.5)),
             max_open_positions=int(runtime_cfg.get("max_open_positions", 2)),
@@ -737,4 +818,4 @@ if __name__ == "__main__":
             daily_drawdown_pct=float(runtime_cfg.get("daily_drawdown_pct", 0.0)),
             max_daily_loss_pct=float(runtime_cfg.get("max_daily_loss_pct", 3.0)),
         )
-        print("Live cycle completed safely.")
+        print(json.dumps(out))

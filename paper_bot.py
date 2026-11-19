@@ -1,4 +1,5 @@
 ﻿import os
+import gc
 import sys
 import json
 import time
@@ -99,7 +100,7 @@ class PaperStrategyTrainerAndTester:
         self.rate_limit_cap = 120
 
         self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=6, pool_maxsize=6)
         self.session.mount("https://", adapter)
 
         os.makedirs(paper_dir, exist_ok=True)
@@ -176,10 +177,12 @@ class PaperStrategyTrainerAndTester:
                 df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
                 df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
                 df = df.set_index("timestamp").sort_index()
+                for col in ["Open", "High", "Low", "Close", "Volume"]:
+                    df[col] = df[col].astype("float32")
 
                 bar_range = (df["High"] - df["Low"]).clip(lower=1e-6)
                 avg_range = bar_range.rolling(20, min_periods=1).mean().clip(lower=1e-6)
-                df["Volume"] = ((bar_range / avg_range) * 1000.0).clip(lower=200.0, upper=5000.0)
+                df["Volume"] = ((bar_range / avg_range) * 1000.0).clip(lower=200.0, upper=5000.0).astype("float32")
 
                 if tf_key == "4h":
                     df = df.resample("4h").agg({
@@ -247,8 +250,8 @@ class PaperStrategyTrainerAndTester:
         df = pd.DataFrame(ordered_rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"])
         df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
         for col in ["Open", "High", "Low", "Close", "Volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df.set_index("timestamp")
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+        return df.drop(columns=["Turnover"]).set_index("timestamp")
 
     def build_matrix(self, df: pd.DataFrame, max_dd: float = 0.95, expansion: float = 1.25, horizon: int = 10) -> pd.DataFrame:
         data = df.copy()
@@ -304,7 +307,6 @@ class PaperStrategyTrainerAndTester:
         session_vwap = (typical_px * vol_safe).rolling(24).sum() / (vol_safe.rolling(24).sum() + 1e-9)
         data["VWAP_Dev"] = (c - session_vwap) / (data["ATR"] + 1e-9)
 
-        # Fast NumPy Supertrend calculation (15x faster than pandas .iloc loop)
         hl2 = ((data["High"] + data["Low"]) * 0.5).to_numpy()
         atr_arr = data["ATR"].fillna(0.0).to_numpy()
         c_arr = c.to_numpy()
@@ -358,7 +360,7 @@ class PaperStrategyTrainerAndTester:
         if y_s.sum() < 5:
             y_s.iloc[-5:] = 1
 
-        # Regularized XGBoost (L1/L2 + min_child_weight) to prevent overfitting on noisy wicks
+        # Cap n_jobs=2 so 4-6GB RAM phones keep UI responsive during training
         params = dict(
             n_estimators=105,
             max_depth=3,
@@ -368,18 +370,18 @@ class PaperStrategyTrainerAndTester:
             min_child_weight=5,
             reg_alpha=0.5,
             reg_lambda=1.5,
-            n_jobs=4,
+            n_jobs=2,
             eval_metric="logloss",
             random_state=42,
         )
         clf_long = xgb.XGBClassifier(**params)
         clf_short = xgb.XGBClassifier(**params)
-        clf_long.fit(train_df[FEATURES], y_l)
-        clf_short.fit(train_df[FEATURES], y_s)
+        X_train = train_df[FEATURES].astype("float32")
+        clf_long.fit(X_train, y_l)
+        clf_short.fit(X_train, y_s)
         return clf_long, clf_short
 
     def _compute_vectorized_filter_masks(self, test_df: pd.DataFrame, strategy_id: str, relaxed: bool = False):
-        """Computes boolean entry masks across all test bars in vectorized NumPy (40x faster than row-by-row pandas)."""
         n = len(test_df)
         long_ok = np.zeros(n, dtype=bool)
         short_ok = np.zeros(n, dtype=bool)
@@ -456,26 +458,36 @@ class PaperStrategyTrainerAndTester:
         htf_dir_aligned: np.ndarray = None,
         relaxed_filter: bool = False,
         extra_quantile_thresholds: list = None,
+        extended_param_sweep: bool = False,
     ) -> dict:
         round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (BYBIT_TAKER_FEE * 2.0)
 
         param_configs = [
-            (0.18, 1.05, 1.60, False),
-            (0.24, 1.15, 1.75, False),
-            (0.30, 1.30, 1.90, True),
-            (0.36, 1.45, 2.05, True),
-            (0.42, 1.65, 2.20, True),
+            (0.18, 1.05, 1.60, False, 1.8),
+            (0.24, 1.15, 1.75, False, 1.8),
+            (0.30, 1.30, 1.90, True, 1.8),
+            (0.36, 1.45, 2.05, True, 1.8),
+            (0.42, 1.65, 2.20, True, 1.8),
         ] if is_forex else [
-            (0.22, 1.15, 1.70, False),
-            (0.28, 1.25, 1.85, False),
-            (0.34, 1.35, 2.00, True),
-            (0.40, 1.50, 2.15, True),
-            (0.46, 1.70, 2.35, True),
+            (0.22, 1.15, 1.70, False, 1.8),
+            (0.28, 1.25, 1.85, False, 1.8),
+            (0.34, 1.35, 2.00, True, 1.8),
+            (0.40, 1.50, 2.15, True, 1.8),
+            (0.46, 1.70, 2.35, True, 1.8),
         ]
+
+        # Extended parameter sweep when initial pass yields low PnL or few trades
+        if extended_param_sweep:
+            param_configs.extend([
+                (0.20, 1.60, 2.40, False, 2.2),
+                (0.26, 1.80, 2.60, False, 2.4),
+                (0.32, 0.95, 1.55, False, 1.4),
+                (0.38, 1.95, 2.80, True, 2.5),
+            ])
 
         if extra_quantile_thresholds:
             for qt in extra_quantile_thresholds:
-                param_configs.append((round(float(qt), 4), 1.20, 1.75, False))
+                param_configs.append((round(float(qt), 4), 1.25, 1.85, False, 1.9))
 
         opens = test_df["Open"].to_numpy()
         highs = test_df["High"].to_numpy()
@@ -490,7 +502,7 @@ class PaperStrategyTrainerAndTester:
         best_eval = None
         best_score = -9999999.0
 
-        for thresh, sl_atr, tp1_rr, require_htf in param_configs:
+        for thresh, sl_atr, tp1_rr, require_htf, trail_mult in param_configs:
             tp2_rr = tp1_rr * 1.75
             cfg = {
                 "long_thresh": thresh,
@@ -498,13 +510,12 @@ class PaperStrategyTrainerAndTester:
                 "sl_atr": sl_atr,
                 "tp1_rr": tp1_rr,
                 "tp2_rr": tp2_rr,
-                "trail_atr": 1.8,
+                "trail_atr": trail_mult,
                 "strategy_id": strategy_id,
                 "timeframe": timeframe,
                 "relaxed_filter": relaxed_filter,
             }
 
-            # Precompute vectorized entry arrays for this parameter set
             le_arr = np.zeros(n_bars, dtype=bool)
             se_arr = np.zeros(n_bars, dtype=bool)
             le_arr[1:] = (p_long[:-1] >= thresh) & f_long[1:]
@@ -561,7 +572,7 @@ class PaperStrategyTrainerAndTester:
                             tp1_hit = True
                             sl = entry + 0.20 * (tp1 - entry)
                         if tp1_hit:
-                            tr_sl = high_w - 1.8 * atr
+                            tr_sl = high_w - trail_mult * atr
                             if tr_sl > sl:
                                 sl = tr_sl
                         if l <= sl or h >= tp2:
@@ -578,7 +589,7 @@ class PaperStrategyTrainerAndTester:
                             tp1_hit = True
                             sl = entry - 0.20 * (entry - tp1)
                         if tp1_hit:
-                            tr_sl = low_w + 1.8 * atr
+                            tr_sl = low_w + trail_mult * atr
                             if tr_sl < sl:
                                 sl = tr_sl
                         if h >= sl or l <= tp2:
@@ -599,7 +610,6 @@ class PaperStrategyTrainerAndTester:
             net_pct = round((net_usdt / initial_capital) * 100.0, 2)
             sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
 
-            # Strict quality scoring so Live models prioritize positive expectancy + clean Profit Factor
             if total_trades == 0:
                 score = -100000.0
             elif total_trades >= min_req_trades and pf >= 1.25 and wr >= 50.0 and net_usdt > 0:
@@ -663,7 +673,6 @@ class PaperStrategyTrainerAndTester:
         if not test_tfs:
             test_tfs = ["1h", "4h"]
 
-        # Deduplicate strategy filter archetypes so we test every distinct logic without redundant loops
         raw_strats = active_strategies if active_strategies else ["xgb_mtf_v2"]
         seen_archetypes = set()
         strategies_to_test = []
@@ -697,6 +706,7 @@ class PaperStrategyTrainerAndTester:
                 df_4h = self.build_matrix(raw_4h, max_dd=dd_atr, expansion=exp_atr, horizon=hor_bars)
                 if not df_4h.empty:
                     htf_trend = df_4h["Supertrend"]
+                del df_4h
 
             best_candidate = None
             all_tf_runs = []
@@ -711,7 +721,6 @@ class PaperStrategyTrainerAndTester:
                 if len(df) < 180:
                     continue
 
-                # Purged embargo split (embargo = hor_bars) so forward target labels never leak into validation
                 split = int(len(df) * 0.65)
                 train_end = max(120, split - hor_bars)
                 train_df = df.iloc[:train_end]
@@ -723,10 +732,10 @@ class PaperStrategyTrainerAndTester:
                 f_stds = train_df[FEATURES].std().replace(0, 1.0).fillna(1.0).tolist()
                 clf_long, clf_short = self._fit_xgb_pair(train_df)
 
-                p_long = clf_long.predict_proba(test_df[FEATURES])[:, 1]
-                p_short = clf_short.predict_proba(test_df[FEATURES])[:, 1]
+                X_test = test_df[FEATURES].astype("float32")
+                p_long = clf_long.predict_proba(X_test)[:, 1]
+                p_short = clf_short.predict_proba(X_test)[:, 1]
 
-                # Pre-align 4H Supertrend direction array once per timeframe
                 htf_dir_aligned = None
                 if tf != "4h" and htf_trend is not None and not htf_trend.empty:
                     aligned_series = htf_trend.reindex(test_df.index, method="ffill").fillna(0)
@@ -779,9 +788,12 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            # Stage 2: Automatic zero-trade / low-trade quantile escalation
-            current_trades = best_candidate["stats"]["trades"] if best_candidate else 0
-            if current_trades < min_req_trades and cached_tf_bundles:
+            # Stage 2: Adaptive Parameter Sweep when trades < min_req_trades OR Net PnL <= 0 / PF < 1.15
+            cur_trades = best_candidate["stats"]["trades"] if best_candidate else 0
+            cur_pnl = best_candidate["stats"]["net_pnl_usdt"] if best_candidate else -999.0
+            cur_pf = best_candidate["stats"]["profit_factor"] if best_candidate else 0.0
+
+            if (cur_trades < min_req_trades or cur_pnl <= 0.0 or cur_pf < 1.15) and cached_tf_bundles:
                 for tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds in cached_tf_bundles:
                     q_thresholds = sorted(set([
                         float(np.quantile(np.maximum(p_long, p_short), 0.72)),
@@ -800,17 +812,19 @@ class PaperStrategyTrainerAndTester:
                         htf_dir_aligned=None,
                         relaxed_filter=True,
                         extra_quantile_thresholds=q_thresholds,
+                        extended_param_sweep=True,
                     )
                     st = eval_res["stats"]
-                    if best_candidate is None or (st["trades"] > current_trades and eval_res["score"] > best_candidate["score"]):
-                        current_trades = st["trades"]
+                    if best_candidate is None or eval_res["score"] > best_candidate["score"]:
+                        cur_trades = st["trades"]
+                        cur_pnl = st["net_pnl_usdt"]
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
-                        cfg["strategy"] = f"Adaptive XGBoost Quantile ({tf.upper()})"
+                        cfg["strategy"] = f"Adaptive Tuned XGBoost ({tf.upper()})"
                         best_candidate = {
                             "score": eval_res["score"],
                             "strategy_id": "xgb_adaptive_quantile",
-                            "strategy_name": "Adaptive XGBoost Quantile",
+                            "strategy_name": "Adaptive Tuned XGBoost",
                             "timeframe": tf.upper(),
                             "stats": st,
                             "cfg": cfg,
@@ -822,10 +836,10 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            # Stage 3: High-sensitivity target escalation on primary 1H/4H timeframes
-            if current_trades < min_req_trades and cached_tf_bundles:
+            # Stage 3: High-sensitivity target retrain on 1H/4H if still below minimum trades or unprofitable
+            if (cur_trades < min_req_trades or cur_pnl <= 0.0) and cached_tf_bundles:
                 for tf, raw, _, _, _, _, _, _, _ in [b for b in cached_tf_bundles if b[0] in ("1h", "4h")]:
-                    df_sens = self.build_matrix(raw, max_dd=1.10, expansion=0.75, horizon=14)
+                    df_sens = self.build_matrix(raw, max_dd=1.15, expansion=0.75, horizon=14)
                     if len(df_sens) < 180:
                         continue
                     split = int(len(df_sens) * 0.65)
@@ -834,8 +848,9 @@ class PaperStrategyTrainerAndTester:
                     f_means = train_s[FEATURES].mean().tolist()
                     f_stds = train_s[FEATURES].std().replace(0, 1.0).fillna(1.0).tolist()
                     clf_l2, clf_s2 = self._fit_xgb_pair(train_s)
-                    pl2 = clf_l2.predict_proba(test_s[FEATURES])[:, 1]
-                    ps2 = clf_s2.predict_proba(test_s[FEATURES])[:, 1]
+                    X_test_s = test_s[FEATURES].astype("float32")
+                    pl2 = clf_l2.predict_proba(X_test_s)[:, 1]
+                    ps2 = clf_s2.predict_proba(X_test_s)[:, 1]
                     q_sens = sorted(set([
                         float(np.quantile(np.maximum(pl2, ps2), 0.72)),
                         float(np.quantile(np.maximum(pl2, ps2), 0.82)),
@@ -852,10 +867,10 @@ class PaperStrategyTrainerAndTester:
                         htf_dir_aligned=None,
                         relaxed_filter=True,
                         extra_quantile_thresholds=q_sens,
+                        extended_param_sweep=True,
                     )
                     st = eval_res["stats"]
-                    if best_candidate is None or (st["trades"] > current_trades and eval_res["score"] > best_candidate["score"]):
-                        current_trades = st["trades"]
+                    if best_candidate is None or eval_res["score"] > best_candidate["score"]:
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
                         cfg["strategy"] = f"High-Sensitivity XGBoost ({tf.upper()})"
@@ -873,6 +888,11 @@ class PaperStrategyTrainerAndTester:
                                 "feature_stds": f_stds,
                             },
                         }
+                    del df_sens, train_s, test_s, clf_l2, clf_s2
+
+            # Explicitly release memory per coin for 4-6GB RAM phones
+            del cached_tf_bundles, raw_4h
+            gc.collect()
 
             if best_candidate is None:
                 continue
@@ -923,6 +943,7 @@ class PaperStrategyTrainerAndTester:
         self._prune_old_trained_models(keep_latest=MAX_KEPT_MODEL_VERSIONS)
 
         self.auto_compare_with_live(trained_coins)
+        gc.collect()
         return trained_coins
 
     def auto_compare_with_live(self, paper_coins_dict: dict) -> list:
