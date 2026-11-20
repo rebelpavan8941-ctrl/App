@@ -210,6 +210,22 @@ class LiveAccountTradingBot:
         decimals = len(clean_step.split(".")[1]) if "." in clean_step else 0
         return f"{scaled:.{decimals}f}"
 
+    @staticmethod
+    def _regime_exit_multipliers(adx_val: float, natr_val: float, btc_bearish: bool) -> tuple:
+        # Returns (sl_mult, tp_mult, trail_ratio) adapted to current market regime
+        if natr_val >= 2.8 or (adx_val < 14.0 and btc_bearish):
+            return 1.15, 0.85, 0.35
+        if not btc_bearish and adx_val >= 18.0 and natr_val < 2.6:
+            return 1.05, 1.20, 0.55
+        return 1.00, 1.00, 0.45
+
+    @staticmethod
+    def _conviction_risk_scale(raw_prob: float, req_thresh: float) -> float:
+        # Safely scales risk between 0.85x and 1.20x based on ML probability edge over threshold
+        edge = max(0.0, raw_prob - req_thresh)
+        scale = 0.85 + min(edge * 2.2, 0.35)
+        return round(min(max(scale, 0.85), 1.20), 4)
+
     def fetch_bybit_candles(self, bybit_symbol: str, interval: str = "60", limit: int = 230) -> pd.DataFrame:
         data = self._public_get(
             "/v5/market/kline",
@@ -439,7 +455,7 @@ class LiveAccountTradingBot:
                     pass
         return booster
 
-    def sync_positions_and_trail_stops(self, state: dict) -> list:
+    def sync_positions_and_trail_stops(self, state: dict, trail_ratio: float = 0.45) -> list:
         res = self._bybit_request("GET", "/v5/position/list", {"category": self.category, "settleCoin": "USDT"})
         tp1_done_map = state.setdefault("tp1_partial_done", {})
         active_list = []
@@ -481,7 +497,7 @@ class LiveAccountTradingBot:
                                 if p_res.get("retCode") == 0:
                                     tp1_done_map[pos_key] = True
 
-                        trail_offset = tp_dist * 0.45
+                        trail_offset = tp_dist * trail_ratio
                         cand_sl = max(entry + tp_dist * 0.15, mark - trail_offset) if side == "LONG" else min(
                             entry - tp_dist * 0.15, mark + trail_offset
                         )
@@ -573,20 +589,25 @@ class LiveAccountTradingBot:
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         avail_usdt = float(bal_res.get("result", {}).get("list", [{}])[0].get("totalAvailableBalance", 0.0))
 
-        open_positions = self.sync_positions_and_trail_stops(state)
-        open_syms = {p["symbol"] for p in open_positions}
-        if open_positions and need_daily_first_trade:
-            need_daily_first_trade = False
-
         btc_macro_bearish = False
+        btc_adx = 20.0
+        btc_natr = 1.8
         if btc_macro_guard:
             btc_4h_raw = self.fetch_bybit_candles("BTCUSDT", interval="240", limit=220)
             if len(btc_4h_raw) >= 210:
                 btc_4h_df = self.build_features(btc_4h_raw)
-                if not btc_4h_df.empty and int(btc_4h_df.iloc[-1]["Supertrend"]) == -1:
-                    btc_macro_bearish = True
+                if not btc_4h_df.empty:
+                    btc_macro_bearish = bool(int(btc_4h_df.iloc[-1]["Supertrend"]) == -1)
+                    btc_adx = float(btc_4h_df.iloc[-1].get("ADX", 20.0))
+                    btc_natr = float(btc_4h_df.iloc[-1].get("NATR", 1.8))
                 del btc_4h_df
             del btc_4h_raw
+
+        sl_mult, tp_mult, trail_ratio = self._regime_exit_multipliers(btc_adx, btc_natr, btc_macro_bearish)
+        open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio)
+        open_syms = {p["symbol"] for p in open_positions}
+        if open_positions and need_daily_first_trade:
+            need_daily_first_trade = False
 
         candidates = []
         daily_hunter_backups = []
@@ -659,7 +680,6 @@ class LiveAccountTradingBot:
             high_conv_rev = (raw_prob >= req_thresh + 0.07) and (float(curr["Vol_Surge"]) >= 1.20)
             guard_blocked = btc_macro_bearish and direction == "LONG" and market_type == "CRYPTO" and not bybit_sym.startswith("BTC")
 
-            # Use the coin's trained 4H MTF mode (OFF, SOFT, or STRICT) if available, otherwise fall back to global mtf_mode
             effective_mtf = str(cfg.get("mtf_alignment_mode") or entry.get("mtf_alignment_mode") or mtf_mode).upper()
             if effective_mtf == "OFF":
                 mtf_aligned = not guard_blocked
@@ -685,6 +705,8 @@ class LiveAccountTradingBot:
             if mtf_aligned and strat_ok and raw_prob >= effective_min_prob:
                 candidates.append({
                     "edge": quality_edge,
+                    "raw_prob": raw_prob,
+                    "req_thresh": effective_min_prob,
                     "bybit_sym": bybit_sym,
                     "market_type": market_type,
                     "direction": direction,
@@ -693,7 +715,6 @@ class LiveAccountTradingBot:
                     "latest_bar_ms": latest_bar_ms,
                 })
             else:
-                # Daily Minimum-1 Trade Hunter: qualify strong directional setups if 0 trades have fired today
                 hunter_thresh = max(effective_min_prob - 0.04, 0.24)
                 if (
                     need_daily_first_trade
@@ -705,6 +726,8 @@ class LiveAccountTradingBot:
                 ):
                     daily_hunter_backups.append({
                         "edge": quality_edge,
+                        "raw_prob": raw_prob,
+                        "req_thresh": hunter_thresh,
                         "bybit_sym": bybit_sym,
                         "market_type": market_type,
                         "direction": direction,
@@ -779,8 +802,8 @@ class LiveAccountTradingBot:
             cfg = cand["cfg"]
             price = float(curr["Close"])
             atr = float(curr["ATR"])
-            sl_atr = max(float(cfg.get("sl_atr", 1.35)), 0.80)
-            tp_rr = max(float(cfg.get("tp2_rr", 3.0)), 2.2)
+            sl_atr = max(float(cfg.get("sl_atr", 1.35)) * sl_mult, 0.80)
+            tp_rr = max(float(cfg.get("tp2_rr", 3.0)) * tp_mult, 1.8)
             min_sl_floor = price * (0.0010 if cand["market_type"] == "FOREX" else 0.0075)
             risk_dist = max(sl_atr * atr, min_sl_floor)
 
@@ -792,7 +815,10 @@ class LiveAccountTradingBot:
                 trade_blocks.append(msg)
                 continue
 
-            risk_usdt = max(avail_usdt * (risk_per_trade_pct / 100.0), 0.15)
+            conv_scale = self._conviction_risk_scale(float(cand.get("raw_prob", 0.3)), float(cand.get("req_thresh", 0.3)))
+            max_risk_cap = max(risk_per_trade_pct * 1.20, 2.50)
+            scaled_risk_pct = min(max(risk_per_trade_pct * conv_scale, 0.50), max_risk_cap)
+            risk_usdt = max(avail_usdt * (scaled_risk_pct / 100.0), 0.15)
             notional = min(max(risk_usdt / (risk_dist / price), min_required_notional, 5.5), max_buying_power)
             qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)
 
