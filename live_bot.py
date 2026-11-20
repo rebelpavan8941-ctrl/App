@@ -102,6 +102,8 @@ class LiveAccountTradingBot:
             "last_diagnostics": [],
             "last_order_rejections": [],
             "last_trade_blocks": [],
+            "last_skip_notice_key": "",
+            "last_skip_notice_ms": 0,
             "coins_scanned": 0,
         }
 
@@ -587,6 +589,10 @@ class LiveAccountTradingBot:
         now_ms = int(time.time() * 1000)
 
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
+        bal_ret_code = int(bal_res.get("retCode", -1)) if bal_res else -1
+        if bal_ret_code != 0:
+            bal_msg = bal_res.get("retMsg", "Unable to fetch Unified USDT balance")
+            order_rejections.append(f"Bybit Account Balance Check [{bal_ret_code}]: {BYBIT_ERROR_HINTS.get(bal_ret_code, bal_msg)}")
         avail_usdt = float(bal_res.get("result", {}).get("list", [{}])[0].get("totalAvailableBalance", 0.0))
 
         btc_macro_bearish = False
@@ -611,6 +617,7 @@ class LiveAccountTradingBot:
 
         candidates = []
         daily_hunter_backups = []
+        top_blocked_info = None
         coins_scanned_count = 0
 
         for symbol, entry in portfolio.items():
@@ -715,14 +722,14 @@ class LiveAccountTradingBot:
                     "latest_bar_ms": latest_bar_ms,
                 })
             else:
-                hunter_thresh = max(effective_min_prob - 0.04, 0.24)
+                # Daily Minimum-1 Trade Hunter: qualify top directional setup (raw_prob >= 0.22, ADX >= 15) if 0 trades fired today
+                hunter_thresh = max(min(effective_min_prob - 0.06, 0.26), 0.22)
                 if (
                     need_daily_first_trade
                     and not guard_blocked
                     and (raw_4h_ok or effective_mtf != "STRICT")
                     and raw_prob >= hunter_thresh
-                    and adx_val >= 18.0
-                    and vol_surge_val >= 1.15
+                    and adx_val >= 15.0
                 ):
                     daily_hunter_backups.append({
                         "edge": quality_edge,
@@ -745,10 +752,11 @@ class LiveAccountTradingBot:
                     reasons.append(f"Strategy filter ({strat_id})")
                 if raw_prob < effective_min_prob:
                     reasons.append(f"ML prob {raw_prob:.2f} < {effective_min_prob:.2f}")
-                block_msg = f"{bybit_sym} {direction} blocked: {', '.join(reasons)}"
+                block_msg = f"{bybit_sym} {direction} waiting: {', '.join(reasons)} [Avail USDT: ${avail_usdt:.2f}]"
                 diagnostics.append(block_msg)
-                if raw_prob >= effective_min_prob:
-                    trade_blocks.append(block_msg)
+                trade_blocks.append(block_msg)
+                if top_blocked_info is None or raw_prob > top_blocked_info[0]:
+                    top_blocked_info = (raw_prob, f"{bybit_sym}_{direction}_{','.join(reasons)}", block_msg)
 
             del df
             gc.collect()
@@ -772,6 +780,7 @@ class LiveAccountTradingBot:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit reached ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
+                order_rejections.append(msg)
                 break
             if len(open_syms) >= max_open_positions:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Max open positions reached ({len(open_syms)}/{max_open_positions})"
@@ -779,9 +788,10 @@ class LiveAccountTradingBot:
                 trade_blocks.append(msg)
                 break
             if avail_usdt < 2.0:
-                msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT balance too low (${avail_usdt:.2f})"
+                msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT balance too low (${avail_usdt:.2f} < $2.00)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
+                order_rejections.append(msg)
                 break
             if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
                 trade_blocks.append(f"{bybit_sym}: Already traded on this candle")
@@ -795,6 +805,7 @@ class LiveAccountTradingBot:
                 msg = f"{bybit_sym} blocked: Instrument specs unavailable on Bybit"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
+                order_rejections.append(msg)
                 continue
             qty_step, min_qty, min_notional, tick_size = filters
 
@@ -810,9 +821,10 @@ class LiveAccountTradingBot:
             max_buying_power = avail_usdt * leverage * 0.85
             min_required_notional = max(min_notional * 1.05, min_qty * price)
             if max_buying_power < min_required_notional:
-                msg = f"{bybit_sym} {cand['direction']} blocked: Min order ${min_required_notional:.2f} > buying power ${max_buying_power:.2f}"
+                msg = f"{bybit_sym} {cand['direction']} blocked: Min order ${min_required_notional:.2f} > buying power ${max_buying_power:.2f} (Avail ${avail_usdt:.2f})"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
+                order_rejections.append(msg)
                 continue
 
             conv_scale = self._conviction_risk_scale(float(cand.get("raw_prob", 0.3)), float(cand.get("req_thresh", 0.3)))
@@ -861,6 +873,16 @@ class LiveAccountTradingBot:
                 rej_msg = f"{bybit_sym} {cand['direction']} (qty {qty_str}) rejected by Bybit [{code}]: {hint} ({raw_msg})"
                 diagnostics.append(rej_msg)
                 order_rejections.append(rej_msg)
+
+        # Surface the top wait/block reason in the Error Log tab (once per 15m or on change) so you can see it on phone without USB
+        if live_orders_armed and live_trades_this_cycle == 0 and len(open_syms) == 0 and not order_rejections and top_blocked_info is not None:
+            _, skip_key, skip_msg = top_blocked_info
+            last_key = str(state.get("last_skip_notice_key", ""))
+            last_ms = int(state.get("last_skip_notice_ms", 0))
+            if skip_key != last_key or (now_ms - last_ms) >= 15 * 60 * 1000:
+                order_rejections.append(f"Scan Status (No Entry Yet): {skip_msg}")
+                state["last_skip_notice_key"] = skip_key
+                state["last_skip_notice_ms"] = now_ms
 
         state["coins_scanned"] = coins_scanned_count
         state["last_diagnostics"] = diagnostics[-25:]
