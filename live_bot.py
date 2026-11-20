@@ -89,7 +89,7 @@ class LiveAccountTradingBot:
     def _load_state(self) -> dict:
         if os.path.exists(self.state_path):
             try:
-                with open(self.state_path, "r", encoding="utf-8") as f:
+                with open(self.state_path, "r", encoding="utf-8-sig") as f:
                     return json.load(f)
             except Exception:
                 pass
@@ -341,7 +341,40 @@ class LiveAccountTradingBot:
         data["BB_Width_Med"] = data["BB_Width"].rolling(30).median()
         return data.dropna()
 
-    def _strategy_entry_filter(self, strategy_id: str, curr: pd.Series, prev: pd.Series, side: str, relaxed: bool = False) -> bool:
+    def _eval_custom_rules(self, prev: pd.Series, rules: list) -> bool:
+        if not rules:
+            return False
+        for rule in rules:
+            ind = str(rule.get("ind", ""))
+            op = str(rule.get("op", ""))
+            val = float(rule.get("val", 0.0))
+            if ind not in prev.index:
+                return False
+            actual = float(prev[ind])
+            if op == ">" and not (actual > val):
+                return False
+            elif op == "<" and not (actual < val):
+                return False
+            elif op == ">=" and not (actual >= val):
+                return False
+            elif op == "<=" and not (actual <= val):
+                return False
+        return True
+
+    def _strategy_entry_filter(
+        self,
+        strategy_id: str,
+        curr: pd.Series,
+        prev: pd.Series,
+        side: str,
+        relaxed: bool = False,
+        custom_rules: dict = None,
+    ) -> bool:
+        if isinstance(custom_rules, dict):
+            rule_key = "long_rules" if side == "LONG" else "short_rules"
+            if custom_rules.get(rule_key):
+                return self._eval_custom_rules(prev, custom_rules[rule_key])
+
         sid = strategy_id.lower()
         if relaxed or "adaptive_quantile" in sid or "high_sensitivity" in sid:
             return bool((prev["Dist_EMA50"] > -1.5) if side == "LONG" else (prev["Dist_EMA50"] < 1.5))
@@ -511,7 +544,7 @@ class LiveAccountTradingBot:
             raise FileNotFoundError(f"Master ML Model not found at {self.master_path}")
 
         leverage = min(max(int(leverage), 1), 20)
-        with open(self.master_path, "r", encoding="utf-8") as f:
+        with open(self.master_path, "r", encoding="utf-8-sig") as f:
             master = json.load(f)
 
         features = master.get("features", FEATURES)
@@ -585,6 +618,7 @@ class LiveAccountTradingBot:
             interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_str, "60")
             strat_id = cfg.get("strategy_id") or entry.get("strategy_id") or "xgb_mtf_v2"
             is_relaxed = bool(cfg.get("relaxed_filter", False))
+            custom_rules = cfg.get("custom_rules")
 
             df_raw = self.fetch_bybit_candles(bybit_sym, interval=interval, limit=230)
             if len(df_raw) < 210:
@@ -634,7 +668,14 @@ class LiveAccountTradingBot:
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
-            strat_ok = self._strategy_entry_filter(strat_id, curr, prev, direction, relaxed=is_relaxed)
+            strat_ok = self._strategy_entry_filter(
+                strat_id,
+                curr,
+                prev,
+                direction,
+                relaxed=is_relaxed,
+                custom_rules=custom_rules,
+            )
             effective_min_prob = max(req_thresh, 0.20)
 
             adx_val = float(curr.get("ADX", 0.0))
@@ -822,7 +863,7 @@ if __name__ == "__main__":
     runtime_cfg = {}
     if os.path.exists(cfg_file):
         try:
-            with open(cfg_file, "r", encoding="utf-8") as f:
+            with open(cfg_file, "r", encoding="utf-8-sig") as f:
                 runtime_cfg = json.load(f)
         except Exception:
             runtime_cfg = {}

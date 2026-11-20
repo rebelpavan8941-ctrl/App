@@ -96,6 +96,8 @@ class PaperStrategyTrainerAndTester:
         self.legacy_master_path = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
         self.paper_results_path = os.path.join(paper_dir, "paper_trained_results.json")
         self.comparison_path = os.path.join(paper_dir, "paper_vs_live_comparison.json")
+        self.discovered_strats_path = os.path.join(paper_dir, "ai_discovered_strategies.json")
+        self.adopted_strats_path = os.path.join(paper_dir, "ai_adopted_strategies.json")
         self.rate_limit_remaining = 120
         self.rate_limit_cap = 120
 
@@ -107,6 +109,53 @@ class PaperStrategyTrainerAndTester:
         os.makedirs(os.path.join(models_dir, "PAPER"), exist_ok=True)
         os.makedirs(self.paper_history_dir, exist_ok=True)
         os.makedirs(os.path.join(models_dir, "LIVE"), exist_ok=True)
+
+        self.dynamic_strategies = self._load_dynamic_strategies()
+
+    def _load_dynamic_strategies(self) -> dict:
+        merged = {}
+        for path in (self.adopted_strats_path, self.discovered_strats_path):
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8-sig") as f:
+                        data = json.load(f)
+                    for sid, sdata in (data.get("strategies", {}) or {}).items():
+                        if isinstance(sdata, dict) and sdata.get("long_rules") and sdata.get("short_rules"):
+                            merged[sid] = sdata
+                except Exception:
+                    pass
+        return merged
+
+    def _auto_adopt_winning_gemini_strategy(self, strategy_id: str, stats: dict):
+        if strategy_id not in self.dynamic_strategies:
+            return
+        pnl = float(stats.get("net_pnl_usdt", 0.0))
+        pf = float(stats.get("profit_factor", 0.0))
+        trades = int(stats.get("trades", 0))
+        if pnl <= 0.0 or pf < 1.15 or trades < 4:
+            return
+
+        adopted = {}
+        if os.path.exists(self.adopted_strats_path):
+            try:
+                with open(self.adopted_strats_path, "r", encoding="utf-8-sig") as f:
+                    adopted = json.load(f).get("strategies", {}) or {}
+            except Exception:
+                adopted = {}
+
+        spec = dict(self.dynamic_strategies[strategy_id])
+        spec["adopted_at"] = int(time.time())
+        spec["verified_pf"] = pf
+        spec["verified_pnl"] = pnl
+        adopted[strategy_id] = spec
+
+        try:
+            tmp_p = self.adopted_strats_path + ".tmp"
+            with open(tmp_p, "w", encoding="utf-8") as wf:
+                json.dump({"updated_at": int(time.time()), "strategies": adopted}, wf, indent=2)
+            os.replace(tmp_p, self.adopted_strats_path)
+        except Exception:
+            pass
 
     def _prune_old_trained_models(self, keep_latest: int = MAX_KEPT_MODEL_VERSIONS):
         try:
@@ -217,7 +266,7 @@ class PaperStrategyTrainerAndTester:
                 params["end"] = cursor_end
 
             rows = []
-            for base in ("https://api.bytick.com", "https://api-demo.bybit.com", "https://api.bybit.com"):
+            for base in ("[https://api.bytick.com](https://api.bytick.com)", "[https://api-demo.bybit.com](https://api-demo.bybit.com)", "[https://api.bybit.com](https://api.bybit.com)"):
                 try:
                     resp = self._public_get(f"{base}/v5/market/kline", params)
                     rows = resp.get("result", {}).get("list", [])
@@ -380,12 +429,42 @@ class PaperStrategyTrainerAndTester:
         clf_short.fit(X_train, y_s)
         return clf_long, clf_short
 
+    def _eval_dynamic_rule_list(self, test_df: pd.DataFrame, rules: list) -> np.ndarray:
+        n = len(test_df)
+        mask = np.ones(n - 1, dtype=bool)
+        for r in rules:
+            ind = r.get("ind", "")
+            op = r.get("op", "")
+            val = float(r.get("val", 0.0))
+            if ind not in test_df.columns:
+                continue
+            arr = test_df[ind].to_numpy()[:-1]
+            if op == ">":
+                mask &= (arr > val)
+            elif op == "<":
+                mask &= (arr < val)
+            elif op == ">=":
+                mask &= (arr >= val)
+            elif op == "<=":
+                mask &= (arr <= val)
+        out = np.zeros(n, dtype=bool)
+        out[1:] = mask
+        return out
+
     def _compute_vectorized_filter_masks(self, test_df: pd.DataFrame, strategy_id: str, relaxed: bool = False):
         n = len(test_df)
         long_ok = np.zeros(n, dtype=bool)
         short_ok = np.zeros(n, dtype=bool)
         if n < 2:
             return long_ok, short_ok
+
+        # Check Gemini-discovered or adopted custom rule strategies first
+        if strategy_id in self.dynamic_strategies:
+            spec = self.dynamic_strategies[strategy_id]
+            return (
+                self._eval_dynamic_rule_list(test_df, spec.get("long_rules", [])),
+                self._eval_dynamic_rule_list(test_df, spec.get("short_rules", [])),
+            )
 
         c = test_df["Close"].to_numpy()[1:]
         prev_ema50_d = test_df["Dist_EMA50"].to_numpy()[:-1]
@@ -521,6 +600,8 @@ class PaperStrategyTrainerAndTester:
                     "mtf_alignment_mode": mtf_mode_label,
                     "relaxed_filter": relaxed_filter,
                 }
+                if strategy_id in self.dynamic_strategies:
+                    cfg["custom_rules"] = self.dynamic_strategies[strategy_id]
 
                 le_arr = np.zeros(n_bars, dtype=bool)
                 se_arr = np.zeros(n_bars, dtype=bool)
@@ -647,6 +728,8 @@ class PaperStrategyTrainerAndTester:
         return best_eval
 
     def _filter_archetype_key(self, strategy_id: str) -> str:
+        if strategy_id in self.dynamic_strategies:
+            return f"dyn_{strategy_id}"
         sid = strategy_id.lower()
         if "donchian" in sid:
             return "donchian"
@@ -676,12 +759,13 @@ class PaperStrategyTrainerAndTester:
         crypto_enabled: bool = True,
         forex_enabled: bool = False,
     ) -> dict:
+        self.dynamic_strategies = self._load_dynamic_strategies()
         leverage = min(max(int(leverage), 1), MAX_LEVERAGE)
         test_tfs = [tf.lower() for tf in (timeframes or DEFAULT_TEST_TIMEFRAMES) if tf.lower() in TIMEFRAME_TO_BYBIT_INTERVAL]
         if not test_tfs:
             test_tfs = ["1h", "4h"]
 
-        raw_strats = active_strategies if active_strategies else ["xgb_mtf_v2"]
+        raw_strats = list(self.dynamic_strategies.keys()) + (active_strategies if active_strategies else ["xgb_mtf_v2"])
         seen_archetypes = set()
         strategies_to_test = []
         for s in raw_strats:
@@ -765,8 +849,12 @@ class PaperStrategyTrainerAndTester:
                     )
                     st = eval_res["stats"]
                     best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "STRICT")
-                    strat_meta = STRATEGY_CATALOG_META.get(strat_id, {"name": strat_id.replace("_", " ").title()})
-                    strat_name = strat_meta.get("name", strat_id)
+                    if strat_id in self.dynamic_strategies:
+                        strat_name = self.dynamic_strategies[strat_id].get("name", strat_id)
+                        self._auto_adopt_winning_gemini_strategy(strat_id, st)
+                    else:
+                        strat_meta = STRATEGY_CATALOG_META.get(strat_id, {"name": strat_id.replace("_", " ").title()})
+                        strat_name = strat_meta.get("name", strat_id)
 
                     all_tf_runs.append({
                         "strategy_id": strat_id,
@@ -847,7 +935,7 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            # Stage 3: High-sensitivity target retrain on 1H/4H across OFF / SOFT / STRICT if still below minimum trades or unprofitable
+            # Stage 3: High-sensitivity target retrain on 1H/4H across OFF / SOFT / STRICT
             if (cur_trades < min_req_trades or cur_pnl <= 0.0) and cached_tf_bundles:
                 for tf, raw, _, _, _, _, _, _, _, htf_dir_aligned in [b for b in cached_tf_bundles if b[0] in ("1h", "4h")]:
                     df_sens = self.build_matrix(raw, max_dd=1.15, expansion=0.75, horizon=14)
@@ -967,7 +1055,7 @@ class PaperStrategyTrainerAndTester:
         live_portfolio = {}
         if os.path.exists(self.live_master_path):
             try:
-                with open(self.live_master_path, "r", encoding="utf-8") as f:
+                with open(self.live_master_path, "r", encoding="utf-8-sig") as f:
                     live_portfolio = json.load(f).get("portfolio", {})
             except Exception:
                 live_portfolio = {}
@@ -1027,7 +1115,7 @@ class PaperStrategyTrainerAndTester:
         if not os.path.exists(self.paper_results_path):
             return False
 
-        with open(self.paper_results_path, "r", encoding="utf-8") as f:
+        with open(self.paper_results_path, "r", encoding="utf-8-sig") as f:
             paper_data = json.load(f)
 
         norm_sym = symbol.strip().upper()
@@ -1039,7 +1127,7 @@ class PaperStrategyTrainerAndTester:
             return False
 
         if os.path.exists(self.live_master_path):
-            with open(self.live_master_path, "r", encoding="utf-8") as f:
+            with open(self.live_master_path, "r", encoding="utf-8-sig") as f:
                 live_master = json.load(f)
         else:
             live_master = {"version": "LIVE_PORTFOLIO_0C", "exported_at": int(time.time()), "features": FEATURES, "portfolio": {}}
@@ -1077,7 +1165,7 @@ class PaperStrategyTrainerAndTester:
 
         if os.path.exists(self.paper_master_path):
             try:
-                with open(self.paper_master_path, "r", encoding="utf-8") as f:
+                with open(self.paper_master_path, "r", encoding="utf-8-sig") as f:
                     master = json.load(f)
                 portfolio = master.setdefault("portfolio", {})
                 if norm_sym in portfolio or norm_sym.replace("/", "") in portfolio:
@@ -1096,7 +1184,7 @@ class PaperStrategyTrainerAndTester:
 
         if os.path.exists(self.paper_results_path):
             try:
-                with open(self.paper_results_path, "r", encoding="utf-8") as f:
+                with open(self.paper_results_path, "r", encoding="utf-8-sig") as f:
                     res_data = json.load(f)
                 coins_map = res_data.setdefault("coins", {})
                 if norm_sym in coins_map or norm_sym.replace("/", "") in coins_map:
@@ -1111,7 +1199,7 @@ class PaperStrategyTrainerAndTester:
         config_file = os.path.join(self.paper_dir, "paper_runtime_config.json")
         if os.path.exists(config_file):
             try:
-                with open(config_file, "r", encoding="utf-8") as f:
+                with open(config_file, "r", encoding="utf-8-sig") as f:
                     cfg = json.load(f)
                 coins_list = cfg.get("coins", [])
                 new_coins = [c for c in coins_list if c.strip().upper() not in (norm_sym, norm_sym.replace("/", ""))]
@@ -1128,7 +1216,7 @@ class PaperStrategyTrainerAndTester:
     def remove_coin_from_live_model(self, symbol: str) -> bool:
         if not os.path.exists(self.live_master_path):
             return False
-        with open(self.live_master_path, "r", encoding="utf-8") as f:
+        with open(self.live_master_path, "r", encoding="utf-8-sig") as f:
             live_master = json.load(f)
 
         norm_sym = symbol.strip().upper()
@@ -1151,7 +1239,7 @@ if __name__ == "__main__":
     runtime_cfg = {}
     if os.path.exists(config_file):
         try:
-            with open(config_file, "r", encoding="utf-8") as f:
+            with open(config_file, "r", encoding="utf-8-sig") as f:
                 runtime_cfg = json.load(f)
         except Exception:
             runtime_cfg = {}
