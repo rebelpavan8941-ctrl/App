@@ -61,7 +61,7 @@ class LiveAccountTradingBot:
         self.api_key = api_key
         self.api_secret = api_secret
         self.models_dir = models_dir
-        self.live_dir = live_dir or os.path.join(os.path.dirname(models_dir), "bot_data", "LIVE")
+        self.live_dir = live_dir or os.path.join(os.path.dirname(models_dir), "bot_data", "LIVE_ACCOUNT")
         os.makedirs(self.live_dir, exist_ok=True)
         self.state_path = os.path.join(self.live_dir, "live_engine_state.json")
 
@@ -214,7 +214,6 @@ class LiveAccountTradingBot:
 
     @staticmethod
     def _regime_exit_multipliers(adx_val: float, natr_val: float, btc_bearish: bool) -> tuple:
-        # Returns (sl_mult, tp_mult, trail_ratio) adapted to current market regime
         if natr_val >= 2.8 or (adx_val < 14.0 and btc_bearish):
             return 1.15, 0.85, 0.35
         if not btc_bearish and adx_val >= 18.0 and natr_val < 2.6:
@@ -223,7 +222,6 @@ class LiveAccountTradingBot:
 
     @staticmethod
     def _conviction_risk_scale(raw_prob: float, req_thresh: float) -> float:
-        # Safely scales risk between 0.85x and 1.20x based on ML probability edge over threshold
         edge = max(0.0, raw_prob - req_thresh)
         scale = 0.85 + min(edge * 2.2, 0.35)
         return round(min(max(scale, 0.85), 1.20), 4)
@@ -706,7 +704,6 @@ class LiveAccountTradingBot:
             effective_min_prob = max(req_thresh, 0.20)
 
             adx_val = float(curr.get("ADX", 0.0))
-            vol_surge_val = float(curr.get("Vol_Surge", 1.0))
             quality_edge = (raw_prob - effective_min_prob) + (0.03 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 22.0 else 0.0)
 
             if mtf_aligned and strat_ok and raw_prob >= effective_min_prob:
@@ -722,19 +719,18 @@ class LiveAccountTradingBot:
                     "latest_bar_ms": latest_bar_ms,
                 })
             else:
-                # Daily Minimum-1 Trade Hunter: qualify top directional setup (raw_prob >= 0.22, ADX >= 15) if 0 trades fired today
-                hunter_thresh = max(min(effective_min_prob - 0.06, 0.26), 0.22)
+                # Calibrated Daily 1-Trade Hunter: qualifies top 4H-aligned directional setup (raw_prob >= 0.18, ADX >= 12) when 0 trades fired today
                 if (
                     need_daily_first_trade
                     and not guard_blocked
-                    and (raw_4h_ok or effective_mtf != "STRICT")
-                    and raw_prob >= hunter_thresh
-                    and adx_val >= 15.0
+                    and (raw_4h_ok or effective_mtf == "OFF")
+                    and raw_prob >= 0.18
+                    and adx_val >= 12.0
                 ):
                     daily_hunter_backups.append({
                         "edge": quality_edge,
                         "raw_prob": raw_prob,
-                        "req_thresh": hunter_thresh,
+                        "req_thresh": 0.18,
                         "bybit_sym": bybit_sym,
                         "market_type": market_type,
                         "direction": direction,
@@ -752,7 +748,7 @@ class LiveAccountTradingBot:
                     reasons.append(f"Strategy filter ({strat_id})")
                 if raw_prob < effective_min_prob:
                     reasons.append(f"ML prob {raw_prob:.2f} < {effective_min_prob:.2f}")
-                block_msg = f"{bybit_sym} {direction} waiting: {', '.join(reasons)} [Avail USDT: ${avail_usdt:.2f}]"
+                block_msg = f"{bybit_sym} {direction} waiting: {', '.join(reasons)} [ADX:{adx_val:.1f}, Avail USDT:${avail_usdt:.2f}]"
                 diagnostics.append(block_msg)
                 trade_blocks.append(block_msg)
                 if top_blocked_info is None or raw_prob > top_blocked_info[0]:
@@ -874,7 +870,6 @@ class LiveAccountTradingBot:
                 diagnostics.append(rej_msg)
                 order_rejections.append(rej_msg)
 
-        # Surface the top wait/block reason in the Error Log tab (once per 15m or on change) so you can see it on phone without USB
         if live_orders_armed and live_trades_this_cycle == 0 and len(open_syms) == 0 and not order_rejections and top_blocked_info is not None:
             _, skip_key, skip_msg = top_blocked_info
             last_key = str(state.get("last_skip_notice_key", ""))
@@ -904,7 +899,7 @@ class LiveAccountTradingBot:
 
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    live_dir = os.environ.get("LIVE_DATA_DIR", os.path.join(base_dir, "bot_data", "LIVE"))
+    live_dir = os.environ.get("LIVE_DATA_DIR", os.path.join(base_dir, "bot_data", "LIVE_ACCOUNT"))
     models_dir = os.environ.get("MODELS_DIR", os.path.join(base_dir, "ml_models"))
 
     cfg_file = os.path.join(live_dir, "live_runtime_config.json")

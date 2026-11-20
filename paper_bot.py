@@ -154,7 +154,6 @@ class PaperStrategyTrainerAndTester:
                     spec["proven_pf"] = pf
                     spec["proven_win_rate_pct"] = wr
                     spec["proven_net_pnl_usdt"] = pnl
-                    # Fix and lock the winning parameters discovered during multi-parameter testing
                     spec["fixed_config"] = {
                         "long_thresh": best_cfg.get("long_thresh", 0.28),
                         "short_thresh": best_cfg.get("short_thresh", 0.28),
@@ -184,6 +183,11 @@ class PaperStrategyTrainerAndTester:
             for old_file in snapshots[keep_latest:]:
                 try:
                     os.remove(old_file)
+                except Exception:
+                    pass
+            for tmp_file in glob.glob(os.path.join(self.paper_dir, "_tmp_*")):
+                try:
+                    os.remove(tmp_file)
                 except Exception:
                     pass
         except Exception:
@@ -475,7 +479,6 @@ class PaperStrategyTrainerAndTester:
         if n < 2:
             return long_ok, short_ok
 
-        # Check Gemini-invented / adopted dynamic strategies first
         if strategy_id in self.dynamic_strategies:
             spec = self.dynamic_strategies[strategy_id]
             return (
@@ -572,7 +575,6 @@ class PaperStrategyTrainerAndTester:
             (0.46, 1.70, 2.35, True, 1.8),
         ]
 
-        # Automatically sweep broader parameter combinations for new Gemini strategies or extended sweeps
         if extended_param_sweep or dyn_spec is not None:
             param_configs.extend([
                 (0.20, 1.60, 2.40, False, 2.2),
@@ -581,7 +583,6 @@ class PaperStrategyTrainerAndTester:
                 (0.38, 1.95, 2.80, True, 2.5),
             ])
 
-        # If this strategy was already adopted with locked winning parameters, include its fixed config
         if dyn_spec and isinstance(dyn_spec.get("fixed_config"), dict):
             fc = dyn_spec["fixed_config"]
             param_configs.insert(0, (
