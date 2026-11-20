@@ -600,7 +600,7 @@ class LiveAccountTradingBot:
             latest_bar_ms = int(df.index[-1].timestamp() * 1000)
 
             try:
-                dmat = xgb.DMatrix(df.iloc[[-1]][features])
+                dmat = xgb.DMatrix(df.iloc[[-1]][features].to_numpy(dtype="float32"))
                 p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
                 p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
                 del dmat
@@ -624,10 +624,13 @@ class LiveAccountTradingBot:
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.07) and (float(curr["Vol_Surge"]) >= 1.20)
             guard_blocked = btc_macro_bearish and direction == "LONG" and market_type == "CRYPTO" and not bybit_sym.startswith("BTC")
-            if mtf_mode.upper() == "OFF":
+
+            # Use the coin's trained 4H MTF mode (OFF, SOFT, or STRICT) if available, otherwise fall back to global mtf_mode
+            effective_mtf = str(cfg.get("mtf_alignment_mode") or entry.get("mtf_alignment_mode") or mtf_mode).upper()
+            if effective_mtf == "OFF":
                 mtf_aligned = not guard_blocked
-            elif mtf_mode.upper() == "SOFT":
-                mtf_aligned = (raw_4h_ok or raw_prob >= (req_thresh + 0.05)) and not guard_blocked
+            elif effective_mtf == "SOFT":
+                mtf_aligned = (raw_4h_ok or (raw_prob >= (req_thresh + 0.05) and float(curr["Vol_Surge"]) >= 1.10)) and not guard_blocked
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
@@ -654,7 +657,7 @@ class LiveAccountTradingBot:
                 if (
                     need_daily_first_trade
                     and not guard_blocked
-                    and (raw_4h_ok or mtf_mode.upper() != "STRICT")
+                    and (raw_4h_ok or effective_mtf != "STRICT")
                     and raw_prob >= hunter_thresh
                     and adx_val >= 18.0
                     and vol_surge_val >= 1.15
@@ -673,7 +676,7 @@ class LiveAccountTradingBot:
                 if guard_blocked:
                     reasons.append("BTC 4H Macro Guard (BTC bearish)")
                 elif not mtf_aligned:
-                    reasons.append(f"4H MTF trend misaligned ({mtf_mode})")
+                    reasons.append(f"4H MTF trend misaligned ({effective_mtf})")
                 if not strat_ok:
                     reasons.append(f"Strategy filter ({strat_id})")
                 if raw_prob < effective_min_prob:

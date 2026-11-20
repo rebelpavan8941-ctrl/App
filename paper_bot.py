@@ -360,7 +360,6 @@ class PaperStrategyTrainerAndTester:
         if y_s.sum() < 5:
             y_s.iloc[-5:] = 1
 
-        # Cap n_jobs=2 so 4-6GB RAM phones keep UI responsive during training
         params = dict(
             n_estimators=105,
             max_depth=3,
@@ -476,7 +475,6 @@ class PaperStrategyTrainerAndTester:
             (0.46, 1.70, 2.35, True, 1.8),
         ]
 
-        # Extended parameter sweep when initial pass yields low PnL or few trades
         if extended_param_sweep:
             param_configs.extend([
                 (0.20, 1.60, 2.40, False, 2.2),
@@ -502,140 +500,150 @@ class PaperStrategyTrainerAndTester:
         best_eval = None
         best_score = -9999999.0
 
+        # Train & evaluate across all three 4H MTF Alignment modes: OFF, SOFT, and STRICT
+        mtf_modes_to_test = ["OFF", "SOFT", "STRICT"] if htf_dir_aligned is not None else ["OFF"]
+
         for thresh, sl_atr, tp1_rr, require_htf, trail_mult in param_configs:
-            tp2_rr = tp1_rr * 1.75
-            cfg = {
-                "long_thresh": thresh,
-                "short_thresh": thresh,
-                "sl_atr": sl_atr,
-                "tp1_rr": tp1_rr,
-                "tp2_rr": tp2_rr,
-                "trail_atr": trail_mult,
-                "strategy_id": strategy_id,
-                "timeframe": timeframe,
-                "relaxed_filter": relaxed_filter,
-            }
+            for mtf_mode_label in mtf_modes_to_test:
+                if mtf_mode_label == "OFF" and require_htf:
+                    continue
 
-            le_arr = np.zeros(n_bars, dtype=bool)
-            se_arr = np.zeros(n_bars, dtype=bool)
-            le_arr[1:] = (p_long[:-1] >= thresh) & f_long[1:]
-            se_arr[1:] = (p_short[:-1] >= thresh) & f_short[1:]
-
-            if require_htf and htf_dir_aligned is not None:
-                hc_l = np.zeros(n_bars, dtype=bool)
-                hc_s = np.zeros(n_bars, dtype=bool)
-                hc_l[1:] = (p_long[:-1] >= thresh + 0.08) & (vols[:-1] >= 1.25)
-                hc_s[1:] = (p_short[:-1] >= thresh + 0.08) & (vols[:-1] >= 1.25)
-                le_arr = le_arr & ((htf_dir_aligned == 1) | hc_l)
-                se_arr = se_arr & ((htf_dir_aligned == -1) | hc_s)
-
-            trades_pnl = []
-            equity = initial_capital
-            in_pos = False
-            side_long = True
-            entry = sl = tp1 = tp2 = high_w = low_w = 0.0
-            tp1_hit = False
-
-            for i in range(1, n_bars):
-                h = highs[i]
-                l = lows[i]
-                atr = atrs[i]
-
-                if not in_pos:
-                    le = le_arr[i]
-                    se = se_arr[i]
-                    if le and se:
-                        if p_long[i - 1] >= p_short[i - 1]:
-                            se = False
-                        else:
-                            le = False
-                    if le != se:
-                        in_pos = True
-                        side_long = le
-                        entry = opens[i]
-                        high_w = low_w = entry
-                        tp1_hit = False
-                        risk = sl_atr * atr
-                        if side_long:
-                            sl = entry - risk
-                            tp1 = entry + risk * tp1_rr
-                            tp2 = entry + risk * tp2_rr
-                        else:
-                            sl = entry + risk
-                            tp1 = entry - risk * tp1_rr
-                            tp2 = entry - risk * tp2_rr
-                else:
-                    if side_long:
-                        if h > high_w:
-                            high_w = h
-                        if h >= tp1 and not tp1_hit:
-                            tp1_hit = True
-                            sl = entry + 0.20 * (tp1 - entry)
-                        if tp1_hit:
-                            tr_sl = high_w - trail_mult * atr
-                            if tr_sl > sl:
-                                sl = tr_sl
-                        if l <= sl or h >= tp2:
-                            ex = sl if l <= sl else tp2
-                            raw_ret = (0.5 * ((tp1 - entry) / entry) + 0.5 * ((ex - entry) / entry)) if tp1_hit else ((ex - entry) / entry)
-                            pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
-                            equity += pnl_usdt
-                            trades_pnl.append(pnl_usdt)
-                            in_pos = False
-                    else:
-                        if l < low_w:
-                            low_w = l
-                        if l <= tp1 and not tp1_hit:
-                            tp1_hit = True
-                            sl = entry - 0.20 * (entry - tp1)
-                        if tp1_hit:
-                            tr_sl = low_w + trail_mult * atr
-                            if tr_sl < sl:
-                                sl = tr_sl
-                        if h >= sl or l <= tp2:
-                            ex = sl if h >= sl else tp2
-                            raw_ret = (0.5 * ((entry - tp1) / entry) + 0.5 * ((entry - ex) / entry)) if tp1_hit else ((entry - ex) / entry)
-                            pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
-                            equity += pnl_usdt
-                            trades_pnl.append(pnl_usdt)
-                            in_pos = False
-
-            arr = np.array(trades_pnl)
-            wins = arr[arr > 0]
-            losses = arr[arr < 0]
-            total_trades = int(len(arr))
-            wr = round((len(wins) / total_trades * 100.0), 2) if total_trades > 0 else 0.0
-            pf = round(float(wins.sum() / abs(losses.sum())), 2) if len(losses) > 0 else round(float(wins.sum()), 2)
-            net_usdt = round(float(equity - initial_capital), 2)
-            net_pct = round((net_usdt / initial_capital) * 100.0, 2)
-            sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
-
-            if total_trades == 0:
-                score = -100000.0
-            elif total_trades >= min_req_trades and pf >= 1.25 and wr >= 50.0 and net_usdt > 0:
-                score = (net_usdt * (sample_conf / 3.5)) + (pf * 30.0) + (wr * 0.5)
-            elif total_trades >= min_req_trades and pf >= 1.10 and net_usdt > 0:
-                score = (net_usdt * 0.6) + (pf * 20.0) + (wr * 0.3)
-            elif total_trades >= min_req_trades:
-                score = -5000.0 + net_usdt + (pf * 15.0) + (wr * 0.2)
-            else:
-                score = -25000.0 + (total_trades * 150.0) + net_usdt
-
-            if best_eval is None or score > best_score:
-                best_score = score
-                best_eval = {
-                    "score": score,
-                    "cfg": cfg,
-                    "stats": {
-                        "trades": total_trades,
-                        "win_rate_pct": wr,
-                        "profit_factor": pf,
-                        "leverage": leverage,
-                        "net_pnl_pct": net_pct,
-                        "net_pnl_usdt": net_usdt,
-                        "net_pnl": net_usdt,
-                    },
+                tp2_rr = tp1_rr * 1.75
+                cfg = {
+                    "long_thresh": thresh,
+                    "short_thresh": thresh,
+                    "sl_atr": sl_atr,
+                    "tp1_rr": tp1_rr,
+                    "tp2_rr": tp2_rr,
+                    "trail_atr": trail_mult,
+                    "strategy_id": strategy_id,
+                    "timeframe": timeframe,
+                    "mtf_alignment_mode": mtf_mode_label,
+                    "relaxed_filter": relaxed_filter,
                 }
+
+                le_arr = np.zeros(n_bars, dtype=bool)
+                se_arr = np.zeros(n_bars, dtype=bool)
+                le_arr[1:] = (p_long[:-1] >= thresh) & f_long[1:]
+                se_arr[1:] = (p_short[:-1] >= thresh) & f_short[1:]
+
+                if mtf_mode_label != "OFF" and htf_dir_aligned is not None:
+                    conv_boost = 0.05 if mtf_mode_label == "SOFT" else 0.08
+                    vol_req = 1.10 if mtf_mode_label == "SOFT" else 1.25
+                    hc_l = np.zeros(n_bars, dtype=bool)
+                    hc_s = np.zeros(n_bars, dtype=bool)
+                    hc_l[1:] = (p_long[:-1] >= thresh + conv_boost) & (vols[:-1] >= vol_req)
+                    hc_s[1:] = (p_short[:-1] >= thresh + conv_boost) & (vols[:-1] >= vol_req)
+                    le_arr = le_arr & ((htf_dir_aligned == 1) | hc_l)
+                    se_arr = se_arr & ((htf_dir_aligned == -1) | hc_s)
+
+                trades_pnl = []
+                equity = initial_capital
+                in_pos = False
+                side_long = True
+                entry = sl = tp1 = tp2 = high_w = low_w = 0.0
+                tp1_hit = False
+
+                for i in range(1, n_bars):
+                    h = highs[i]
+                    l = lows[i]
+                    atr = atrs[i]
+
+                    if not in_pos:
+                        le = le_arr[i]
+                        se = se_arr[i]
+                        if le and se:
+                            if p_long[i - 1] >= p_short[i - 1]:
+                                se = False
+                            else:
+                                le = False
+                        if le != se:
+                            in_pos = True
+                            side_long = le
+                            entry = opens[i]
+                            high_w = low_w = entry
+                            tp1_hit = False
+                            risk = sl_atr * atr
+                            if side_long:
+                                sl = entry - risk
+                                tp1 = entry + risk * tp1_rr
+                                tp2 = entry + risk * tp2_rr
+                            else:
+                                sl = entry + risk
+                                tp1 = entry - risk * tp1_rr
+                                tp2 = entry - risk * tp2_rr
+                    else:
+                        if side_long:
+                            if h > high_w:
+                                high_w = h
+                            if h >= tp1 and not tp1_hit:
+                                tp1_hit = True
+                                sl = entry + 0.20 * (tp1 - entry)
+                            if tp1_hit:
+                                tr_sl = high_w - trail_mult * atr
+                                if tr_sl > sl:
+                                    sl = tr_sl
+                            if l <= sl or h >= tp2:
+                                ex = sl if l <= sl else tp2
+                                raw_ret = (0.5 * ((tp1 - entry) / entry) + 0.5 * ((ex - entry) / entry)) if tp1_hit else ((ex - entry) / entry)
+                                pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
+                                equity += pnl_usdt
+                                trades_pnl.append(pnl_usdt)
+                                in_pos = False
+                        else:
+                            if l < low_w:
+                                low_w = l
+                            if l <= tp1 and not tp1_hit:
+                                tp1_hit = True
+                                sl = entry - 0.20 * (entry - tp1)
+                            if tp1_hit:
+                                tr_sl = low_w + trail_mult * atr
+                                if tr_sl < sl:
+                                    sl = tr_sl
+                            if h >= sl or l <= tp2:
+                                ex = sl if h >= sl else tp2
+                                raw_ret = (0.5 * ((entry - tp1) / entry) + 0.5 * ((entry - ex) / entry)) if tp1_hit else ((entry - ex) / entry)
+                                pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
+                                equity += pnl_usdt
+                                trades_pnl.append(pnl_usdt)
+                                in_pos = False
+
+                arr = np.array(trades_pnl)
+                wins = arr[arr > 0]
+                losses = arr[arr < 0]
+                total_trades = int(len(arr))
+                wr = round((len(wins) / total_trades * 100.0), 2) if total_trades > 0 else 0.0
+                pf = round(float(wins.sum() / abs(losses.sum())), 2) if len(losses) > 0 else round(float(wins.sum()), 2)
+                net_usdt = round(float(equity - initial_capital), 2)
+                net_pct = round((net_usdt / initial_capital) * 100.0, 2)
+                sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
+
+                if total_trades == 0:
+                    score = -100000.0
+                elif total_trades >= min_req_trades and pf >= 1.25 and wr >= 50.0 and net_usdt > 0:
+                    score = (net_usdt * (sample_conf / 3.5)) + (pf * 30.0) + (wr * 0.5)
+                elif total_trades >= min_req_trades and pf >= 1.10 and net_usdt > 0:
+                    score = (net_usdt * 0.6) + (pf * 20.0) + (wr * 0.3)
+                elif total_trades >= min_req_trades:
+                    score = -5000.0 + net_usdt + (pf * 15.0) + (wr * 0.2)
+                else:
+                    score = -25000.0 + (total_trades * 150.0) + net_usdt
+
+                if best_eval is None or score > best_score:
+                    best_score = score
+                    best_eval = {
+                        "score": score,
+                        "cfg": cfg,
+                        "stats": {
+                            "trades": total_trades,
+                            "win_rate_pct": wr,
+                            "profit_factor": pf,
+                            "leverage": leverage,
+                            "net_pnl_pct": net_pct,
+                            "net_pnl_usdt": net_usdt,
+                            "net_pnl": net_usdt,
+                        },
+                    }
         return best_eval
 
     def _filter_archetype_key(self, strategy_id: str) -> str:
@@ -741,7 +749,7 @@ class PaperStrategyTrainerAndTester:
                     aligned_series = htf_trend.reindex(test_df.index, method="ffill").fillna(0)
                     htf_dir_aligned = aligned_series.to_numpy(dtype=np.int8)
 
-                cached_tf_bundles.append((tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds))
+                cached_tf_bundles.append((tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds, htf_dir_aligned))
 
                 for strat_id in strategies_to_test:
                     eval_res = self._simulate_strategy_on_tf(
@@ -756,6 +764,7 @@ class PaperStrategyTrainerAndTester:
                         htf_dir_aligned=htf_dir_aligned,
                     )
                     st = eval_res["stats"]
+                    best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "STRICT")
                     strat_meta = STRATEGY_CATALOG_META.get(strat_id, {"name": strat_id.replace("_", " ").title()})
                     strat_name = strat_meta.get("name", strat_id)
 
@@ -763,6 +772,7 @@ class PaperStrategyTrainerAndTester:
                         "strategy_id": strat_id,
                         "strategy_name": strat_name,
                         "timeframe": tf.upper(),
+                        "mtf_mode": best_mtf,
                         "trades": st["trades"],
                         "win_rate_pct": st["win_rate_pct"],
                         "profit_factor": st["profit_factor"],
@@ -772,7 +782,7 @@ class PaperStrategyTrainerAndTester:
                     if best_candidate is None or eval_res["score"] > best_candidate["score"]:
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
-                        cfg["strategy"] = f"{strat_name} ({tf.upper()})"
+                        cfg["strategy"] = f"{strat_name} ({tf.upper()} • MTF:{best_mtf})"
                         best_candidate = {
                             "score": eval_res["score"],
                             "strategy_id": strat_id,
@@ -788,13 +798,13 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            # Stage 2: Adaptive Parameter Sweep when trades < min_req_trades OR Net PnL <= 0 / PF < 1.15
+            # Stage 2: Adaptive Parameter Sweep across OFF / SOFT / STRICT when trades < min_req_trades OR Net PnL <= 0 / PF < 1.15
             cur_trades = best_candidate["stats"]["trades"] if best_candidate else 0
             cur_pnl = best_candidate["stats"]["net_pnl_usdt"] if best_candidate else -999.0
             cur_pf = best_candidate["stats"]["profit_factor"] if best_candidate else 0.0
 
             if (cur_trades < min_req_trades or cur_pnl <= 0.0 or cur_pf < 1.15) and cached_tf_bundles:
-                for tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds in cached_tf_bundles:
+                for tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds, htf_dir_aligned in cached_tf_bundles:
                     q_thresholds = sorted(set([
                         float(np.quantile(np.maximum(p_long, p_short), 0.72)),
                         float(np.quantile(np.maximum(p_long, p_short), 0.80)),
@@ -809,18 +819,19 @@ class PaperStrategyTrainerAndTester:
                         leverage=leverage,
                         initial_capital=initial_capital,
                         is_forex=is_fx,
-                        htf_dir_aligned=None,
+                        htf_dir_aligned=htf_dir_aligned,
                         relaxed_filter=True,
                         extra_quantile_thresholds=q_thresholds,
                         extended_param_sweep=True,
                     )
                     st = eval_res["stats"]
+                    best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "OFF")
                     if best_candidate is None or eval_res["score"] > best_candidate["score"]:
                         cur_trades = st["trades"]
                         cur_pnl = st["net_pnl_usdt"]
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
-                        cfg["strategy"] = f"Adaptive Tuned XGBoost ({tf.upper()})"
+                        cfg["strategy"] = f"Adaptive Tuned XGBoost ({tf.upper()} • MTF:{best_mtf})"
                         best_candidate = {
                             "score": eval_res["score"],
                             "strategy_id": "xgb_adaptive_quantile",
@@ -836,9 +847,9 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            # Stage 3: High-sensitivity target retrain on 1H/4H if still below minimum trades or unprofitable
+            # Stage 3: High-sensitivity target retrain on 1H/4H across OFF / SOFT / STRICT if still below minimum trades or unprofitable
             if (cur_trades < min_req_trades or cur_pnl <= 0.0) and cached_tf_bundles:
-                for tf, raw, _, _, _, _, _, _, _ in [b for b in cached_tf_bundles if b[0] in ("1h", "4h")]:
+                for tf, raw, _, _, _, _, _, _, _, htf_dir_aligned in [b for b in cached_tf_bundles if b[0] in ("1h", "4h")]:
                     df_sens = self.build_matrix(raw, max_dd=1.15, expansion=0.75, horizon=14)
                     if len(df_sens) < 180:
                         continue
@@ -855,6 +866,10 @@ class PaperStrategyTrainerAndTester:
                         float(np.quantile(np.maximum(pl2, ps2), 0.72)),
                         float(np.quantile(np.maximum(pl2, ps2), 0.82)),
                     ]))
+                    htf_sens = None
+                    if tf != "4h" and htf_trend is not None and not htf_trend.empty:
+                        htf_sens = htf_trend.reindex(test_s.index, method="ffill").fillna(0).to_numpy(dtype=np.int8)
+
                     eval_res = self._simulate_strategy_on_tf(
                         test_df=test_s,
                         p_long=pl2,
@@ -864,16 +879,17 @@ class PaperStrategyTrainerAndTester:
                         leverage=leverage,
                         initial_capital=initial_capital,
                         is_forex=is_fx,
-                        htf_dir_aligned=None,
+                        htf_dir_aligned=htf_sens,
                         relaxed_filter=True,
                         extra_quantile_thresholds=q_sens,
                         extended_param_sweep=True,
                     )
                     st = eval_res["stats"]
+                    best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "OFF")
                     if best_candidate is None or eval_res["score"] > best_candidate["score"]:
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
-                        cfg["strategy"] = f"High-Sensitivity XGBoost ({tf.upper()})"
+                        cfg["strategy"] = f"High-Sensitivity XGBoost ({tf.upper()} • MTF:{best_mtf})"
                         best_candidate = {
                             "score": eval_res["score"],
                             "strategy_id": "xgb_high_sensitivity",
@@ -890,7 +906,6 @@ class PaperStrategyTrainerAndTester:
                         }
                     del df_sens, train_s, test_s, clf_l2, clf_s2
 
-            # Explicitly release memory per coin for 4-6GB RAM phones
             del cached_tf_bundles, raw_4h
             gc.collect()
 
@@ -901,11 +916,13 @@ class PaperStrategyTrainerAndTester:
             total_net_pnl += st["net_pnl_usdt"]
             win_rates.append(st["win_rate_pct"])
 
+            best_mtf_mode = best_candidate["cfg"].get("mtf_alignment_mode", "STRICT")
             coin_entry = {
                 "market": classify_market(symbol),
-                "strategy": f"{best_candidate['strategy_name']} ({best_candidate['timeframe']})",
+                "strategy": f"{best_candidate['strategy_name']} ({best_candidate['timeframe']} • MTF:{best_mtf_mode})",
                 "strategy_id": best_candidate["strategy_id"],
                 "timeframe": best_candidate["timeframe"],
+                "mtf_alignment_mode": best_mtf_mode,
                 "win_rate_pct": st["win_rate_pct"],
                 "profit_factor": st["profit_factor"],
                 "net_pnl_pct": st["net_pnl_pct"],
@@ -1030,11 +1047,13 @@ class PaperStrategyTrainerAndTester:
         portfolio = live_master.setdefault("portfolio", {})
         portfolio.pop(norm_sym.replace("/", ""), None)
         stats = coin_bundle.get("stats", {})
+        best_mtf_mode = coin_bundle.get("mtf_alignment_mode") or coin_bundle.get("config", {}).get("mtf_alignment_mode", "STRICT")
         portfolio[norm_sym] = {
             "market": coin_bundle.get("market", classify_market(norm_sym)),
             "strategy": coin_bundle.get("strategy", "XGBoost 1H/4H Momentum"),
             "strategy_id": coin_bundle.get("strategy_id", "xgb_mtf_v2"),
             "timeframe": coin_bundle.get("timeframe", "1H"),
+            "mtf_alignment_mode": best_mtf_mode,
             "win_rate_pct": stats.get("win_rate_pct", 0.0),
             "profit_factor": stats.get("profit_factor", 0.0),
             "net_pnl_pct": stats.get("net_pnl_pct", 0.0),
@@ -1164,4 +1183,4 @@ if __name__ == "__main__":
             crypto_enabled=crypto_enabled,
             forex_enabled=forex_enabled,
         )
-        print(f"Trained & evaluated {len(results)} Paper coins across 4.5 months (135 days) & 18 features.")
+        print(f"Trained & evaluated {len(results)} Paper coins across 4.5 months (135 days) & OFF/SOFT/STRICT 4H MTF modes.")
