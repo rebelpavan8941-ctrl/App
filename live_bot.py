@@ -81,6 +81,7 @@ class LiveAccountTradingBot:
         self.rate_limit_cap = 120
         self._booster_cache = {}
         self._instrument_cache = {}
+        self._trend_4h_cache = {}
 
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(pool_connections=6, pool_maxsize=6)
@@ -123,7 +124,7 @@ class LiveAccountTradingBot:
         if cap and cap.isdigit() and int(cap) > 0:
             self.rate_limit_cap = int(cap)
 
-    def _public_get(self, path: str, params: dict, timeout: float = 6.0) -> dict:
+    def _public_get(self, path: str, params: dict, timeout: float = 5.0) -> dict:
         for base in self.host_candidates:
             try:
                 resp = self.session.get(f"{base}{path}", params=params, timeout=timeout)
@@ -136,7 +137,7 @@ class LiveAccountTradingBot:
 
     def _bybit_request(self, method: str, path: str, params: dict = None, body: dict = None) -> dict:
         if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
-            time.sleep(1.5)
+            time.sleep(1.0)
 
         last_err = None
         for base in self.host_candidates:
@@ -153,12 +154,8 @@ class LiveAccountTradingBot:
                         "X-BAPI-TIMESTAMP": ts,
                         "X-BAPI-RECV-WINDOW": recv_window,
                     }
-                    resp = self.session.get(url, headers=headers, timeout=8)
+                    resp = self.session.get(url, headers=headers, timeout=6)
                     self._update_rate_limits(resp)
-                    if resp.status_code == 429:
-                        time.sleep(2.5)
-                        resp = self.session.get(url, headers=headers, timeout=8)
-                        self._update_rate_limits(resp)
                     if resp.status_code == 200:
                         return resp.json()
                 else:
@@ -171,12 +168,8 @@ class LiveAccountTradingBot:
                         "X-BAPI-RECV-WINDOW": recv_window,
                         "Content-Type": "application/json",
                     }
-                    resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=8)
+                    resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=6)
                     self._update_rate_limits(resp)
-                    if resp.status_code == 429:
-                        time.sleep(2.5)
-                        resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=8)
-                        self._update_rate_limits(resp)
                     if resp.status_code == 200:
                         return resp.json()
             except Exception as e:
@@ -230,7 +223,7 @@ class LiveAccountTradingBot:
         data = self._public_get(
             "/v5/market/kline",
             {"category": self.category, "symbol": bybit_symbol, "interval": interval, "limit": limit},
-            timeout=6.0,
+            timeout=5.0,
         )
         rows = data.get("result", {}).get("list", [])
         if rows:
@@ -248,7 +241,7 @@ class LiveAccountTradingBot:
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
                     params={"interval": yf_interval, "range": yf_range},
                     headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=8,
+                    timeout=6,
                 )
                 res0 = y_resp.json().get("chart", {}).get("result", [])[0]
                 ts_list = res0.get("timestamp", [])
@@ -357,6 +350,22 @@ class LiveAccountTradingBot:
         data["BB_Width_Med"] = data["BB_Width"].rolling(30).median()
         return data.dropna()
 
+    def _get_cached_4h_metrics(self, bybit_sym: str) -> tuple:
+        now_s = time.time()
+        cached = self._trend_4h_cache.get(bybit_sym)
+        if cached and (now_s - cached[0]) < 600.0:
+            return cached[1], cached[2], cached[3]
+        raw_4h = self.fetch_bybit_candles(bybit_sym, interval="240", limit=220)
+        if len(raw_4h) >= 210:
+            df_4h = self.build_features(raw_4h)
+            if not df_4h.empty:
+                st = int(df_4h.iloc[-1]["Supertrend"])
+                adx = float(df_4h.iloc[-1].get("ADX", 20.0))
+                natr = float(df_4h.iloc[-1].get("NATR", 1.8))
+                self._trend_4h_cache[bybit_sym] = (now_s, st, adx, natr)
+                return st, adx, natr
+        return 0, 20.0, 1.8
+
     def _eval_custom_rules(self, prev: pd.Series, rules: list) -> bool:
         if not rules:
             return False
@@ -435,7 +444,7 @@ class LiveAccountTradingBot:
             raise ValueError(f"Invalid XGBoost booster format for {cache_key} (missing 'learner'). Retrain Paper model.")
         if cache_key in self._booster_cache:
             return self._booster_cache[cache_key]
-        if len(self._booster_cache) >= 16:
+        if len(self._booster_cache) >= 24:
             oldest_key = next(iter(self._booster_cache))
             self._booster_cache.pop(oldest_key, None)
 
@@ -597,15 +606,8 @@ class LiveAccountTradingBot:
         btc_adx = 20.0
         btc_natr = 1.8
         if btc_macro_guard:
-            btc_4h_raw = self.fetch_bybit_candles("BTCUSDT", interval="240", limit=220)
-            if len(btc_4h_raw) >= 210:
-                btc_4h_df = self.build_features(btc_4h_raw)
-                if not btc_4h_df.empty:
-                    btc_macro_bearish = bool(int(btc_4h_df.iloc[-1]["Supertrend"]) == -1)
-                    btc_adx = float(btc_4h_df.iloc[-1].get("ADX", 20.0))
-                    btc_natr = float(btc_4h_df.iloc[-1].get("NATR", 1.8))
-                del btc_4h_df
-            del btc_4h_raw
+            btc_st, btc_adx, btc_natr = self._get_cached_4h_metrics("BTCUSDT")
+            btc_macro_bearish = bool(btc_st == -1)
 
         sl_mult, tp_mult, trail_ratio = self._regime_exit_multipliers(btc_adx, btc_natr, btc_macro_bearish)
         open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio)
@@ -652,7 +654,6 @@ class LiveAccountTradingBot:
                 continue
 
             df = self.build_features(df_raw)
-            del df_raw
             if len(df) < 2:
                 continue
             prev = df.iloc[-2]
@@ -663,7 +664,6 @@ class LiveAccountTradingBot:
                 dmat = xgb.DMatrix(df.iloc[[-1]][features].to_numpy(dtype="float32"))
                 p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
                 p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
-                del dmat
             except Exception as e:
                 diagnostics.append(f"{bybit_sym}: Booster predict error ({e})")
                 continue
@@ -676,10 +676,7 @@ class LiveAccountTradingBot:
             if interval == "240":
                 trend_4h = int(curr["Supertrend"])
             else:
-                raw_4h = self.fetch_bybit_candles(bybit_sym, interval="240", limit=220)
-                df_4h = self.build_features(raw_4h) if len(raw_4h) >= 210 else pd.DataFrame()
-                trend_4h = int(df_4h.iloc[-1]["Supertrend"]) if not df_4h.empty else 0
-                del raw_4h, df_4h
+                trend_4h, _, _ = self._get_cached_4h_metrics(bybit_sym)
 
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.07) and (float(curr["Vol_Surge"]) >= 1.20)
@@ -719,7 +716,6 @@ class LiveAccountTradingBot:
                     "latest_bar_ms": latest_bar_ms,
                 })
             else:
-                # Calibrated Daily 1-Trade Hunter: qualifies top 4H-aligned directional setup (raw_prob >= 0.18, ADX >= 12) when 0 trades fired today
                 if (
                     need_daily_first_trade
                     and not guard_blocked
@@ -753,9 +749,6 @@ class LiveAccountTradingBot:
                 trade_blocks.append(block_msg)
                 if top_blocked_info is None or raw_prob > top_blocked_info[0]:
                     top_blocked_info = (raw_prob, f"{bybit_sym}_{direction}_{','.join(reasons)}", block_msg)
-
-            del df
-            gc.collect()
 
         candidates.sort(key=lambda x: x["edge"], reverse=True)
         if not candidates and need_daily_first_trade and daily_hunter_backups:
