@@ -109,15 +109,14 @@ class PaperStrategyTrainerAndTester:
         os.makedirs(os.path.join(models_dir, "PAPER"), exist_ok=True)
         os.makedirs(self.paper_history_dir, exist_ok=True)
         os.makedirs(os.path.join(models_dir, "LIVE"), exist_ok=True)
-
         self.dynamic_strategies = self._load_dynamic_strategies()
 
     def _load_dynamic_strategies(self) -> dict:
         merged = {}
-        for path in (self.adopted_strats_path, self.discovered_strats_path):
-            if os.path.exists(path):
+        for fpath in (self.adopted_strats_path, self.discovered_strats_path):
+            if os.path.exists(fpath):
                 try:
-                    with open(path, "r", encoding="utf-8-sig") as f:
+                    with open(fpath, "r", encoding="utf-8-sig") as f:
                         data = json.load(f)
                     for sid, sdata in (data.get("strategies", {}) or {}).items():
                         if isinstance(sdata, dict) and sdata.get("long_rules") and sdata.get("short_rules"):
@@ -126,15 +125,9 @@ class PaperStrategyTrainerAndTester:
                     pass
         return merged
 
-    def _auto_adopt_winning_gemini_strategy(self, strategy_id: str, stats: dict):
-        if strategy_id not in self.dynamic_strategies:
+    def _adopt_winning_dynamic_strategies(self, trained_coins: dict):
+        if not self.dynamic_strategies:
             return
-        pnl = float(stats.get("net_pnl_usdt", 0.0))
-        pf = float(stats.get("profit_factor", 0.0))
-        trades = int(stats.get("trades", 0))
-        if pnl <= 0.0 or pf < 1.15 or trades < 4:
-            return
-
         adopted = {}
         if os.path.exists(self.adopted_strats_path):
             try:
@@ -143,19 +136,43 @@ class PaperStrategyTrainerAndTester:
             except Exception:
                 adopted = {}
 
-        spec = dict(self.dynamic_strategies[strategy_id])
-        spec["adopted_at"] = int(time.time())
-        spec["verified_pf"] = pf
-        spec["verified_pnl"] = pnl
-        adopted[strategy_id] = spec
+        changed = False
+        for sym, cdata in trained_coins.items():
+            if not isinstance(cdata, dict):
+                continue
+            sid = str(cdata.get("strategy_id", ""))
+            if sid in self.dynamic_strategies:
+                pnl = float(cdata.get("net_pnl_usdt", 0.0))
+                pf = float(cdata.get("profit_factor", 0.0))
+                wr = float(cdata.get("win_rate_pct", 0.0))
+                trades = int(cdata.get("trades", 0))
+                if pnl > 0.0 and pf >= 1.15 and trades >= 4:
+                    best_cfg = dict(cdata.get("config", {}))
+                    spec = dict(self.dynamic_strategies[sid])
+                    spec["adopted_at"] = int(time.time())
+                    spec["proven_on_symbol"] = sym
+                    spec["proven_pf"] = pf
+                    spec["proven_win_rate_pct"] = wr
+                    spec["proven_net_pnl_usdt"] = pnl
+                    # Fix and lock the winning parameters discovered during multi-parameter testing
+                    spec["fixed_config"] = {
+                        "long_thresh": best_cfg.get("long_thresh", 0.28),
+                        "short_thresh": best_cfg.get("short_thresh", 0.28),
+                        "sl_atr": best_cfg.get("sl_atr", 1.30),
+                        "tp1_rr": best_cfg.get("tp1_rr", 1.90),
+                        "tp2_rr": best_cfg.get("tp2_rr", 3.30),
+                        "trail_atr": best_cfg.get("trail_atr", 1.80),
+                        "timeframe": best_cfg.get("timeframe", "1H"),
+                        "mtf_alignment_mode": best_cfg.get("mtf_alignment_mode", "SOFT"),
+                    }
+                    adopted[sid] = spec
+                    changed = True
 
-        try:
-            tmp_p = self.adopted_strats_path + ".tmp"
-            with open(tmp_p, "w", encoding="utf-8") as wf:
+        if changed:
+            tmp_a = self.adopted_strats_path + ".tmp"
+            with open(tmp_a, "w", encoding="utf-8") as wf:
                 json.dump({"updated_at": int(time.time()), "strategies": adopted}, wf, indent=2)
-            os.replace(tmp_p, self.adopted_strats_path)
-        except Exception:
-            pass
+            os.replace(tmp_a, self.adopted_strats_path)
 
     def _prune_old_trained_models(self, keep_latest: int = MAX_KEPT_MODEL_VERSIONS):
         try:
@@ -266,7 +283,7 @@ class PaperStrategyTrainerAndTester:
                 params["end"] = cursor_end
 
             rows = []
-            for base in ("[https://api.bytick.com](https://api.bytick.com)", "[https://api-demo.bybit.com](https://api-demo.bybit.com)", "[https://api.bybit.com](https://api.bybit.com)"):
+            for base in ("https://api.bytick.com", "https://api-demo.bybit.com", "https://api.bybit.com"):
                 try:
                     resp = self._public_get(f"{base}/v5/market/kline", params)
                     rows = resp.get("result", {}).get("list", [])
@@ -431,25 +448,25 @@ class PaperStrategyTrainerAndTester:
 
     def _eval_dynamic_rule_list(self, test_df: pd.DataFrame, rules: list) -> np.ndarray:
         n = len(test_df)
-        mask = np.ones(n - 1, dtype=bool)
-        for r in rules:
-            ind = r.get("ind", "")
-            op = r.get("op", "")
-            val = float(r.get("val", 0.0))
+        mask = np.ones(n, dtype=bool)
+        mask[0] = False
+        for rule in rules:
+            ind = rule.get("ind", "")
+            op = rule.get("op", "")
+            val = float(rule.get("val", 0.0))
             if ind not in test_df.columns:
-                continue
+                mask[:] = False
+                return mask
             arr = test_df[ind].to_numpy()[:-1]
             if op == ">":
-                mask &= (arr > val)
+                mask[1:] &= (arr > val)
             elif op == "<":
-                mask &= (arr < val)
+                mask[1:] &= (arr < val)
             elif op == ">=":
-                mask &= (arr >= val)
+                mask[1:] &= (arr >= val)
             elif op == "<=":
-                mask &= (arr <= val)
-        out = np.zeros(n, dtype=bool)
-        out[1:] = mask
-        return out
+                mask[1:] &= (arr <= val)
+        return mask
 
     def _compute_vectorized_filter_masks(self, test_df: pd.DataFrame, strategy_id: str, relaxed: bool = False):
         n = len(test_df)
@@ -458,7 +475,7 @@ class PaperStrategyTrainerAndTester:
         if n < 2:
             return long_ok, short_ok
 
-        # Check Gemini-discovered or adopted custom rule strategies first
+        # Check Gemini-invented / adopted dynamic strategies first
         if strategy_id in self.dynamic_strategies:
             spec = self.dynamic_strategies[strategy_id]
             return (
@@ -539,6 +556,7 @@ class PaperStrategyTrainerAndTester:
         extended_param_sweep: bool = False,
     ) -> dict:
         round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (BYBIT_TAKER_FEE * 2.0)
+        dyn_spec = self.dynamic_strategies.get(strategy_id)
 
         param_configs = [
             (0.18, 1.05, 1.60, False, 1.8),
@@ -554,13 +572,25 @@ class PaperStrategyTrainerAndTester:
             (0.46, 1.70, 2.35, True, 1.8),
         ]
 
-        if extended_param_sweep:
+        # Automatically sweep broader parameter combinations for new Gemini strategies or extended sweeps
+        if extended_param_sweep or dyn_spec is not None:
             param_configs.extend([
                 (0.20, 1.60, 2.40, False, 2.2),
                 (0.26, 1.80, 2.60, False, 2.4),
                 (0.32, 0.95, 1.55, False, 1.4),
                 (0.38, 1.95, 2.80, True, 2.5),
             ])
+
+        # If this strategy was already adopted with locked winning parameters, include its fixed config
+        if dyn_spec and isinstance(dyn_spec.get("fixed_config"), dict):
+            fc = dyn_spec["fixed_config"]
+            param_configs.insert(0, (
+                float(fc.get("long_thresh", 0.28)),
+                float(fc.get("sl_atr", 1.30)),
+                float(fc.get("tp1_rr", 1.90)),
+                str(fc.get("mtf_alignment_mode", "SOFT")).upper() == "STRICT",
+                float(fc.get("trail_atr", 1.80)),
+            ))
 
         if extra_quantile_thresholds:
             for qt in extra_quantile_thresholds:
@@ -579,7 +609,6 @@ class PaperStrategyTrainerAndTester:
         best_eval = None
         best_score = -9999999.0
 
-        # Train & evaluate across all three 4H MTF Alignment modes: OFF, SOFT, and STRICT
         mtf_modes_to_test = ["OFF", "SOFT", "STRICT"] if htf_dir_aligned is not None else ["OFF"]
 
         for thresh, sl_atr, tp1_rr, require_htf, trail_mult in param_configs:
@@ -600,8 +629,8 @@ class PaperStrategyTrainerAndTester:
                     "mtf_alignment_mode": mtf_mode_label,
                     "relaxed_filter": relaxed_filter,
                 }
-                if strategy_id in self.dynamic_strategies:
-                    cfg["custom_rules"] = self.dynamic_strategies[strategy_id]
+                if dyn_spec:
+                    cfg["custom_rules"] = dyn_spec
 
                 le_arr = np.zeros(n_bars, dtype=bool)
                 se_arr = np.zeros(n_bars, dtype=bool)
@@ -729,7 +758,7 @@ class PaperStrategyTrainerAndTester:
 
     def _filter_archetype_key(self, strategy_id: str) -> str:
         if strategy_id in self.dynamic_strategies:
-            return f"dyn_{strategy_id}"
+            return strategy_id
         sid = strategy_id.lower()
         if "donchian" in sid:
             return "donchian"
@@ -765,7 +794,7 @@ class PaperStrategyTrainerAndTester:
         if not test_tfs:
             test_tfs = ["1h", "4h"]
 
-        raw_strats = list(self.dynamic_strategies.keys()) + (active_strategies if active_strategies else ["xgb_mtf_v2"])
+        raw_strats = list(dict.fromkeys(list(self.dynamic_strategies.keys()) + (active_strategies if active_strategies else ["xgb_mtf_v2"])))
         seen_archetypes = set()
         strategies_to_test = []
         for s in raw_strats:
@@ -849,12 +878,9 @@ class PaperStrategyTrainerAndTester:
                     )
                     st = eval_res["stats"]
                     best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "STRICT")
-                    if strat_id in self.dynamic_strategies:
-                        strat_name = self.dynamic_strategies[strat_id].get("name", strat_id)
-                        self._auto_adopt_winning_gemini_strategy(strat_id, st)
-                    else:
-                        strat_meta = STRATEGY_CATALOG_META.get(strat_id, {"name": strat_id.replace("_", " ").title()})
-                        strat_name = strat_meta.get("name", strat_id)
+                    dyn_meta = self.dynamic_strategies.get(strat_id)
+                    strat_meta = dyn_meta if dyn_meta else STRATEGY_CATALOG_META.get(strat_id, {"name": strat_id.replace("_", " ").title()})
+                    strat_name = strat_meta.get("name", strat_id)
 
                     all_tf_runs.append({
                         "strategy_id": strat_id,
@@ -886,7 +912,6 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            # Stage 2: Adaptive Parameter Sweep across OFF / SOFT / STRICT when trades < min_req_trades OR Net PnL <= 0 / PF < 1.15
             cur_trades = best_candidate["stats"]["trades"] if best_candidate else 0
             cur_pnl = best_candidate["stats"]["net_pnl_usdt"] if best_candidate else -999.0
             cur_pf = best_candidate["stats"]["profit_factor"] if best_candidate else 0.0
@@ -935,7 +960,6 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            # Stage 3: High-sensitivity target retrain on 1H/4H across OFF / SOFT / STRICT
             if (cur_trades < min_req_trades or cur_pnl <= 0.0) and cached_tf_bundles:
                 for tf, raw, _, _, _, _, _, _, _, htf_dir_aligned in [b for b in cached_tf_bundles if b[0] in ("1h", "4h")]:
                     df_sens = self.build_matrix(raw, max_dd=1.15, expansion=0.75, horizon=14)
@@ -1024,6 +1048,8 @@ class PaperStrategyTrainerAndTester:
             }
             trained_coins[symbol] = coin_entry
             paper_portfolio[symbol] = coin_entry
+
+        self._adopt_winning_dynamic_strategies(trained_coins)
 
         with open(self.paper_results_path, "w", encoding="utf-8") as f:
             json.dump({"leverage": leverage, "training_days": TRAINING_WINDOW_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
