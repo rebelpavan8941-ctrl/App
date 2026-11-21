@@ -100,11 +100,10 @@ class LiveAccountTradingBot:
             "daily_coin_trades": {},
             "daily_total_trades": 0,
             "tp1_partial_done": {},
+            "last_bot_logs": [],
             "last_diagnostics": [],
             "last_order_rejections": [],
             "last_trade_blocks": [],
-            "last_skip_notice_key": "",
-            "last_skip_notice_ms": 0,
             "coins_scanned": 0,
         }
 
@@ -564,6 +563,7 @@ class LiveAccountTradingBot:
         btc_macro_guard: bool = True,
         daily_drawdown_pct: float = 0.0,
         max_daily_loss_pct: float = 3.0,
+        bot_logs_enabled: bool = True,
     ) -> dict:
         if not os.path.exists(self.master_path):
             raise FileNotFoundError(f"Master ML Model not found at {self.master_path}")
@@ -581,11 +581,20 @@ class LiveAccountTradingBot:
         traded_candle_ts = state.setdefault("traded_candle_ts", {})
         last_trade_epoch_ms = state.setdefault("last_trade_epoch_ms", {})
         daily_coin_trades = state.setdefault("daily_coin_trades", {})
+        bot_logs = state.setdefault("last_bot_logs", [])
         diagnostics = []
         order_rejections = []
         trade_blocks = []
         radar_signals = []
-        today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+        now_dt = datetime.datetime.now(datetime.timezone.utc)
+        today_str = now_dt.strftime("%Y-%m-%d")
+        clock_str = now_dt.strftime("%H:%M:%S UTC")
+
+        def add_bot_log(msg: str):
+            if bot_logs_enabled:
+                bot_logs.append(f"[{clock_str}] {msg}")
+
         if daily_coin_trades.get("_date") != today_str:
             daily_coin_trades.clear()
             daily_coin_trades["_date"] = today_str
@@ -593,14 +602,15 @@ class LiveAccountTradingBot:
 
         daily_total_trades = int(state.get("daily_total_trades", 0))
         need_daily_first_trade = (daily_total_trades == 0)
-
         now_ms = int(time.time() * 1000)
 
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         bal_ret_code = int(bal_res.get("retCode", -1)) if bal_res else -1
         if bal_ret_code != 0:
             bal_msg = bal_res.get("retMsg", "Unable to fetch Unified USDT balance")
-            order_rejections.append(f"Bybit Account Balance Check [{bal_ret_code}]: {BYBIT_ERROR_HINTS.get(bal_ret_code, bal_msg)}")
+            err_str = f"Bybit Wallet API Error [{bal_ret_code}]: {BYBIT_ERROR_HINTS.get(bal_ret_code, bal_msg)}"
+            order_rejections.append(err_str)
+            add_bot_log(err_str)
         avail_usdt = float(bal_res.get("result", {}).get("list", [{}])[0].get("totalAvailableBalance", 0.0))
 
         btc_macro_bearish = False
@@ -618,7 +628,6 @@ class LiveAccountTradingBot:
 
         candidates = []
         daily_hunter_backups = []
-        top_blocked_info = None
         coins_scanned_count = 0
 
         for symbol, entry in portfolio.items():
@@ -688,7 +697,6 @@ class LiveAccountTradingBot:
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
-            # Build radar signal directly here so dynamic_bot_runner skips duplicate candle downloads
             adx_val = float(curr.get("ADX", 0.0))
             disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
             conv_pct = int(min(99, max(45, round((raw_prob / max(req_thresh, 0.16)) * 76 + (10 if raw_4h_ok else -8) + min(adx_val * 0.25, 8)))))
@@ -728,7 +736,6 @@ class LiveAccountTradingBot:
                     "latest_bar_ms": latest_bar_ms,
                 })
             else:
-                # Calibrated Daily 1-Trade Hunter: qualifies top 4H-aligned setup (raw_prob >= 0.12) when 0 trades fired today
                 if (
                     need_daily_first_trade
                     and not guard_blocked
@@ -749,66 +756,67 @@ class LiveAccountTradingBot:
 
                 reasons = []
                 if guard_blocked:
-                    reasons.append("BTC 4H Macro Guard")
+                    reasons.append("BTC 4H Guard")
                 elif not mtf_aligned:
-                    reasons.append(f"4H MTF misaligned ({effective_mtf})")
+                    reasons.append(f"4H MTF ({effective_mtf})")
                 if not strat_ok:
                     reasons.append(f"Filter ({strat_id})")
                 if raw_prob < effective_min_prob:
-                    reasons.append(f"ML prob {raw_prob:.2f} < {effective_min_prob:.2f}")
-                block_msg = f"{bybit_sym} {direction} waiting: {', '.join(reasons)} [ADX:{adx_val:.1f}, Avail:${avail_usdt:.2f}]"
+                    reasons.append(f"Prob {raw_prob:.2f} < {effective_min_prob:.2f}")
+                block_msg = f"{bybit_sym} {direction}: {', '.join(reasons)} (ADX:{adx_val:.1f}, Avail:${avail_usdt:.2f})"
                 diagnostics.append(block_msg)
                 trade_blocks.append(block_msg)
-                if top_blocked_info is None or raw_prob > top_blocked_info[0]:
-                    top_blocked_info = (raw_prob, f"{bybit_sym}_{direction}_{','.join(reasons)}", block_msg)
 
         radar_signals.sort(key=lambda x: (x["aligned_4h"], x["conviction_pct"]), reverse=True)
         candidates.sort(key=lambda x: x["edge"], reverse=True)
         if not candidates and need_daily_first_trade and daily_hunter_backups:
             daily_hunter_backups.sort(key=lambda x: x["edge"], reverse=True)
             candidates = [daily_hunter_backups[0]]
-            diagnostics.append(f"Daily 1-Trade Hunter selected top setup: {candidates[0]['bybit_sym']} {candidates[0]['direction']}")
+            add_bot_log(f"Daily Hunter picked #{1} setup: {candidates[0]['bybit_sym']} {candidates[0]['direction']} (prob={candidates[0]['raw_prob']:.2f})")
 
         live_trades_this_cycle = 0
 
         for cand in candidates:
             bybit_sym = cand["bybit_sym"]
             if not live_orders_armed:
-                msg = f"{bybit_sym} {cand['direction']} blocked: Live Orders Armed switch is OFF"
+                msg = f"{bybit_sym} {cand['direction']} skipped: Live Orders Armed switch is OFF"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
-                order_rejections.append(msg)
+                add_bot_log(msg)
                 break
             if daily_drawdown_pct >= max_daily_loss_pct and max_daily_loss_pct > 0.0:
-                msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit reached ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
+                msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
                 order_rejections.append(msg)
+                add_bot_log(msg)
                 break
             if len(open_syms) >= max_open_positions:
-                msg = f"{bybit_sym} {cand['direction']} blocked: Max open positions reached ({len(open_syms)}/{max_open_positions})"
+                msg = f"{bybit_sym} {cand['direction']} skipped: Max open positions ({len(open_syms)}/{max_open_positions})"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
+                add_bot_log(msg)
                 break
             if avail_usdt < 2.0:
-                msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT balance too low (${avail_usdt:.2f} < $2.00)"
+                msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT too low (${avail_usdt:.2f} < $2.00)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
                 order_rejections.append(msg)
+                add_bot_log(msg)
                 break
             if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
-                trade_blocks.append(f"{bybit_sym}: Already traded on this candle")
+                add_bot_log(f"{bybit_sym} {cand['direction']}: Already traded on current candle")
                 continue
             if (now_ms - int(last_trade_epoch_ms.get(bybit_sym, 0))) < 15 * 60 * 1000:
-                trade_blocks.append(f"{bybit_sym}: 15-minute cooldown active")
+                add_bot_log(f"{bybit_sym} {cand['direction']}: 15m cooldown active")
                 continue
 
             filters = self._get_instrument_filters(bybit_sym)
             if filters is None:
                 msg = f"{bybit_sym} blocked: Instrument specs unavailable on Bybit"
                 diagnostics.append(msg)
-                trade_blocks.append(msg)
                 order_rejections.append(msg)
+                add_bot_log(msg)
                 continue
             qty_step, min_qty, min_notional, tick_size = filters
 
@@ -826,8 +834,8 @@ class LiveAccountTradingBot:
             if max_buying_power < min_required_notional:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Min order ${min_required_notional:.2f} > buying power ${max_buying_power:.2f} (Avail ${avail_usdt:.2f})"
                 diagnostics.append(msg)
-                trade_blocks.append(msg)
                 order_rejections.append(msg)
+                add_bot_log(msg)
                 continue
 
             conv_scale = self._conviction_risk_scale(float(cand.get("raw_prob", 0.3)), float(cand.get("req_thresh", 0.3)))
@@ -869,6 +877,7 @@ class LiveAccountTradingBot:
                 state["daily_total_trades"] = daily_total_trades
                 live_trades_this_cycle += 1
                 avail_usdt = max(0.0, avail_usdt - (notional / leverage))
+                add_bot_log(f"ORDER EXECUTED SUCCESS: {bybit_sym} {cand['direction']} qty={qty_str} @ ~{price:.4f} (SL={sl_str}, TP={tp_str})")
             else:
                 code = int(res.get("retCode", -1))
                 raw_msg = str(res.get("retMsg", "Unknown Bybit rejection"))
@@ -876,12 +885,15 @@ class LiveAccountTradingBot:
                 rej_msg = f"{bybit_sym} {cand['direction']} (qty {qty_str}) rejected by Bybit [{code}]: {hint} ({raw_msg})"
                 diagnostics.append(rej_msg)
                 order_rejections.append(rej_msg)
+                add_bot_log(f"ORDER REJECTED: {rej_msg}")
 
-        if live_orders_armed and live_trades_this_cycle == 0 and len(open_syms) == 0 and not order_rejections and top_blocked_info is not None:
-            _, skip_key, skip_msg = top_blocked_info
-            order_rejections.append(f"Scan Status: {skip_msg}")
-            state["last_skip_notice_key"] = skip_key
-            state["last_skip_notice_ms"] = now_ms
+        if live_trades_this_cycle == 0 and diagnostics:
+            add_bot_log(f"Scan ({coins_scanned_count} coins, Avail ${avail_usdt:.2f}): {diagnostics[0]}")
+
+        if not bot_logs_enabled:
+            state["last_bot_logs"] = []
+        else:
+            state["last_bot_logs"] = bot_logs[-60:]
 
         state["coins_scanned"] = coins_scanned_count
         state["last_diagnostics"] = diagnostics[-25:]
@@ -943,6 +955,6 @@ if __name__ == "__main__":
             btc_macro_guard=bool(runtime_cfg.get("btc_macro_guard", True)),
             daily_drawdown_pct=float(runtime_cfg.get("daily_drawdown_pct", 0.0)),
             max_daily_loss_pct=float(runtime_cfg.get("max_daily_loss_pct", 3.0)),
+            bot_logs_enabled=bool(runtime_cfg.get("bot_logs_enabled", True)),
         )
         print(json.dumps(out))
-        
