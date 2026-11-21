@@ -584,6 +584,7 @@ class LiveAccountTradingBot:
         diagnostics = []
         order_rejections = []
         trade_blocks = []
+        radar_signals = []
         today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         if daily_coin_trades.get("_date") != today_str:
             daily_coin_trades.clear()
@@ -631,9 +632,6 @@ class LiveAccountTradingBot:
             coins_scanned_count += 1
             cfg = entry.get("config", {})
             bybit_sym = (cfg.get("bybit_symbol") or symbol.replace("/", "")).upper()
-            if bybit_sym in open_syms:
-                trade_blocks.append(f"{bybit_sym}: Already has an open position")
-                continue
 
             models_map = entry.get("models", {})
             long_data = models_map.get("long") or models_map.get("long_model")
@@ -690,6 +688,22 @@ class LiveAccountTradingBot:
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
+            # Build radar signal directly here so dynamic_bot_runner skips duplicate candle downloads
+            adx_val = float(curr.get("ADX", 0.0))
+            disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
+            conv_pct = int(min(99, max(45, round((raw_prob / max(req_thresh, 0.16)) * 76 + (10 if raw_4h_ok else -8) + min(adx_val * 0.25, 8)))))
+            radar_signals.append({
+                "symbol": disp_sym,
+                "side": direction,
+                "conviction_pct": conv_pct,
+                "aligned_4h": bool(raw_4h_ok and not guard_blocked),
+                "raw_prob": round(raw_prob, 4),
+            })
+
+            if bybit_sym in open_syms:
+                trade_blocks.append(f"{bybit_sym}: Already has an open position")
+                continue
+
             strat_ok = self._strategy_entry_filter(
                 strat_id,
                 curr,
@@ -698,10 +712,8 @@ class LiveAccountTradingBot:
                 relaxed=is_relaxed,
                 custom_rules=custom_rules,
             )
-            effective_min_prob = max(req_thresh, 0.20)
-
-            adx_val = float(curr.get("ADX", 0.0))
-            quality_edge = (raw_prob - effective_min_prob) + (0.03 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 22.0 else 0.0)
+            effective_min_prob = max(req_thresh, 0.18)
+            quality_edge = (raw_prob - effective_min_prob) + (0.03 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 20.0 else 0.0)
 
             if mtf_aligned and strat_ok and raw_prob >= effective_min_prob:
                 candidates.append({
@@ -716,17 +728,17 @@ class LiveAccountTradingBot:
                     "latest_bar_ms": latest_bar_ms,
                 })
             else:
+                # Calibrated Daily 1-Trade Hunter: qualifies top 4H-aligned setup (raw_prob >= 0.12) when 0 trades fired today
                 if (
                     need_daily_first_trade
                     and not guard_blocked
                     and (raw_4h_ok or effective_mtf == "OFF")
-                    and raw_prob >= 0.18
-                    and adx_val >= 12.0
+                    and raw_prob >= 0.12
                 ):
                     daily_hunter_backups.append({
                         "edge": quality_edge,
                         "raw_prob": raw_prob,
-                        "req_thresh": 0.18,
+                        "req_thresh": 0.12,
                         "bybit_sym": bybit_sym,
                         "market_type": market_type,
                         "direction": direction,
@@ -737,19 +749,20 @@ class LiveAccountTradingBot:
 
                 reasons = []
                 if guard_blocked:
-                    reasons.append("BTC 4H Macro Guard (BTC bearish)")
+                    reasons.append("BTC 4H Macro Guard")
                 elif not mtf_aligned:
-                    reasons.append(f"4H MTF trend misaligned ({effective_mtf})")
+                    reasons.append(f"4H MTF misaligned ({effective_mtf})")
                 if not strat_ok:
-                    reasons.append(f"Strategy filter ({strat_id})")
+                    reasons.append(f"Filter ({strat_id})")
                 if raw_prob < effective_min_prob:
                     reasons.append(f"ML prob {raw_prob:.2f} < {effective_min_prob:.2f}")
-                block_msg = f"{bybit_sym} {direction} waiting: {', '.join(reasons)} [ADX:{adx_val:.1f}, Avail USDT:${avail_usdt:.2f}]"
+                block_msg = f"{bybit_sym} {direction} waiting: {', '.join(reasons)} [ADX:{adx_val:.1f}, Avail:${avail_usdt:.2f}]"
                 diagnostics.append(block_msg)
                 trade_blocks.append(block_msg)
                 if top_blocked_info is None or raw_prob > top_blocked_info[0]:
                     top_blocked_info = (raw_prob, f"{bybit_sym}_{direction}_{','.join(reasons)}", block_msg)
 
+        radar_signals.sort(key=lambda x: (x["aligned_4h"], x["conviction_pct"]), reverse=True)
         candidates.sort(key=lambda x: x["edge"], reverse=True)
         if not candidates and need_daily_first_trade and daily_hunter_backups:
             daily_hunter_backups.sort(key=lambda x: x["edge"], reverse=True)
@@ -764,6 +777,7 @@ class LiveAccountTradingBot:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Live Orders Armed switch is OFF"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
+                order_rejections.append(msg)
                 break
             if daily_drawdown_pct >= max_daily_loss_pct and max_daily_loss_pct > 0.0:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit reached ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
@@ -865,12 +879,9 @@ class LiveAccountTradingBot:
 
         if live_orders_armed and live_trades_this_cycle == 0 and len(open_syms) == 0 and not order_rejections and top_blocked_info is not None:
             _, skip_key, skip_msg = top_blocked_info
-            last_key = str(state.get("last_skip_notice_key", ""))
-            last_ms = int(state.get("last_skip_notice_ms", 0))
-            if skip_key != last_key or (now_ms - last_ms) >= 15 * 60 * 1000:
-                order_rejections.append(f"Scan Status (No Entry Yet): {skip_msg}")
-                state["last_skip_notice_key"] = skip_key
-                state["last_skip_notice_ms"] = now_ms
+            order_rejections.append(f"Scan Status: {skip_msg}")
+            state["last_skip_notice_key"] = skip_key
+            state["last_skip_notice_ms"] = now_ms
 
         state["coins_scanned"] = coins_scanned_count
         state["last_diagnostics"] = diagnostics[-25:]
@@ -884,6 +895,8 @@ class LiveAccountTradingBot:
             "coins_scanned": coins_scanned_count,
             "daily_total_trades": daily_total_trades,
             "open_positions_count": len(open_syms),
+            "radar_signals": radar_signals,
+            "ml_model_version": master.get("version", f"LIVE_PORTFOLIO_{len(portfolio)}C"),
             "order_rejections": order_rejections,
             "trade_blocks": trade_blocks,
             "diagnostics": diagnostics[-10:],
@@ -932,3 +945,4 @@ if __name__ == "__main__":
             max_daily_loss_pct=float(runtime_cfg.get("max_daily_loss_pct", 3.0)),
         )
         print(json.dumps(out))
+        
