@@ -133,6 +133,7 @@ class LiveAccountTradingBot:
             "traded_candle_ts": {},
             "last_trade_epoch_ms": {},
             "loss_cooldown_until_ms": {},
+            "agentic_veto_until_ms": {},
             "restricted_symbols_until_ms": {},
             "daily_coin_trades": {},
             "daily_total_trades": 0,
@@ -676,6 +677,7 @@ class LiveAccountTradingBot:
         traded_candle_ts = state.setdefault("traded_candle_ts", {})
         last_trade_epoch_ms = state.setdefault("last_trade_epoch_ms", {})
         loss_cooldown_until_ms = state.setdefault("loss_cooldown_until_ms", {})
+        agentic_veto_until_ms = state.setdefault("agentic_veto_until_ms", {})
         restricted_until_ms = state.setdefault("restricted_symbols_until_ms", {})
         daily_coin_trades = state.setdefault("daily_coin_trades", {})
         bot_logs = state.setdefault("last_bot_logs", [])
@@ -819,6 +821,10 @@ class LiveAccountTradingBot:
 
             if now_ms < int(loss_cooldown_until_ms.get(bybit_sym, 0)):
                 trade_blocks.append(f"{bybit_sym}: 2h post-loss cooldown active")
+                continue
+
+            if now_ms < int(agentic_veto_until_ms.get(bybit_sym, 0)):
+                trade_blocks.append(f"{bybit_sym}: Vetoed by Agentic AI Supervisor")
                 continue
 
             if bybit_sym in open_syms:
