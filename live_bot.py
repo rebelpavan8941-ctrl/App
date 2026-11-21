@@ -56,6 +56,40 @@ def is_valid_xgb_model(model_dict) -> bool:
     return isinstance(model_dict, dict) and "learner" in model_dict and isinstance(model_dict.get("learner"), dict)
 
 
+def _sanitize_xgb_model_json(model_dict: dict) -> dict:
+    """Repairs XGBoost JSON float arrays where integer tokens cause C++ json.h:82 Invalid cast."""
+    if not isinstance(model_dict, dict):
+        return model_dict
+    learner = model_dict.get("learner")
+    if not isinstance(learner, dict):
+        return model_dict
+
+    lmp = learner.get("learner_model_param")
+    if isinstance(lmp, dict) and "base_score" in lmp:
+        bs = lmp["base_score"]
+        if isinstance(bs, (int, float)) and not isinstance(bs, bool):
+            lmp["base_score"] = str(float(bs))
+
+    gb = learner.get("gradient_booster")
+    if isinstance(gb, dict):
+        model = gb.get("model")
+        if isinstance(model, dict):
+            trees = model.get("trees")
+            if isinstance(trees, list):
+                float_array_keys = ("split_conditions", "base_weights", "loss_changes", "sum_hessian")
+                for tree in trees:
+                    if not isinstance(tree, dict):
+                        continue
+                    for k in float_array_keys:
+                        arr = tree.get(k)
+                        if isinstance(arr, list):
+                            tree[k] = [
+                                float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+                                for v in arr
+                            ]
+    return model_dict
+
+
 class LiveAccountTradingBot:
     def __init__(self, api_key: str, api_secret: str, models_dir: str, live_dir: str = None, endpoint: str = "Mainnet"):
         self.api_key = api_key
@@ -447,12 +481,13 @@ class LiveAccountTradingBot:
             oldest_key = next(iter(self._booster_cache))
             self._booster_cache.pop(oldest_key, None)
 
+        sanitized_dict = _sanitize_xgb_model_json(model_dict)
         booster = xgb.Booster()
         os.makedirs(self.live_dir, exist_ok=True)
         tmp_path = os.path.join(self.live_dir, f"_tmp_live_{cache_key}_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(model_dict, f)
+                json.dump(sanitized_dict, f)
             booster.load_model(tmp_path)
             self._booster_cache[cache_key] = booster
         finally:
@@ -628,6 +663,7 @@ class LiveAccountTradingBot:
 
         candidates = []
         daily_hunter_backups = []
+        top_wait_tuple = None
         coins_scanned_count = 0
 
         for symbol, entry in portfolio.items():
@@ -646,7 +682,9 @@ class LiveAccountTradingBot:
             long_data = models_map.get("long") or models_map.get("long_model")
             short_data = models_map.get("short") or models_map.get("short_model")
             if not is_valid_xgb_model(long_data) or not is_valid_xgb_model(short_data):
-                diagnostics.append(f"{bybit_sym}: Missing valid XGBoost booster weights")
+                err_msg = f"{bybit_sym}: Missing valid XGBoost booster weights"
+                diagnostics.append(err_msg)
+                order_rejections.append(err_msg)
                 continue
 
             tf_str = (cfg.get("timeframe") or entry.get("timeframe") or "1h").lower()
@@ -672,7 +710,9 @@ class LiveAccountTradingBot:
                 p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
                 p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
             except Exception as e:
-                diagnostics.append(f"{bybit_sym}: Booster predict error ({e})")
+                err_msg = f"{bybit_sym}: Booster error (re-train/re-promote model) - {e}"
+                diagnostics.append(err_msg)
+                order_rejections.append(err_msg)
                 continue
 
             direction = "LONG" if p_long >= p_short else "SHORT"
@@ -763,16 +803,18 @@ class LiveAccountTradingBot:
                     reasons.append(f"Filter ({strat_id})")
                 if raw_prob < effective_min_prob:
                     reasons.append(f"Prob {raw_prob:.2f} < {effective_min_prob:.2f}")
-                block_msg = f"{bybit_sym} {direction}: {', '.join(reasons)} (ADX:{adx_val:.1f}, Avail:${avail_usdt:.2f})"
+                block_msg = f"{bybit_sym} {direction} ({conv_pct}%): {', '.join(reasons)} [ADX:{adx_val:.1f}]"
                 diagnostics.append(block_msg)
                 trade_blocks.append(block_msg)
+                if top_wait_tuple is None or conv_pct > top_wait_tuple[0]:
+                    top_wait_tuple = (conv_pct, block_msg)
 
         radar_signals.sort(key=lambda x: (x["aligned_4h"], x["conviction_pct"]), reverse=True)
         candidates.sort(key=lambda x: x["edge"], reverse=True)
         if not candidates and need_daily_first_trade and daily_hunter_backups:
             daily_hunter_backups.sort(key=lambda x: x["edge"], reverse=True)
-            candidates = [daily_hunter_backups[0]]
-            add_bot_log(f"Daily Hunter picked #{1} setup: {candidates[0]['bybit_sym']} {candidates[0]['direction']} (prob={candidates[0]['raw_prob']:.2f})")
+            candidates = list(daily_hunter_backups)
+            add_bot_log(f"Daily Hunter queued {len(candidates)} 4H-aligned setups (top: {candidates[0]['bybit_sym']} {candidates[0]['direction']}, prob={candidates[0]['raw_prob']:.2f})")
 
         live_trades_this_cycle = 0
 
@@ -813,9 +855,8 @@ class LiveAccountTradingBot:
 
             filters = self._get_instrument_filters(bybit_sym)
             if filters is None:
-                msg = f"{bybit_sym} blocked: Instrument specs unavailable on Bybit"
+                msg = f"{bybit_sym} skipped: Not tradable on Bybit Linear"
                 diagnostics.append(msg)
-                order_rejections.append(msg)
                 add_bot_log(msg)
                 continue
             qty_step, min_qty, min_notional, tick_size = filters
@@ -832,9 +873,8 @@ class LiveAccountTradingBot:
             max_buying_power = avail_usdt * leverage * 0.85
             min_required_notional = max(min_notional * 1.05, min_qty * price)
             if max_buying_power < min_required_notional:
-                msg = f"{bybit_sym} {cand['direction']} blocked: Min order ${min_required_notional:.2f} > buying power ${max_buying_power:.2f} (Avail ${avail_usdt:.2f})"
+                msg = f"{bybit_sym} {cand['direction']} skipped: Min order ${min_required_notional:.2f} > buying power ${max_buying_power:.2f} (Avail ${avail_usdt:.2f})"
                 diagnostics.append(msg)
-                order_rejections.append(msg)
                 add_bot_log(msg)
                 continue
 
@@ -887,8 +927,9 @@ class LiveAccountTradingBot:
                 order_rejections.append(rej_msg)
                 add_bot_log(f"ORDER REJECTED: {rej_msg}")
 
-        if live_trades_this_cycle == 0 and diagnostics:
-            add_bot_log(f"Scan ({coins_scanned_count} coins, Avail ${avail_usdt:.2f}): {diagnostics[0]}")
+        if live_trades_this_cycle == 0:
+            summary_detail = top_wait_tuple[1] if top_wait_tuple else (diagnostics[0] if diagnostics else "All pairs scanned")
+            add_bot_log(f"Scan ({coins_scanned_count} coins, Avail ${avail_usdt:.2f}): {summary_detail}")
 
         if not bot_logs_enabled:
             state["last_bot_logs"] = []

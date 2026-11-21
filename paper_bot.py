@@ -111,6 +111,40 @@ class PaperStrategyTrainerAndTester:
         os.makedirs(os.path.join(models_dir, "LIVE"), exist_ok=True)
         self.dynamic_strategies = self._load_dynamic_strategies()
 
+    @staticmethod
+    def _sanitize_xgb_model_json(model_dict: dict) -> dict:
+        """Ensures float arrays in XGBoost JSON never serialize as bare integers (fixes json.h:82 Invalid cast)."""
+        if not isinstance(model_dict, dict):
+            return model_dict
+        learner = model_dict.get("learner")
+        if not isinstance(learner, dict):
+            return model_dict
+
+        lmp = learner.get("learner_model_param")
+        if isinstance(lmp, dict) and "base_score" in lmp:
+            bs = lmp["base_score"]
+            if isinstance(bs, (int, float)) and not isinstance(bs, bool):
+                lmp["base_score"] = str(float(bs))
+
+        gb = learner.get("gradient_booster")
+        if isinstance(gb, dict):
+            model = gb.get("model")
+            if isinstance(model, dict):
+                trees = model.get("trees")
+                if isinstance(trees, list):
+                    float_array_keys = ("split_conditions", "base_weights", "loss_changes", "sum_hessian")
+                    for tree in trees:
+                        if not isinstance(tree, dict):
+                            continue
+                        for k in float_array_keys:
+                            arr = tree.get(k)
+                            if isinstance(arr, list):
+                                tree[k] = [
+                                    float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+                                    for v in arr
+                                ]
+        return model_dict
+
     def _load_dynamic_strategies(self) -> dict:
         merged = {}
         for fpath in (self.adopted_strats_path, self.discovered_strats_path):
@@ -407,14 +441,14 @@ class PaperStrategyTrainerAndTester:
     def _serialize_booster(self, clf: xgb.XGBClassifier) -> dict:
         try:
             raw_bytes = bytes(clf.get_booster().save_raw("json"))
-            return json.loads(raw_bytes.decode("utf-8"))
+            return self._sanitize_xgb_model_json(json.loads(raw_bytes.decode("utf-8")))
         except Exception:
             os.makedirs(self.paper_dir, exist_ok=True)
             safe_tmp = os.path.join(self.paper_dir, f"_tmp_booster_{os.getpid()}_{int(time.time() * 1000)}.json")
             try:
                 clf.save_model(safe_tmp)
                 with open(safe_tmp, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    return self._sanitize_xgb_model_json(json.load(f))
             finally:
                 if os.path.exists(safe_tmp):
                     try:
@@ -1163,6 +1197,13 @@ class PaperStrategyTrainerAndTester:
         portfolio.pop(norm_sym.replace("/", ""), None)
         stats = coin_bundle.get("stats", {})
         best_mtf_mode = coin_bundle.get("mtf_alignment_mode") or coin_bundle.get("config", {}).get("mtf_alignment_mode", "STRICT")
+
+        models_copy = dict(coin_bundle.get("models", {}))
+        if isinstance(models_copy.get("long"), dict):
+            models_copy["long"] = self._sanitize_xgb_model_json(models_copy["long"])
+        if isinstance(models_copy.get("short"), dict):
+            models_copy["short"] = self._sanitize_xgb_model_json(models_copy["short"])
+
         portfolio[norm_sym] = {
             "market": coin_bundle.get("market", classify_market(norm_sym)),
             "strategy": coin_bundle.get("strategy", "XGBoost 1H/4H Momentum"),
@@ -1177,7 +1218,7 @@ class PaperStrategyTrainerAndTester:
             "trades": stats.get("trades", 0),
             "stats": stats,
             "config": coin_bundle["config"],
-            "models": coin_bundle["models"],
+            "models": models_copy,
         }
 
         self._save_live_master(live_master)
