@@ -8,6 +8,7 @@ import hmac
 import hashlib
 import urllib.parse
 import datetime
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import numpy as np
 import pandas as pd
@@ -120,7 +121,7 @@ class LiveAccountTradingBot:
         self._trend_4h_cache = {}
 
         self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=6, pool_maxsize=6)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
         self.session.mount("https://", adapter)
 
     def _load_state(self) -> dict:
@@ -140,6 +141,7 @@ class LiveAccountTradingBot:
             "daily_coin_trades": {},
             "daily_total_trades": 0,
             "tp1_partial_done": {},
+            "radar_signals": [],
             "last_bot_logs": [],
             "last_diagnostics": [],
             "last_order_rejections": [],
@@ -172,7 +174,7 @@ class LiveAccountTradingBot:
         if cap and cap.isdigit() and int(cap) > 0:
             self.rate_limit_cap = int(cap)
 
-    def _public_get(self, path: str, params: dict, timeout: float = 5.0) -> dict:
+    def _public_get(self, path: str, params: dict, timeout: float = 4.5) -> dict:
         for base in self.host_candidates:
             try:
                 resp = self.session.get(f"{base}{path}", params=params, timeout=timeout)
@@ -185,7 +187,7 @@ class LiveAccountTradingBot:
 
     def _bybit_request(self, method: str, path: str, params: dict = None, body: dict = None) -> dict:
         if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
-            time.sleep(1.0)
+            time.sleep(0.5)
 
         last_err = None
         for base in self.host_candidates:
@@ -202,7 +204,7 @@ class LiveAccountTradingBot:
                         "X-BAPI-TIMESTAMP": ts,
                         "X-BAPI-RECV-WINDOW": recv_window,
                     }
-                    resp = self.session.get(url, headers=headers, timeout=6)
+                    resp = self.session.get(url, headers=headers, timeout=5.5)
                     self._update_rate_limits(resp)
                     if resp.status_code == 200:
                         return resp.json()
@@ -216,7 +218,7 @@ class LiveAccountTradingBot:
                         "X-BAPI-RECV-WINDOW": recv_window,
                         "Content-Type": "application/json",
                     }
-                    resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=6)
+                    resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=5.5)
                     self._update_rate_limits(resp)
                     if resp.status_code == 200:
                         return resp.json()
@@ -300,7 +302,7 @@ class LiveAccountTradingBot:
         return True, ""
 
     def _record_recent_stop_losses_and_reflect(self, state: dict, now_ms: int, add_bot_log):
-        """Applies a 3-hour cooldown after stop-losses and updates Agentic AI reflection memory."""
+        """Applies a 3-hour cooldown after stop-losses, syncs closed trades to Reports, and updates Agentic memory."""
         loss_cd = state.setdefault("loss_cooldown_until_ms", {})
         reflected = state.setdefault("reflected_closed_ids", [])
         res = self._bybit_request("GET", "/v5/position/closed-pnl", {"category": self.category, "limit": 10})
@@ -316,9 +318,9 @@ class LiveAccountTradingBot:
 
             if sym and updated_ms > 0 and order_id not in reflected:
                 reflected.append(order_id)
+                side_label = "SHORT" if str(row.get("side", "")).lower() == "buy" else "LONG"
                 try:
                     import ai_regime_copilot
-                    side_label = "SHORT" if str(row.get("side", "")).lower() == "buy" else "LONG"
                     ref_res = ai_regime_copilot.record_post_trade_reflection(
                         self.live_dir,
                         sym,
@@ -331,13 +333,37 @@ class LiveAccountTradingBot:
                         add_bot_log(f"[AGENTIC REFLECTION] {ref_res['lesson']}")
                 except Exception:
                     pass
+
+                try:
+                    hist_file = os.path.join(self.live_dir, "live_reports_history.json")
+                    hist_data = {"trades": []}
+                    if os.path.exists(hist_file):
+                        with open(hist_file, "r", encoding="utf-8-sig") as hf:
+                            loaded = json.load(hf)
+                            if isinstance(loaded, dict):
+                                hist_data = loaded
+                    trades_list = hist_data.setdefault("trades", [])
+                    if not any(str(t.get("id")) == order_id for t in trades_list):
+                        disp = f"{sym[:-4]}/USDT" if sym.endswith("USDT") else sym
+                        trades_list.insert(0, {
+                            "id": order_id,
+                            "symbol": disp,
+                            "side": side_label,
+                            "net_pnl": round(pnl, 4),
+                            "closed_at_ms": updated_ms,
+                        })
+                        hist_data["trades"] = trades_list[:300]
+                        with open(hist_file, "w", encoding="utf-8") as wf:
+                            json.dump(hist_data, wf, indent=2)
+                except Exception:
+                    pass
         state["reflected_closed_ids"] = reflected[-40:]
 
     def fetch_bybit_candles(self, bybit_symbol: str, interval: str = "60", limit: int = 230) -> pd.DataFrame:
         data = self._public_get(
             "/v5/market/kline",
             {"category": self.category, "symbol": bybit_symbol, "interval": interval, "limit": limit},
-            timeout=5.0,
+            timeout=4.5,
         )
         rows = data.get("result", {}).get("list", [])
         if rows:
@@ -355,7 +381,7 @@ class LiveAccountTradingBot:
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
                     params={"interval": yf_interval, "range": yf_range},
                     headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=6,
+                    timeout=5.5,
                 )
                 res0 = y_resp.json().get("chart", {}).get("result", [])[0]
                 ts_list = res0.get("timestamp", [])
@@ -558,7 +584,7 @@ class LiveAccountTradingBot:
             raise ValueError(f"Invalid XGBoost booster format for {cache_key} (missing 'learner'). Retrain Paper model.")
         if cache_key in self._booster_cache:
             return self._booster_cache[cache_key]
-        if len(self._booster_cache) >= 24:
+        if len(self._booster_cache) >= 32:
             oldest_key = next(iter(self._booster_cache))
             self._booster_cache.pop(oldest_key, None)
 
@@ -763,22 +789,59 @@ class LiveAccountTradingBot:
         open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio)
         open_syms = {p["symbol"] for p in open_positions}
 
+        # Filter active items and fetch primary + 4H candles concurrently for fast ~200ms radar & scan cycles
+        active_items = []
+        fetch_tasks = {}
+        for symbol, entry in portfolio.items():
+            if not isinstance(entry, dict):
+                continue
+            market_type = entry.get("market", "FOREX" if is_forex_symbol(symbol) else "CRYPTO").upper()
+            if (market_type == "CRYPTO" and not crypto_enabled) or (market_type == "FOREX" and not forex_enabled):
+                continue
+            cfg = entry.get("config", {})
+            bybit_sym = (cfg.get("bybit_symbol") or symbol.replace("/", "")).upper()
+            tf_str = (cfg.get("timeframe") or entry.get("timeframe") or "1h").lower()
+            interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_str, "60")
+            active_items.append((symbol, entry, market_type, cfg, bybit_sym, interval))
+            fetch_tasks[(bybit_sym, interval)] = (bybit_sym, interval, 230)
+            if interval != "240":
+                cached = self._trend_4h_cache.get(bybit_sym)
+                if not cached or (time.time() - cached[0]) >= 600.0:
+                    fetch_tasks[(bybit_sym, "240")] = (bybit_sym, "240", 220)
+
+        fetched_candles = {}
+        if fetch_tasks:
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                futures = {
+                    k: pool.submit(self.fetch_bybit_candles, v[0], v[1], v[2])
+                    for k, v in fetch_tasks.items()
+                }
+                for k, fut in futures.items():
+                    try:
+                        fetched_candles[k] = fut.result()
+                    except Exception:
+                        fetched_candles[k] = pd.DataFrame()
+
+        # Populate 4H trend cache from parallel results
+        now_s = time.time()
+        for (sym_k, int_k), df_4h_raw in fetched_candles.items():
+            if int_k == "240" and len(df_4h_raw) >= 210:
+                df_4h = self.build_features(df_4h_raw)
+                if not df_4h.empty:
+                    ref_bar = df_4h.iloc[-2] if len(df_4h) >= 2 else df_4h.iloc[-1]
+                    self._trend_4h_cache[sym_k] = (
+                        now_s,
+                        int(ref_bar["Supertrend"]),
+                        float(ref_bar.get("ADX", 20.0)),
+                        float(ref_bar.get("NATR", 1.8)),
+                    )
+
         candidates = []
         top_wait_tuple = None
         coins_scanned_count = 0
 
-        for symbol, entry in portfolio.items():
-            if not isinstance(entry, dict):
-                continue
-
-            market_type = entry.get("market", "FOREX" if is_forex_symbol(symbol) else "CRYPTO").upper()
-            if (market_type == "CRYPTO" and not crypto_enabled) or (market_type == "FOREX" and not forex_enabled):
-                continue
-
+        for symbol, entry, market_type, cfg, bybit_sym, interval in active_items:
             coins_scanned_count += 1
-            cfg = entry.get("config", {})
-            bybit_sym = (cfg.get("bybit_symbol") or symbol.replace("/", "")).upper()
-
             models_map = entry.get("models", {})
             long_data = models_map.get("long") or models_map.get("long_model")
             short_data = models_map.get("short") or models_map.get("short_model")
@@ -788,13 +851,11 @@ class LiveAccountTradingBot:
                 order_rejections.append(err_msg)
                 continue
 
-            tf_str = (cfg.get("timeframe") or entry.get("timeframe") or "1h").lower()
-            interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_str, "60")
             strat_id = cfg.get("strategy_id") or entry.get("strategy_id") or "xgb_mtf_v2"
             is_relaxed = bool(cfg.get("relaxed_filter", False))
             custom_rules = cfg.get("custom_rules")
 
-            df_raw = self.fetch_bybit_candles(bybit_sym, interval=interval, limit=230)
+            df_raw = fetched_candles.get((bybit_sym, interval), pd.DataFrame())
             if len(df_raw) < 210:
                 diagnostics.append(f"{bybit_sym}: Insufficient candles ({len(df_raw)}/210)")
                 continue
@@ -826,7 +887,8 @@ class LiveAccountTradingBot:
             if interval == "240":
                 trend_4h = int(closed_bar["Supertrend"])
             else:
-                trend_4h, _, _ = self._get_cached_4h_metrics(bybit_sym)
+                cached_4h = self._trend_4h_cache.get(bybit_sym)
+                trend_4h = cached_4h[1] if cached_4h else 0
 
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.06) and (float(closed_bar["Vol_Surge"]) >= 1.20)
@@ -877,7 +939,6 @@ class LiveAccountTradingBot:
                 custom_rules=custom_rules,
             )
 
-            # Incorporate Agentic AI post-trade reflection score into symbol ranking
             learned_score = float(agentic_coin_scores.get(disp_sym, 0.0))
             effective_min_prob = max(req_thresh * 0.92, 0.18)
             quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 20.0 else 0.0) + (learned_score * 0.002)
@@ -1053,6 +1114,7 @@ class LiveAccountTradingBot:
             state["last_bot_logs"] = bot_logs[-60:]
 
         state["coins_scanned"] = coins_scanned_count
+        state["radar_signals"] = radar_signals
         state["last_diagnostics"] = diagnostics[-25:]
         state["last_order_rejections"] = order_rejections[-10:]
         state["last_trade_blocks"] = trade_blocks[-15:]
