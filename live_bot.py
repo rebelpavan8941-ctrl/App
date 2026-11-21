@@ -99,6 +99,7 @@ class LiveAccountTradingBot:
         self.live_dir = live_dir or os.path.join(os.path.dirname(models_dir), "bot_data", "LIVE_ACCOUNT")
         os.makedirs(self.live_dir, exist_ok=True)
         self.state_path = os.path.join(self.live_dir, "live_engine_state.json")
+        self.memory_path = os.path.join(self.live_dir, "ai_copilot_memory.json")
 
         p1 = os.path.join(models_dir, "LIVE", "UNIFIED_PORTFOLIO_MASTER.json")
         p2 = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
@@ -135,6 +136,7 @@ class LiveAccountTradingBot:
             "loss_cooldown_until_ms": {},
             "agentic_veto_until_ms": {},
             "restricted_symbols_until_ms": {},
+            "reflected_closed_ids": [],
             "daily_coin_trades": {},
             "daily_total_trades": 0,
             "tp1_partial_done": {},
@@ -148,6 +150,15 @@ class LiveAccountTradingBot:
     def _save_state(self, state: dict):
         with open(self.state_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+
+    def _load_agentic_coin_scores(self) -> dict:
+        if os.path.exists(self.memory_path):
+            try:
+                with open(self.memory_path, "r", encoding="utf-8-sig") as f:
+                    return json.load(f).get("coin_scores", {}) or {}
+            except Exception:
+                pass
+        return {}
 
     def _sign(self, ts: str, recv_window: str, payload: str) -> str:
         raw = f"{ts}{self.api_key}{recv_window}{payload}"
@@ -264,7 +275,6 @@ class LiveAccountTradingBot:
         ret_1h = float(closed_bar.get("Ret_1h", 0.0))
         di_spread = float(closed_bar.get("DI_Spread", 0.0))
 
-        # Check intrabar drift since the closed candle's close
         closed_px = float(closed_bar.get("Close", 0.0))
         live_px = float(live_bar.get("Close", closed_px))
         intrabar_move = ((live_px - closed_px) / closed_px) if closed_px > 0 else 0.0
@@ -289,18 +299,39 @@ class LiveAccountTradingBot:
                 return False, f"Bearish DI momentum ({di_spread:.1f})"
         return True, ""
 
-    def _record_recent_stop_losses(self, state: dict, now_ms: int):
-        """Applies a 3-hour symbol cooldown after any stop-loss exit to prevent revenge re-entries."""
+    def _record_recent_stop_losses_and_reflect(self, state: dict, now_ms: int, add_bot_log):
+        """Applies a 3-hour cooldown after stop-losses and updates Agentic AI reflection memory."""
         loss_cd = state.setdefault("loss_cooldown_until_ms", {})
+        reflected = state.setdefault("reflected_closed_ids", [])
         res = self._bybit_request("GET", "/v5/position/closed-pnl", {"category": self.category, "limit": 10})
         for row in res.get("result", {}).get("list", []):
             sym = str(row.get("symbol", "")).upper()
             pnl = float(row.get("closedPnl", 0.0))
             updated_ms = int(row.get("updatedTime", 0))
+            order_id = str(row.get("orderId", f"{sym}_{updated_ms}"))
             if sym and pnl < 0.0 and updated_ms > 0 and (now_ms - updated_ms) < 3 * 60 * 60 * 1000:
                 target_cd = updated_ms + (3 * 60 * 60 * 1000)
                 if target_cd > int(loss_cd.get(sym, 0)):
                     loss_cd[sym] = target_cd
+
+            if sym and updated_ms > 0 and order_id not in reflected:
+                reflected.append(order_id)
+                try:
+                    import ai_regime_copilot
+                    side_label = "SHORT" if str(row.get("side", "")).lower() == "buy" else "LONG"
+                    ref_res = ai_regime_copilot.record_post_trade_reflection(
+                        self.live_dir,
+                        sym,
+                        side_label,
+                        pnl,
+                        float(row.get("avgEntryPrice", 0.0)),
+                        float(row.get("avgExitPrice", 0.0)),
+                    )
+                    if ref_res.get("lesson"):
+                        add_bot_log(f"[AGENTIC REFLECTION] {ref_res['lesson']}")
+                except Exception:
+                    pass
+        state["reflected_closed_ids"] = reflected[-40:]
 
     def fetch_bybit_candles(self, bybit_symbol: str, interval: str = "60", limit: int = 230) -> pd.DataFrame:
         data = self._public_get(
@@ -442,7 +473,6 @@ class LiveAccountTradingBot:
         if len(raw_4h) >= 210:
             df_4h = self.build_features(raw_4h)
             if not df_4h.empty:
-                # Use last closed 4H bar (-2) if available so 4H Supertrend never repaints intrabar
                 ref_bar = df_4h.iloc[-2] if len(df_4h) >= 2 else df_4h.iloc[-1]
                 st = int(ref_bar["Supertrend"])
                 adx = float(ref_bar.get("ADX", 20.0))
@@ -480,7 +510,6 @@ class LiveAccountTradingBot:
         relaxed: bool = False,
         custom_rules: dict = None,
     ) -> bool:
-        """Exact mirror of paper_bot.py: evaluates indicators on the last CLOSED candle (iloc[-2])."""
         if isinstance(custom_rules, dict):
             rule_key = "long_rules" if side == "LONG" else "short_rules"
             if custom_rules.get(rule_key):
@@ -572,7 +601,7 @@ class LiveAccountTradingBot:
                 profit_dist = (mark - entry) if side == "LONG" else (entry - mark)
                 filters = self._get_instrument_filters(bybit_sym)
 
-                # Stage 1: Move SL to Break-Even (+0.12 * tp_dist) once 45% of TP distance is reached
+                # Stage 1: Move SL to Break-Even (+0.12 * tp_dist) on MarkPrice once 45% of TP is reached
                 if filters and tp_dist > 0.0 and profit_dist >= tp_dist * 0.45:
                     qty_step, min_qty, min_notional, tick_size = filters
                     be_sl = (entry + tp_dist * 0.12) if side == "LONG" else (entry - tp_dist * 0.12)
@@ -584,11 +613,12 @@ class LiveAccountTradingBot:
                             "category": self.category,
                             "symbol": bybit_sym,
                             "stopLoss": self._format_step(be_sl, tick_size),
+                            "slTriggerBy": "MarkPrice",
                             "positionIdx": 0,
                         })
                         cur_sl = be_sl
 
-                # Stage 2: At 70% of TP distance, lock +0.45 * tp_dist and take 50% partial if qty allows
+                # Stage 2: At 70% of TP distance, lock +0.45 * tp_dist on MarkPrice & partial close if allowed
                 if filters and tp_dist > 0.0 and profit_dist >= tp_dist * 0.70:
                     qty_step, min_qty, min_notional, tick_size = filters
                     pos_key = f"{bybit_sym}_{entry:.6f}"
@@ -621,6 +651,7 @@ class LiveAccountTradingBot:
                             "category": self.category,
                             "symbol": bybit_sym,
                             "stopLoss": self._format_step(cand_sl, tick_size),
+                            "slTriggerBy": "MarkPrice",
                             "positionIdx": 0,
                         })
 
@@ -688,6 +719,7 @@ class LiveAccountTradingBot:
         restricted_until_ms = state.setdefault("restricted_symbols_until_ms", {})
         daily_coin_trades = state.setdefault("daily_coin_trades", {})
         bot_logs = state.setdefault("last_bot_logs", [])
+        agentic_coin_scores = self._load_agentic_coin_scores()
         diagnostics = []
         order_rejections = []
         trade_blocks = []
@@ -709,7 +741,7 @@ class LiveAccountTradingBot:
         daily_total_trades = int(state.get("daily_total_trades", 0))
         now_ms = int(time.time() * 1000)
 
-        self._record_recent_stop_losses(state, now_ms)
+        self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log)
 
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         bal_ret_code = int(bal_res.get("retCode", -1)) if bal_res else -1
@@ -771,8 +803,6 @@ class LiveAccountTradingBot:
             if len(df) < 3:
                 continue
 
-            # CRITICAL ALIGNMENT WITH paper_bot.py:
-            # Predict on the LAST CLOSED CANDLE (iloc[-2]), never on the unfinished live candle (iloc[-1])!
             closed_bar = df.iloc[-2]
             live_bar = df.iloc[-1]
             latest_bar_ms = int(df.index[-1].timestamp() * 1000)
@@ -847,9 +877,10 @@ class LiveAccountTradingBot:
                 custom_rules=custom_rules,
             )
 
-            # Use the exact trained threshold from paper_bot.py (with a safe 0.18 floor)
+            # Incorporate Agentic AI post-trade reflection score into symbol ranking
+            learned_score = float(agentic_coin_scores.get(disp_sym, 0.0))
             effective_min_prob = max(req_thresh * 0.92, 0.18)
-            quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 20.0 else 0.0)
+            quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 20.0 else 0.0) + (learned_score * 0.002)
 
             if mtf_aligned and strat_ok and anti_chase_ok and raw_prob >= effective_min_prob:
                 candidates.append({
@@ -887,7 +918,6 @@ class LiveAccountTradingBot:
         candidates.sort(key=lambda x: x["edge"], reverse=True)
 
         live_trades_this_cycle = 0
-        # 1 Good Trade Per Day discipline: cap at 1 active trade when hunting the daily win
         daily_target_cap = 1
 
         for cand in candidates:
@@ -941,7 +971,6 @@ class LiveAccountTradingBot:
             price = float(live_bar["Close"])
             atr = float(closed_bar["ATR"])
 
-            # Use achievable TP1 target (1.55R - 1.90R) instead of unreachable TP2 moonshot (3.3R)!
             sl_atr = max(float(cfg.get("sl_atr", 1.35)) * sl_mult, 1.30)
             tp_rr = min(max(float(cfg.get("tp1_rr", 1.75)) * tp_mult, 1.55), 2.05)
 
@@ -984,6 +1013,7 @@ class LiveAccountTradingBot:
                 "timeInForce": "IOC",
                 "stopLoss": sl_str,
                 "takeProfit": tp_str,
+                "slTriggerBy": "MarkPrice",
                 "positionIdx": 0,
             })
             if res.get("retCode") == 0:
@@ -997,7 +1027,7 @@ class LiveAccountTradingBot:
                 avail_usdt = max(0.0, avail_usdt - (notional / leverage))
                 add_bot_log(
                     f"ORDER EXECUTED SUCCESS (A+ Closed-Candle): {bybit_sym} {cand['direction']} "
-                    f"qty={qty_str} @ ~{price:.4f} | SL={sl_str} | TP={tp_str} ({tp_rr:.2f}R, prob={cand['raw_prob']:.2f})"
+                    f"qty={qty_str} @ ~{price:.4f} | SL={sl_str} (MarkPrice) | TP={tp_str} ({tp_rr:.2f}R, prob={cand['raw_prob']:.2f})"
                 )
             else:
                 code = int(res.get("retCode", -1))
