@@ -706,11 +706,12 @@ class LiveAccountTradingBot:
             latest_bar_ms = int(df.index[-1].timestamp() * 1000)
 
             try:
-                dmat = xgb.DMatrix(df.iloc[[-1]][features].to_numpy(dtype="float32"))
+                x_row = df.iloc[[-1]][features].to_numpy(dtype="float32")
+                dmat = xgb.DMatrix(x_row, feature_names=features)
                 p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
                 p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
             except Exception as e:
-                err_msg = f"{bybit_sym}: Booster error (re-train/re-promote model) - {e}"
+                err_msg = f"{bybit_sym}: Booster error - {e}"
                 diagnostics.append(err_msg)
                 order_rejections.append(err_msg)
                 continue
