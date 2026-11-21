@@ -42,6 +42,7 @@ BYBIT_ERROR_HINTS = {
     110016: "Order quantity exceeds max risk limit tier",
     110043: "Leverage unchanged or position margin mode conflict",
     110044: "Available margin is insufficient",
+    110126: "Contract agreement not signed on Bybit (sign in Bybit app or remove stock-perp coin)",
     110132: "Contract not available in your region",
 }
 
@@ -131,6 +132,7 @@ class LiveAccountTradingBot:
         return {
             "traded_candle_ts": {},
             "last_trade_epoch_ms": {},
+            "restricted_symbols_until_ms": {},
             "daily_coin_trades": {},
             "daily_total_trades": 0,
             "tp1_partial_done": {},
@@ -615,6 +617,7 @@ class LiveAccountTradingBot:
         state = self._load_state()
         traded_candle_ts = state.setdefault("traded_candle_ts", {})
         last_trade_epoch_ms = state.setdefault("last_trade_epoch_ms", {})
+        restricted_until_ms = state.setdefault("restricted_symbols_until_ms", {})
         daily_coin_trades = state.setdefault("daily_coin_trades", {})
         bot_logs = state.setdefault("last_bot_logs", [])
         diagnostics = []
@@ -749,6 +752,10 @@ class LiveAccountTradingBot:
                 "raw_prob": round(raw_prob, 4),
             })
 
+            if now_ms < int(restricted_until_ms.get(bybit_sym, 0)):
+                trade_blocks.append(f"{bybit_sym}: Contract agreement unsigned on Bybit [110126] (skipped)")
+                continue
+
             if bybit_sym in open_syms:
                 trade_blocks.append(f"{bybit_sym}: Already has an open position")
                 continue
@@ -767,6 +774,7 @@ class LiveAccountTradingBot:
             if mtf_aligned and strat_ok and raw_prob >= effective_min_prob:
                 candidates.append({
                     "edge": quality_edge,
+                    "conv_pct": conv_pct,
                     "raw_prob": raw_prob,
                     "req_thresh": effective_min_prob,
                     "bybit_sym": bybit_sym,
@@ -781,12 +789,13 @@ class LiveAccountTradingBot:
                     need_daily_first_trade
                     and not guard_blocked
                     and (raw_4h_ok or effective_mtf == "OFF")
-                    and raw_prob >= 0.12
+                    and (raw_prob >= 0.08 or conv_pct >= 75)
                 ):
                     daily_hunter_backups.append({
-                        "edge": quality_edge,
+                        "edge": (conv_pct / 100.0) + raw_prob,
+                        "conv_pct": conv_pct,
                         "raw_prob": raw_prob,
-                        "req_thresh": 0.12,
+                        "req_thresh": 0.08,
                         "bybit_sym": bybit_sym,
                         "market_type": market_type,
                         "direction": direction,
@@ -815,7 +824,7 @@ class LiveAccountTradingBot:
         if not candidates and need_daily_first_trade and daily_hunter_backups:
             daily_hunter_backups.sort(key=lambda x: x["edge"], reverse=True)
             candidates = list(daily_hunter_backups)
-            add_bot_log(f"Daily Hunter queued {len(candidates)} 4H-aligned setups (top: {candidates[0]['bybit_sym']} {candidates[0]['direction']}, prob={candidates[0]['raw_prob']:.2f})")
+            add_bot_log(f"Daily Hunter queued {len(candidates)} 4H-aligned setups (top: {candidates[0]['bybit_sym']} {candidates[0]['direction']} {candidates[0]['conv_pct']}%)")
 
         live_trades_this_cycle = 0
 
@@ -923,7 +932,9 @@ class LiveAccountTradingBot:
                 code = int(res.get("retCode", -1))
                 raw_msg = str(res.get("retMsg", "Unknown Bybit rejection"))
                 hint = BYBIT_ERROR_HINTS.get(code, raw_msg)
-                rej_msg = f"{bybit_sym} {cand['direction']} (qty {qty_str}) rejected by Bybit [{code}]: {hint} ({raw_msg})"
+                if code == 110126:
+                    restricted_until_ms[bybit_sym] = now_ms + (24 * 60 * 60 * 1000)
+                rej_msg = f"{bybit_sym} {cand['direction']} (qty {qty_str}) rejected by Bybit [{code}]: {hint}"
                 diagnostics.append(rej_msg)
                 order_rejections.append(rej_msg)
                 add_bot_log(f"ORDER REJECTED: {rej_msg}")
