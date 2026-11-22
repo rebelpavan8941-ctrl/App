@@ -14,6 +14,8 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
 TIMEFRAME_TO_BYBIT_INTERVAL = {
     "15m": "15",
     "30m": "30",
@@ -107,10 +109,11 @@ class LiveAccountTradingBot:
         self.master_path = p1 if os.path.exists(p1) else p2
 
         self.is_demo = str(endpoint).lower() in ("testnet", "demo")
+        # Prioritize api.bytick.com (with retry) so Indian ISP DNS blocks on api.bybit.com never crash a cycle
         self.host_candidates = (
-            ["https://api-demo.bybit.com", "https://api.bytick.com", "https://api.bybit.com"]
+            ["https://api-demo.bybit.com", "https://api.bytick.com"]
             if self.is_demo
-            else ["https://api.bytick.com", "https://api.bybit.com"]
+            else ["https://api.bytick.com", "https://api.bytick.com"]
         )
         self.base_url = self.host_candidates[0]
         self.category = "linear"
@@ -305,7 +308,10 @@ class LiveAccountTradingBot:
         """Applies a 3-hour cooldown after stop-losses, syncs closed trades to Reports, and updates Agentic memory."""
         loss_cd = state.setdefault("loss_cooldown_until_ms", {})
         reflected = state.setdefault("reflected_closed_ids", [])
-        res = self._bybit_request("GET", "/v5/position/closed-pnl", {"category": self.category, "limit": 10})
+        try:
+            res = self._bybit_request("GET", "/v5/position/closed-pnl", {"category": self.category, "limit": 10})
+        except Exception:
+            return
         for row in res.get("result", {}).get("list", []):
             sym = str(row.get("symbol", "")).upper()
             pnl = float(row.get("closedPnl", 0.0))
@@ -751,20 +757,23 @@ class LiveAccountTradingBot:
         trade_blocks = []
         radar_signals = []
 
-        now_dt = datetime.datetime.now(datetime.timezone.utc)
-        today_str = now_dt.strftime("%Y-%m-%d")
-        clock_str = now_dt.strftime("%H:%M:%S UTC")
+        # Auto-renew daily target every day at 12:00 AM IST (UTC+05:30)
+        now_ist = datetime.datetime.now(IST_TZ)
+        today_ist_str = now_ist.strftime("%Y-%m-%d")
+        clock_str = now_ist.strftime("%H:%M:%S IST")
 
         def add_bot_log(msg: str):
             if bot_logs_enabled:
                 bot_logs.append(f"[{clock_str}] {msg}")
 
-        if daily_coin_trades.get("_date") != today_str:
+        if daily_coin_trades.get("_date_ist") != today_ist_str:
             daily_coin_trades.clear()
-            daily_coin_trades["_date"] = today_str
+            daily_coin_trades["_date_ist"] = today_ist_str
             state["daily_total_trades"] = 0
+            add_bot_log(f"Daily Target Auto-Renewed for {today_ist_str} (12:00 AM IST) — Quota 0/1 reset.")
 
         daily_total_trades = int(state.get("daily_total_trades", 0))
+        elite_a_plus_only = (daily_total_trades >= 1)
         now_ms = int(time.time() * 1000)
 
         self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log)
@@ -789,7 +798,6 @@ class LiveAccountTradingBot:
         open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio)
         open_syms = {p["symbol"] for p in open_positions}
 
-        # Filter active items and fetch primary + 4H candles concurrently for fast ~200ms radar & scan cycles
         active_items = []
         fetch_tasks = {}
         for symbol, entry in portfolio.items():
@@ -822,7 +830,6 @@ class LiveAccountTradingBot:
                     except Exception:
                         fetched_candles[k] = pd.DataFrame()
 
-        # Populate 4H trend cache from parallel results
         now_s = time.time()
         for (sym_k, int_k), df_4h_raw in fetched_candles.items():
             if int_k == "240" and len(df_4h_raw) >= 210:
@@ -940,13 +947,24 @@ class LiveAccountTradingBot:
             )
 
             learned_score = float(agentic_coin_scores.get(disp_sym, 0.0))
-            effective_min_prob = max(req_thresh * 0.92, 0.18)
+            base_min_prob = max(req_thresh * 0.92, 0.18)
+
+            # After 1st trade of the day, require Grade A or A+ setup only!
+            if elite_a_plus_only:
+                effective_min_prob = base_min_prob + 0.04
+                grade_ok = (conv_pct >= 84) and raw_4h_ok and (adx_val >= 20.0) and (learned_score >= -4.0)
+            else:
+                effective_min_prob = base_min_prob
+                grade_ok = True
+
             quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 20.0 else 0.0) + (learned_score * 0.002)
 
-            if mtf_aligned and strat_ok and anti_chase_ok and raw_prob >= effective_min_prob:
+            if mtf_aligned and strat_ok and anti_chase_ok and grade_ok and raw_prob >= effective_min_prob:
+                grade_tag = "A+" if (conv_pct >= 90 and raw_4h_ok and adx_val >= 23.0) else "A"
                 candidates.append({
                     "edge": quality_edge,
                     "conv_pct": conv_pct,
+                    "grade": grade_tag,
                     "raw_prob": raw_prob,
                     "req_thresh": effective_min_prob,
                     "bybit_sym": bybit_sym,
@@ -967,6 +985,8 @@ class LiveAccountTradingBot:
                     reasons.append(chase_reason)
                 if not strat_ok:
                     reasons.append(f"Waiting for {strat_id}")
+                if elite_a_plus_only and not grade_ok:
+                    reasons.append(f"Below A/A+ bar (Conv {conv_pct}%<84% or ADX {adx_val:.1f}<20 or 4H unaligned)")
                 if raw_prob < effective_min_prob:
                     reasons.append(f"Prob {raw_prob:.2f} < {effective_min_prob:.2f}")
                 block_msg = f"{bybit_sym} {direction} ({conv_pct}%): {', '.join(reasons)} [ADX:{adx_val:.1f}]"
@@ -979,7 +999,6 @@ class LiveAccountTradingBot:
         candidates.sort(key=lambda x: x["edge"], reverse=True)
 
         live_trades_this_cycle = 0
-        daily_target_cap = 1
 
         for cand in candidates:
             bybit_sym = cand["bybit_sym"]
@@ -988,11 +1007,6 @@ class LiveAccountTradingBot:
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
                 add_bot_log(msg)
-                break
-            if daily_total_trades >= daily_target_cap:
-                msg = f"{bybit_sym} {cand['direction']} skipped: Daily 1-trade quota already completed ({daily_total_trades}/{daily_target_cap})"
-                diagnostics.append(msg)
-                trade_blocks.append(msg)
                 break
             if daily_drawdown_pct >= max_daily_loss_pct and max_daily_loss_pct > 0.0:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
@@ -1084,10 +1098,11 @@ class LiveAccountTradingBot:
                 daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
                 daily_total_trades += 1
                 state["daily_total_trades"] = daily_total_trades
+                elite_a_plus_only = True
                 live_trades_this_cycle += 1
                 avail_usdt = max(0.0, avail_usdt - (notional / leverage))
                 add_bot_log(
-                    f"ORDER EXECUTED SUCCESS (A+ Closed-Candle): {bybit_sym} {cand['direction']} "
+                    f"ORDER EXECUTED SUCCESS (Grade {cand['grade']} Closed-Candle): {bybit_sym} {cand['direction']} "
                     f"qty={qty_str} @ ~{price:.4f} | SL={sl_str} (MarkPrice) | TP={tp_str} ({tp_rr:.2f}R, prob={cand['raw_prob']:.2f})"
                 )
             else:
@@ -1102,11 +1117,11 @@ class LiveAccountTradingBot:
                 add_bot_log(f"ORDER REJECTED: {rej_msg}")
 
         if live_trades_this_cycle == 0:
-            if daily_total_trades >= daily_target_cap:
-                add_bot_log(f"Daily Target Active ({daily_total_trades}/{daily_target_cap} trade done today) — protecting capital.")
+            summary_detail = top_wait_tuple[1] if top_wait_tuple else (diagnostics[0] if diagnostics else "All pairs scanned")
+            if daily_total_trades >= 1:
+                add_bot_log(f"Daily 1st Trade Done ({daily_total_trades} today) — Hunting A/A+ setups only | Top: {summary_detail}")
             else:
-                summary_detail = top_wait_tuple[1] if top_wait_tuple else (diagnostics[0] if diagnostics else "All pairs scanned")
-                add_bot_log(f"Scanning {coins_scanned_count} coins for 1 A+ setup (Avail ${avail_usdt:.2f}) | Top: {summary_detail}")
+                add_bot_log(f"Scanning {coins_scanned_count} coins for 1st setup (Avail ${avail_usdt:.2f}) | Top: {summary_detail}")
 
         if not bot_logs_enabled:
             state["last_bot_logs"] = []
