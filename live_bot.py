@@ -1091,6 +1091,9 @@ class LiveAccountTradingBot:
                     "closed_bar": closed_bar.copy(),
                     "live_bar": live_bar.copy(),
                     "latest_bar_ms": latest_bar_ms,
+                    "candles_df": df.iloc[:-1].tail(72).copy(),
+                    "adx_val": adx_val,
+                    "fr_val": fr_val,
                 })
             else:
                 reasons = []
@@ -1191,6 +1194,44 @@ class LiveAccountTradingBot:
             tp_raw = (price + risk_dist * tp_rr) if is_long else (price - risk_dist * tp_rr)
             sl_str = self._format_step(sl_raw, tick_size)
             tp_str = self._format_step(tp_raw, tick_size)
+
+            # Layer 1 Local Human Price-Action Brain + Optional Gemini Shadow-Compare
+            try:
+                import ai_regime_copilot
+                shadow_cfg_path = os.path.join(self.live_dir, "ai_shadow_config.json")
+                gem_shadow_on = False
+                gem_shadow_key = ""
+                if os.path.exists(shadow_cfg_path):
+                    with open(shadow_cfg_path, "r", encoding="utf-8-sig") as scf:
+                        sc_data = json.load(scf)
+                        gem_shadow_on = bool(sc_data.get("gemini_shadow_enabled", False))
+                        gem_shadow_key = str(sc_data.get("gemini_api_key", "")).strip()
+
+                pa_res = ai_regime_copilot.evaluate_pre_trade_human_brain(
+                    live_dir=self.live_dir,
+                    symbol=bybit_sym,
+                    side=cand["direction"],
+                    candles_df=cand.get("candles_df"),
+                    adx_val=float(cand.get("adx_val", 20.0)),
+                    funding_rate=float(cand.get("fr_val", 0.0)),
+                    session_name=curr_session,
+                    gemini_enabled=gem_shadow_on,
+                    gemini_api_key=gem_shadow_key,
+                )
+                if pa_res.get("shadow_log"):
+                    add_bot_log(pa_res["shadow_log"])
+
+                if pa_res.get("decision") == "REJECT":
+                    l1_why = "; ".join(pa_res.get("reasons", [])[:2])
+                    msg = f"{bybit_sym} {cand['direction']} blocked by Layer 1 Human Brain ({pa_res.get('score', 0)}/100): {l1_why}"
+                    diagnostics.append(msg)
+                    trade_blocks.append(msg)
+                    add_bot_log(msg)
+                    continue
+                else:
+                    add_bot_log(f"[LAYER 1 APPROVED] {bybit_sym} {cand['direction']} ({pa_res.get('score', 75)}/100): {'; '.join(pa_res.get('reasons', [])[:1])}")
+            except Exception:
+                pass
 
             self._bybit_request("POST", "/v5/position/set-leverage", body={
                 "category": self.category,
