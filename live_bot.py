@@ -1,4 +1,4 @@
-﻿import os
+import os
 import gc
 import sys
 import json
@@ -130,9 +130,10 @@ class LiveAccountTradingBot:
         self._booster_cache = {}
         self._instrument_cache = {}
         self._trend_4h_cache = {}
+        self._funding_cache = (0.0, {})
 
         self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
         self.session.mount("https://", adapter)
 
     def _load_state(self) -> dict:
@@ -190,7 +191,7 @@ class LiveAccountTradingBot:
         if cap and cap.isdigit() and int(cap) > 0:
             self.rate_limit_cap = int(cap)
 
-    def _public_get(self, path: str, params: dict, timeout: float = 4.5) -> dict:
+    def _public_get(self, path: str, params: dict, timeout: float = 4.0) -> dict:
         for base in self.host_candidates:
             try:
                 resp = self.session.get(f"{base}{path}", params=params, timeout=timeout)
@@ -202,10 +203,14 @@ class LiveAccountTradingBot:
         return {}
 
     def _fetch_all_funding_rates(self) -> dict:
-        """Single lightweight call to pull live funding rates for all linear contracts."""
+        """Cached 60s lightweight call to pull live funding rates for all linear contracts."""
+        now_s = time.time()
+        cached_ts, cached_map = self._funding_cache
+        if cached_map and (now_s - cached_ts) < 60.0:
+            return cached_map
         rates = {}
         try:
-            data = self._public_get("/v5/market/tickers", {"category": self.category}, timeout=4.0)
+            data = self._public_get("/v5/market/tickers", {"category": self.category}, timeout=3.5)
             for row in data.get("result", {}).get("list", []):
                 sym = str(row.get("symbol", "")).upper()
                 fr_raw = row.get("fundingRate", "")
@@ -214,13 +219,15 @@ class LiveAccountTradingBot:
                         rates[sym] = float(fr_raw)
                     except Exception:
                         pass
+            if rates:
+                self._funding_cache = (now_s, rates)
         except Exception:
             pass
-        return rates
+        return rates or cached_map
 
     def _bybit_request(self, method: str, path: str, params: dict = None, body: dict = None) -> dict:
         if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
-            time.sleep(0.5)
+            time.sleep(0.4)
 
         last_err = None
         for base in self.host_candidates:
@@ -237,7 +244,7 @@ class LiveAccountTradingBot:
                         "X-BAPI-TIMESTAMP": ts,
                         "X-BAPI-RECV-WINDOW": recv_window,
                     }
-                    resp = self.session.get(url, headers=headers, timeout=5.5)
+                    resp = self.session.get(url, headers=headers, timeout=5.0)
                     self._update_rate_limits(resp)
                     if resp.status_code == 200:
                         return resp.json()
@@ -251,7 +258,7 @@ class LiveAccountTradingBot:
                         "X-BAPI-RECV-WINDOW": recv_window,
                         "Content-Type": "application/json",
                     }
-                    resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=5.5)
+                    resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=5.0)
                     self._update_rate_limits(resp)
                     if resp.status_code == 200:
                         return resp.json()
@@ -304,7 +311,7 @@ class LiveAccountTradingBot:
 
     @staticmethod
     def _passes_anti_chase_guard(closed_bar: pd.Series, live_bar: pd.Series, side: str) -> tuple:
-        """Checks both the last closed candle and current live candle to prevent chasing exhausted moves."""
+        """Prevents chasing parabolic blow-offs while allowing healthy breakouts and normal 1H pullbacks."""
         rsi = float(closed_bar.get("RSI_14", 50.0))
         dist_ema20 = float(closed_bar.get("Dist_EMA20", 0.0))
         ret_1h = float(closed_bar.get("Ret_1h", 0.0))
@@ -315,23 +322,23 @@ class LiveAccountTradingBot:
         intrabar_move = ((live_px - closed_px) / closed_px) if closed_px > 0 else 0.0
 
         if side == "SHORT":
-            if dist_ema20 < -1.55:
+            if dist_ema20 < -2.35:
                 return False, f"Stretched below EMA20 ({dist_ema20:.2f} ATR)"
-            if rsi < 38.0:
-                return False, f"RSI oversold ({rsi:.1f} < 38)"
-            if ret_1h > 0.005 or intrabar_move > 0.0045:
-                return False, f"Active bounce (+{max(ret_1h, intrabar_move) * 100:.2f}%)"
-            if di_spread > 6.0:
-                return False, f"Bullish DI momentum (+{di_spread:.1f})"
+            if rsi < 27.0:
+                return False, f"RSI deeply oversold ({rsi:.1f} < 27)"
+            if ret_1h > 0.014 or intrabar_move > 0.011:
+                return False, f"Sharp bounce (+{max(ret_1h, intrabar_move) * 100:.2f}%)"
+            if di_spread > 12.0:
+                return False, f"Strong bullish DI (+{di_spread:.1f})"
         else:
-            if dist_ema20 > 1.55:
+            if dist_ema20 > 2.35:
                 return False, f"Stretched above EMA20 (+{dist_ema20:.2f} ATR)"
-            if rsi > 62.0:
-                return False, f"RSI overbought ({rsi:.1f} > 62)"
-            if ret_1h < -0.005 or intrabar_move < -0.0045:
-                return False, f"Active pullback ({min(ret_1h, intrabar_move) * 100:.2f}%)"
-            if di_spread < -6.0:
-                return False, f"Bearish DI momentum ({di_spread:.1f})"
+            if rsi > 73.0:
+                return False, f"RSI deeply overbought ({rsi:.1f} > 73)"
+            if ret_1h < -0.014 or intrabar_move < -0.011:
+                return False, f"Sharp dump ({min(ret_1h, intrabar_move) * 100:.2f}%)"
+            if di_spread < -12.0:
+                return False, f"Strong bearish DI ({di_spread:.1f})"
         return True, ""
 
     def _record_recent_stop_losses_and_reflect(self, state: dict, now_ms: int, add_bot_log):
@@ -399,7 +406,7 @@ class LiveAccountTradingBot:
         data = self._public_get(
             "/v5/market/kline",
             {"category": self.category, "symbol": bybit_symbol, "interval": interval, "limit": limit},
-            timeout=4.5,
+            timeout=4.0,
         )
         rows = data.get("result", {}).get("list", [])
         if rows:
@@ -417,7 +424,7 @@ class LiveAccountTradingBot:
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
                     params={"interval": yf_interval, "range": yf_range},
                     headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=5.5,
+                    timeout=5.0,
                 )
                 res0 = y_resp.json().get("chart", {}).get("result", [])[0]
                 ts_list = res0.get("timestamp", [])
@@ -582,9 +589,22 @@ class LiveAccountTradingBot:
             return bool((closed_bar["Dist_EMA50"] > -1.5) if side == "LONG" else (closed_bar["Dist_EMA50"] < 1.5))
 
         if "donchian" in sid:
-            return (curr_open > closed_bar["Donchian_High"] and closed_bar["Supertrend"] == 1) if side == "LONG" else (
-                curr_open < closed_bar["Donchian_Low"] and closed_bar["Supertrend"] == -1
-            )
+            if side == "LONG":
+                return bool(
+                    closed_bar["Supertrend"] == 1
+                    and (
+                        curr_open >= closed_bar["Donchian_High"] * 0.996
+                        or (closed_bar["Close"] > closed_bar["EMA_20"] and closed_bar["DI_Spread"] > 0)
+                    )
+                )
+            else:
+                return bool(
+                    closed_bar["Supertrend"] == -1
+                    and (
+                        curr_open <= closed_bar["Donchian_Low"] * 1.004
+                        or (closed_bar["Close"] < closed_bar["EMA_20"] and closed_bar["DI_Spread"] < 0)
+                    )
+                )
         if "vol_surge" in sid or "ob_imbalance" in sid or "supertrend_adx" in sid:
             return bool(closed_bar["Vol_Surge"] >= 1.25 and closed_bar["ADX"] >= 20 and (
                 (closed_bar["DI_Spread"] > 0) if side == "LONG" else (closed_bar["DI_Spread"] < 0)
@@ -716,7 +736,6 @@ class LiveAccountTradingBot:
                                 add_bot_log(f"TIME-STOP EXIT ({age_hours:.1f}h stagnant): Closed {bybit_sym} {side} near breakeven/profit to free capital.")
                             continue
                     else:
-                        # Tighten SL to cap downside on stagnant losing trade
                         tight_sl = (entry - tp_dist * 0.22) if side == "LONG" else (entry + tp_dist * 0.22)
                         valid_vs_mark = (tight_sl < mark * 0.9985) if side == "LONG" else (tight_sl > mark * 1.0015)
                         better_than_cur = (cur_sl == 0.0 or tight_sl > cur_sl * 1.0005) if side == "LONG" else (cur_sl == 0.0 or tight_sl < cur_sl * 0.9995)
@@ -932,7 +951,7 @@ class LiveAccountTradingBot:
 
         fetched_candles = {}
         if fetch_tasks:
-            with ThreadPoolExecutor(max_workers=6) as pool:
+            with ThreadPoolExecutor(max_workers=8) as pool:
                 futures = {
                     k: pool.submit(self.fetch_bybit_candles, v[0], v[1], v[2])
                     for k, v in fetch_tasks.items()
@@ -1010,9 +1029,19 @@ class LiveAccountTradingBot:
                 cached_4h = self._trend_4h_cache.get(bybit_sym)
                 trend_4h = cached_4h[1] if cached_4h else 0
 
+            adx_val = float(closed_bar.get("ADX", 0.0))
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.06) and (float(closed_bar["Vol_Surge"]) >= 1.20)
-            guard_blocked = btc_macro_bearish and direction == "LONG" and market_type == "CRYPTO" and not bybit_sym.startswith("BTC")
+
+            # Allow decoupled high-strength leaders past BTC 4H Guard
+            decoupled_leader = raw_4h_ok and (adx_val >= 25.0) and (raw_prob >= req_thresh + 0.06)
+            guard_blocked = (
+                btc_macro_bearish
+                and direction == "LONG"
+                and market_type == "CRYPTO"
+                and not bybit_sym.startswith("BTC")
+                and not decoupled_leader
+            )
 
             # Funding Rate Crowding Filter
             fr_val = float(funding_rates.get(bybit_sym, 0.0)) if market_type == "CRYPTO" else 0.0
@@ -1026,7 +1055,6 @@ class LiveAccountTradingBot:
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
-            adx_val = float(closed_bar.get("ADX", 0.0))
             disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
             conv_pct = int(min(99, max(45, round((raw_prob / max(req_thresh, 0.16)) * 76 + (10 if raw_4h_ok else -8) + min(adx_val * 0.25, 8)))))
             radar_signals.append({
@@ -1066,7 +1094,7 @@ class LiveAccountTradingBot:
             learned_score = float(agentic_coin_scores.get(disp_sym, 0.0))
             base_min_prob = max(req_thresh * 0.92, 0.18) + session_prob_penalty
 
-            # After 1st trade of the day, require Grade A or A+ setup only!
+            # After 1st trade of the day, require Grade A or A+ setup only
             if elite_a_plus_only:
                 effective_min_prob = base_min_prob + 0.04
                 grade_ok = (conv_pct >= 84) and raw_4h_ok and (adx_val >= 20.0) and (learned_score >= -4.0)
