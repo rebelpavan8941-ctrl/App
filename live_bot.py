@@ -130,7 +130,7 @@ class LiveAccountTradingBot:
         self._booster_cache = {}
         self._instrument_cache = {}
         self._trend_4h_cache = {}
-        self._funding_cache = (0.0, {})
+        self._ticker_cache = (0.0, {}, {})  # (ts, funding_rates, mark_prices)
 
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
@@ -155,6 +155,7 @@ class LiveAccountTradingBot:
             "daily_total_trades": 0,
             "tp1_partial_done": {},
             "native_trail_set": {},
+            "virtual_open_positions": [],
             "radar_signals": [],
             "last_bot_logs": [],
             "last_diagnostics": [],
@@ -202,28 +203,37 @@ class LiveAccountTradingBot:
                 continue
         return {}
 
-    def _fetch_all_funding_rates(self) -> dict:
-        """Cached 60s lightweight call to pull live funding rates for all linear contracts."""
+    def _fetch_tickers_cached(self) -> tuple:
+        """Single 45s cached call returning (funding_rates_dict, mark_prices_dict) to save battery."""
         now_s = time.time()
-        cached_ts, cached_map = self._funding_cache
-        if cached_map and (now_s - cached_ts) < 60.0:
-            return cached_map
+        c_ts, c_fr, c_px = self._ticker_cache
+        if c_px and (now_s - c_ts) < 45.0:
+            return c_fr, c_px
         rates = {}
+        prices = {}
         try:
             data = self._public_get("/v5/market/tickers", {"category": self.category}, timeout=3.5)
             for row in data.get("result", {}).get("list", []):
                 sym = str(row.get("symbol", "")).upper()
+                if not sym:
+                    continue
                 fr_raw = row.get("fundingRate", "")
-                if sym and fr_raw not in ("", None):
+                if fr_raw not in ("", None):
                     try:
                         rates[sym] = float(fr_raw)
                     except Exception:
                         pass
-            if rates:
-                self._funding_cache = (now_s, rates)
+                px_raw = row.get("markPrice") or row.get("lastPrice") or ""
+                if px_raw not in ("", None):
+                    try:
+                        prices[sym] = float(px_raw)
+                    except Exception:
+                        pass
+            if prices:
+                self._ticker_cache = (now_s, rates, prices)
         except Exception:
             pass
-        return rates or cached_map
+        return (rates or c_fr), (prices or c_px)
 
     def _bybit_request(self, method: str, path: str, params: dict = None, body: dict = None) -> dict:
         if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
@@ -311,7 +321,6 @@ class LiveAccountTradingBot:
 
     @staticmethod
     def _passes_anti_chase_guard(closed_bar: pd.Series, live_bar: pd.Series, side: str) -> tuple:
-        """Prevents chasing parabolic blow-offs while allowing healthy breakouts and normal 1H pullbacks."""
         rsi = float(closed_bar.get("RSI_14", 50.0))
         dist_ema20 = float(closed_bar.get("Dist_EMA20", 0.0))
         ret_1h = float(closed_bar.get("Ret_1h", 0.0))
@@ -340,6 +349,100 @@ class LiveAccountTradingBot:
             if di_spread < -10.0:
                 return False, f"Strong bearish DI ({di_spread:.1f})"
         return True, ""
+
+    def _save_closed_trade_history(self, order_id: str, sym: str, side_label: str, pnl: float, closed_ms: int, is_virtual: bool = False):
+        try:
+            hist_file = os.path.join(self.live_dir, "live_reports_history.json")
+            hist_data = {"trades": []}
+            if os.path.exists(hist_file):
+                with open(hist_file, "r", encoding="utf-8-sig") as hf:
+                    loaded = json.load(hf)
+                    if isinstance(loaded, dict):
+                        hist_data = loaded
+            trades_list = hist_data.setdefault("trades", [])
+            if not any(str(t.get("id")) == order_id for t in trades_list):
+                disp = f"{sym[:-4]}/USDT" if sym.endswith("USDT") else sym
+                trades_list.insert(0, {
+                    "id": order_id,
+                    "symbol": disp,
+                    "side": side_label,
+                    "net_pnl": round(pnl, 4),
+                    "closed_at_ms": closed_ms,
+                    "virtual": bool(is_virtual),
+                })
+                hist_data["trades"] = trades_list[:300]
+                with open(hist_file, "w", encoding="utf-8") as wf:
+                    json.dump(hist_data, wf, indent=2)
+        except Exception:
+            pass
+
+    def _sync_virtual_positions(self, state: dict, mark_prices: dict, trail_ratio: float, now_ms: int, add_bot_log) -> list:
+        """Simulates SL, TP, +65% Break-Even, +70% Trailing Stop, and 8h Time-Stop for Dry-Run positions."""
+        v_list = state.get("virtual_open_positions") or []
+        if not v_list:
+            return []
+        remaining = []
+        loss_cd = state.setdefault("loss_cooldown_until_ms", {})
+
+        for vp in v_list:
+            sym = str(vp.get("symbol", "")).upper()
+            side = str(vp.get("side", "LONG")).upper()
+            entry = float(vp.get("entry_price", 0.0))
+            qty = float(vp.get("qty", 0.0))
+            sl = float(vp.get("sl", 0.0))
+            tp = float(vp.get("tp", 0.0))
+            opened_ms = int(vp.get("opened_ms", now_ms))
+            mark = float(mark_prices.get(sym, vp.get("mark_price", entry)))
+            if mark <= 0.0:
+                mark = entry
+
+            is_long = side == "LONG"
+            gross_pnl = ((mark - entry) if is_long else (entry - mark)) * qty
+            est_fees = (entry * qty + mark * qty) * 0.00055
+            net_pnl = gross_pnl - est_fees
+
+            tp_dist = abs(tp - entry)
+            profit_dist = (mark - entry) if is_long else (entry - mark)
+
+            # Update Break-Even at +65% TP & Trailing Stop at +70% TP
+            if tp_dist > 0.0 and profit_dist >= tp_dist * 0.65:
+                be_sl = (entry + tp_dist * 0.15) if is_long else (entry - tp_dist * 0.15)
+                if (is_long and be_sl > sl) or ((not is_long) and be_sl < sl):
+                    sl = be_sl
+            if tp_dist > 0.0 and profit_dist >= tp_dist * 0.70:
+                trail_sl = (mark - tp_dist * trail_ratio) if is_long else (mark + tp_dist * trail_ratio)
+                if (is_long and trail_sl > sl) or ((not is_long) and trail_sl < sl):
+                    sl = trail_sl
+
+            hit_sl = (mark <= sl) if is_long else (mark >= sl)
+            hit_tp = (mark >= tp) if is_long else (mark <= tp)
+            age_hours = (now_ms - opened_ms) / 3_600_000.0
+            hit_time = (age_hours >= 8.0 and tp_dist > 0.0 and profit_dist >= 0.0 and profit_dist < tp_dist * 0.25)
+
+            if hit_sl or hit_tp or hit_time:
+                reason = "TP HIT" if hit_tp else ("TIME-STOP" if hit_time else "SL HIT")
+                vid = f"DRY_{sym}_{now_ms}"
+                self._save_closed_trade_history(vid, sym, side, net_pnl, now_ms, is_virtual=True)
+                if net_pnl < 0.0:
+                    loss_cd[sym] = now_ms + (4 * 60 * 60 * 1000)
+                try:
+                    import ai_regime_copilot
+                    ref_res = ai_regime_copilot.record_post_trade_reflection(
+                        self.live_dir, sym, side, net_pnl, entry, mark
+                    )
+                    if ref_res.get("lesson"):
+                        add_bot_log(f"[DRY-RUN REFLECTION] {ref_res['lesson']}")
+                except Exception:
+                    pass
+                add_bot_log(f"[DRY-RUN CLOSED • {reason}] {sym} {side} @ {mark:.4f} | Net PnL: {net_pnl:+.4f} USDT")
+            else:
+                vp["mark_price"] = mark
+                vp["sl"] = sl
+                vp["unrealized_pnl"] = round(net_pnl, 4)
+                remaining.append(vp)
+
+        state["virtual_open_positions"] = remaining
+        return remaining
 
     def _record_recent_stop_losses_and_reflect(self, state: dict, now_ms: int, add_bot_log):
         loss_cd = state.setdefault("loss_cooldown_until_ms", {})
@@ -375,30 +478,7 @@ class LiveAccountTradingBot:
                         add_bot_log(f"[AGENTIC REFLECTION] {ref_res['lesson']}")
                 except Exception:
                     pass
-
-                try:
-                    hist_file = os.path.join(self.live_dir, "live_reports_history.json")
-                    hist_data = {"trades": []}
-                    if os.path.exists(hist_file):
-                        with open(hist_file, "r", encoding="utf-8-sig") as hf:
-                            loaded = json.load(hf)
-                            if isinstance(loaded, dict):
-                                hist_data = loaded
-                    trades_list = hist_data.setdefault("trades", [])
-                    if not any(str(t.get("id")) == order_id for t in trades_list):
-                        disp = f"{sym[:-4]}/USDT" if sym.endswith("USDT") else sym
-                        trades_list.insert(0, {
-                            "id": order_id,
-                            "symbol": disp,
-                            "side": side_label,
-                            "net_pnl": round(pnl, 4),
-                            "closed_at_ms": updated_ms,
-                        })
-                        hist_data["trades"] = trades_list[:300]
-                        with open(hist_file, "w", encoding="utf-8") as wf:
-                            json.dump(hist_data, wf, indent=2)
-                except Exception:
-                    pass
+                self._save_closed_trade_history(order_id, sym, side_label, pnl, updated_ms, is_virtual=False)
         state["reflected_closed_ids"] = reflected[-40:]
 
     def fetch_bybit_candles(self, bybit_symbol: str, interval: str = "60", limit: int = 230) -> pd.DataFrame:
@@ -661,7 +741,6 @@ class LiveAccountTradingBot:
         return booster
 
     def _arm_native_trailing_stop(self, bybit_sym: str, side: str, entry: float, tp_dist: float, tick_size: str, trail_ratio: float) -> bool:
-        """Sets Bybit V5 native trailing stop (activates at +70% TP so winners are never choked early)."""
         if entry <= 0.0 or tp_dist <= 0.0:
             return False
         act_px = (entry + tp_dist * 0.70) if side == "LONG" else (entry - tp_dist * 0.70)
@@ -708,13 +787,11 @@ class LiveAccountTradingBot:
                 filters = self._get_instrument_filters(bybit_sym)
                 pos_key = f"{bybit_sym}_{entry:.6f}"
 
-                # Ensure Exchange-Native Trailing Stop is armed on Bybit servers (activates at +70% TP)
                 if filters and cur_trail <= 0.0 and not native_trail_map.get(pos_key, False):
                     _, _, _, tick_size = filters
                     if self._arm_native_trailing_stop(bybit_sym, side, entry, tp_dist, tick_size, trail_ratio):
                         native_trail_map[pos_key] = True
 
-                # Stagnant-Trade Time-Stop: open >= 8h without reaching +25% of TP distance
                 age_hours = (now_ms - opened_ms) / 3_600_000.0
                 if filters and age_hours >= 8.0 and tp_dist > 0.0 and profit_dist < (tp_dist * 0.25):
                     qty_step, _, _, tick_size = filters
@@ -750,7 +827,6 @@ class LiveAccountTradingBot:
                             if add_bot_log:
                                 add_bot_log(f"TIME-STOP GUARD ({age_hours:.1f}h stagnant): Tightened {bybit_sym} {side} SL to {self._format_step(tight_sl, tick_size)}")
 
-                # Stage 1: Move SL to Break-Even (+0.15 * tp_dist, covers fees) ONLY once +65% of TP is reached
                 if filters and tp_dist > 0.0 and profit_dist >= tp_dist * 0.65:
                     qty_step, min_qty, min_notional, tick_size = filters
                     be_sl = (entry + tp_dist * 0.15) if side == "LONG" else (entry - tp_dist * 0.15)
@@ -767,7 +843,6 @@ class LiveAccountTradingBot:
                         })
                         cur_sl = be_sl
 
-                # Stage 2: At +85% of TP distance, lock +0.55 * tp_dist on MarkPrice & partial close if allowed
                 if filters and tp_dist > 0.0 and profit_dist >= tp_dist * 0.85:
                     qty_step, min_qty, min_notional, tick_size = filters
                     if not tp1_done_map.get(pos_key, False):
@@ -830,6 +905,7 @@ class LiveAccountTradingBot:
                 "positionIdx": 0,
             })
             closed.append({"symbol": pos["symbol"], "ok": res.get("retCode") == 0})
+        state["virtual_open_positions"] = []
         self._save_state(state)
         return closed
 
@@ -905,7 +981,7 @@ class LiveAccountTradingBot:
         now_ms = int(time.time() * 1000)
 
         self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log)
-        funding_rates = self._fetch_all_funding_rates() if crypto_enabled else {}
+        funding_rates, mark_prices = self._fetch_tickers_cached() if crypto_enabled else ({}, {})
 
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         bal_ret_code = int(bal_res.get("retCode", -1)) if bal_res else -1
@@ -925,7 +1001,8 @@ class LiveAccountTradingBot:
 
         sl_mult, tp_mult, trail_ratio = self._regime_exit_multipliers(btc_adx, btc_natr, btc_macro_bearish)
         open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio, add_bot_log=add_bot_log)
-        open_syms = {p["symbol"] for p in open_positions}
+        virtual_positions = self._sync_virtual_positions(state, mark_prices, trail_ratio, now_ms, add_bot_log)
+        open_syms = {p["symbol"] for p in open_positions} | {vp["symbol"] for vp in virtual_positions}
 
         active_items = []
         fetch_tasks = {}
@@ -1030,7 +1107,6 @@ class LiveAccountTradingBot:
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.08) and (float(closed_bar["Vol_Surge"]) >= 1.25)
 
-            # Allow decoupled high-strength leaders past BTC 4H Guard
             decoupled_leader = raw_4h_ok and (adx_val >= 25.0) and (raw_prob >= req_thresh + 0.06)
             guard_blocked = (
                 btc_macro_bearish
@@ -1053,11 +1129,15 @@ class LiveAccountTradingBot:
 
             disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
             conv_pct = int(min(99, max(45, round((raw_prob / max(req_thresh, 0.16)) * 76 + (10 if raw_4h_ok else -8) + min(adx_val * 0.25, 8)))))
+            aligned_flag = bool(raw_4h_ok and not guard_blocked)
             radar_signals.append({
                 "symbol": disp_sym,
+                "direction": direction,
+                "confidence_pct": conv_pct,
+                "mtf_aligned": aligned_flag,
                 "side": direction,
                 "conviction_pct": conv_pct,
-                "aligned_4h": bool(raw_4h_ok and not guard_blocked),
+                "aligned_4h": aligned_flag,
                 "raw_prob": round(raw_prob, 4),
             })
 
@@ -1090,7 +1170,6 @@ class LiveAccountTradingBot:
             learned_score = float(agentic_coin_scores.get(disp_sym, 0.0))
             base_min_prob = max(req_thresh, 0.24) + session_prob_penalty
 
-            # Strict Conviction Floor: NEVER trade 50% setups
             if elite_a_plus_only:
                 effective_min_prob = base_min_prob + 0.04
                 grade_ok = (conv_pct >= 84) and raw_4h_ok and (adx_val >= 20.0) and (learned_score >= -4.0)
@@ -1143,19 +1222,13 @@ class LiveAccountTradingBot:
                 if top_wait_tuple is None or conv_pct > top_wait_tuple[0]:
                     top_wait_tuple = (conv_pct, block_msg)
 
-        radar_signals.sort(key=lambda x: (x["aligned_4h"], x["conviction_pct"]), reverse=True)
+        radar_signals.sort(key=lambda x: (x["mtf_aligned"], x["confidence_pct"]), reverse=True)
         candidates.sort(key=lambda x: x["edge"], reverse=True)
 
         live_trades_this_cycle = 0
 
         for cand in candidates:
             bybit_sym = cand["bybit_sym"]
-            if not live_orders_armed:
-                msg = f"{bybit_sym} {cand['direction']} skipped: Live Orders Armed switch is OFF"
-                diagnostics.append(msg)
-                trade_blocks.append(msg)
-                add_bot_log(msg)
-                break
             if daily_drawdown_pct >= max_daily_loss_pct and max_daily_loss_pct > 0.0:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
                 diagnostics.append(msg)
@@ -1168,7 +1241,7 @@ class LiveAccountTradingBot:
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
                 break
-            if avail_usdt < 2.0:
+            if live_orders_armed and avail_usdt < 2.0:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT too low (${avail_usdt:.2f} < $2.00)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
@@ -1194,16 +1267,16 @@ class LiveAccountTradingBot:
             price = float(live_bar["Close"])
             atr = float(closed_bar["ATR"])
 
-            # Wider SL breathing room so normal wicks don't stop out good entries
             sl_atr = max(float(cfg.get("sl_atr", 1.55)) * sl_mult, 1.50)
             tp_rr = min(max(float(cfg.get("tp1_rr", 1.65)) * tp_mult, 1.50), 1.85)
 
             min_sl_floor = price * (0.0020 if cand["market_type"] == "FOREX" else 0.0155)
             risk_dist = max(sl_atr * atr, min_sl_floor)
 
-            max_buying_power = avail_usdt * leverage * 0.85
+            sim_equity = avail_usdt if avail_usdt >= 2.0 else 10.0
+            max_buying_power = sim_equity * leverage * 0.85
             min_required_notional = max(min_notional * 1.05, min_qty * price)
-            if max_buying_power < min_required_notional:
+            if live_orders_armed and max_buying_power < min_required_notional:
                 msg = f"{bybit_sym} {cand['direction']} skipped: Min order ${min_required_notional:.2f} > buying power ${max_buying_power:.2f} (Avail ${avail_usdt:.2f})"
                 diagnostics.append(msg)
                 add_bot_log(msg)
@@ -1212,8 +1285,8 @@ class LiveAccountTradingBot:
             conv_scale = self._conviction_risk_scale(float(cand.get("raw_prob", 0.3)), float(cand.get("req_thresh", 0.3)))
             max_risk_cap = max(risk_per_trade_pct * 1.20, 2.50)
             scaled_risk_pct = min(max(risk_per_trade_pct * conv_scale, 0.50), max_risk_cap)
-            risk_usdt = max(avail_usdt * (scaled_risk_pct / 100.0), 0.15)
-            notional = min(max(risk_usdt / (risk_dist / price), min_required_notional, 5.5), max_buying_power)
+            risk_usdt = max(sim_equity * (scaled_risk_pct / 100.0), 0.15)
+            notional = min(max(risk_usdt / (risk_dist / price), min_required_notional, 5.5), max(max_buying_power, min_required_notional))
             qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)
 
             is_long = cand["direction"] == "LONG"
@@ -1259,6 +1332,34 @@ class LiveAccountTradingBot:
                     add_bot_log(f"[LAYER 1 APPROVED] {bybit_sym} {cand['direction']} ({pa_res.get('score', 75)}/100): {'; '.join(pa_res.get('reasons', [])[:1])}")
             except Exception:
                 pass
+
+            # VIRTUAL DRY-RUN MODE when Exchange Live Orders toggle is OFF
+            if not live_orders_armed:
+                v_list = state.setdefault("virtual_open_positions", [])
+                v_list.append({
+                    "symbol": bybit_sym,
+                    "side": cand["direction"],
+                    "qty": float(qty_str),
+                    "entry_price": price,
+                    "mark_price": price,
+                    "sl": float(sl_str),
+                    "tp": float(tp_str),
+                    "unrealized_pnl": 0.0,
+                    "opened_ms": now_ms,
+                })
+                open_syms.add(bybit_sym)
+                traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
+                last_trade_epoch_ms[bybit_sym] = now_ms
+                daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
+                daily_total_trades += 1
+                state["daily_total_trades"] = daily_total_trades
+                elite_a_plus_only = True
+                live_trades_this_cycle += 1
+                add_bot_log(
+                    f"[DRY-RUN SIMULATED] (Grade {cand['grade']} • {cand['conv_pct']}% • {curr_session}): {bybit_sym} {cand['direction']} "
+                    f"qty={qty_str} @ ~{price:.4f} | SL={sl_str} | TP={tp_str} ({tp_rr:.2f}R • No Exchange Order)"
+                )
+                break
 
             self._bybit_request("POST", "/v5/position/set-leverage", body={
                 "category": self.category,
@@ -1311,15 +1412,16 @@ class LiveAccountTradingBot:
                 add_bot_log(f"ORDER REJECTED: {rej_msg}")
 
         summary_detail = top_wait_tuple[1] if top_wait_tuple else (diagnostics[0] if diagnostics else "All pairs scanned")
-        mode_tag = f"1/1 • A/A+ Mode ({daily_total_trades} today)" if daily_total_trades >= 1 else "0/1 • Hunting 1st Setup"
+        dry_tag = " [DRY-RUN]" if not live_orders_armed else ""
+        mode_tag = f"1/1 • A/A+ Mode ({daily_total_trades} today){dry_tag}" if daily_total_trades >= 1 else f"0/1 • Hunting 1st Setup{dry_tag}"
         sess_note = f"{curr_session}{' (Tight)' if session_prob_penalty > 0 else ''}"
         state["top_status_summary"] = f"{mode_tag} | {sess_note} | {summary_detail}"
 
         if live_trades_this_cycle == 0:
             if daily_total_trades >= 1:
-                add_bot_log(f"Daily 1st Trade Done ({daily_total_trades} today • {sess_note}) — Hunting A/A+ setups only | Top: {summary_detail}")
+                add_bot_log(f"Daily 1st Trade Done ({daily_total_trades} today • {sess_note}{dry_tag}) — Hunting A/A+ setups only | Top: {summary_detail}")
             else:
-                add_bot_log(f"Scanning {coins_scanned_count} coins ({sess_note}, Avail ${avail_usdt:.2f}) | Top: {summary_detail}")
+                add_bot_log(f"Scanning {coins_scanned_count} coins ({sess_note}{dry_tag}, Avail ${avail_usdt:.2f}) | Top: {summary_detail}")
 
         if not bot_logs_enabled:
             state["last_bot_logs"] = []
