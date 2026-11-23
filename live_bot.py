@@ -1331,8 +1331,9 @@ class LiveAccountTradingBot:
                     continue
                 else:
                     add_bot_log(f"[LAYER 1 APPROVED] {bybit_sym} {cand['direction']} ({pa_res.get('score', 75)}/100): {'; '.join(pa_res.get('reasons', [])[:1])}")
-            except Exception:
-                pass
+            except Exception as l1_err:
+                add_bot_log(f"[LAYER 1 ERROR] {bybit_sym} {cand['direction']} skipped: {l1_err}")
+                continue
 
             # VIRTUAL DRY-RUN MODE when Exchange Live Orders toggle is OFF
             if not live_orders_armed:
