@@ -121,7 +121,7 @@ class LiveAccountTradingBot:
         self.host_candidates = (
             ["https://api-demo.bybit.com", "https://api.bytick.com"]
             if self.is_demo
-            else ["https://api.bytick.com", "https://api.bytick.com"]
+            else ["https://api.bytick.com", "https://api.bybit.com"]
         )
         self.base_url = self.host_candidates[0]
         self.category = "linear"
@@ -974,10 +974,9 @@ class LiveAccountTradingBot:
             daily_coin_trades.clear()
             daily_coin_trades["_date_ist"] = today_ist_str
             state["daily_total_trades"] = 0
-            add_bot_log(f"Daily Target Auto-Renewed for {today_ist_str} (12:00 AM IST) — Quota 0/1 reset.")
+            add_bot_log(f"Daily Counter Auto-Renewed for {today_ist_str} (12:00 AM IST).")
 
         daily_total_trades = int(state.get("daily_total_trades", 0))
-        elite_a_plus_only = (daily_total_trades >= 1)
         now_ms = int(time.time() * 1000)
 
         self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log)
@@ -1168,19 +1167,23 @@ class LiveAccountTradingBot:
             )
 
             learned_score = float(agentic_coin_scores.get(disp_sym, 0.0))
-            base_min_prob = max(req_thresh, 0.24) + session_prob_penalty
+            effective_min_prob = max(req_thresh * 0.96, 0.22) + session_prob_penalty
 
-            if elite_a_plus_only:
-                effective_min_prob = base_min_prob + 0.04
-                grade_ok = (conv_pct >= 84) and raw_4h_ok and (adx_val >= 20.0) and (learned_score >= -4.0)
-            else:
-                effective_min_prob = base_min_prob
-                grade_ok = (conv_pct >= 76) and raw_4h_ok and (adx_val >= 18.0) and (learned_score >= -10.0)
+            # Allow A+, A, B+, and B setups all day (gated by Layer 1 Human AI + Focus Mode)
+            grade_ok = (conv_pct >= 68) and raw_4h_ok and (adx_val >= 16.5) and (learned_score >= -10.0)
 
             quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 20.0 else 0.0) + (learned_score * 0.002)
 
             if mtf_aligned and strat_ok and anti_chase_ok and grade_ok and (not funding_blocked) and raw_prob >= effective_min_prob:
-                grade_tag = "A+" if (conv_pct >= 90 and raw_4h_ok and adx_val >= 23.0) else "A"
+                if conv_pct >= 88 and raw_4h_ok and adx_val >= 22.0:
+                    grade_tag = "A+"
+                elif conv_pct >= 80 and raw_4h_ok and adx_val >= 19.0:
+                    grade_tag = "A"
+                elif conv_pct >= 74 and adx_val >= 17.5:
+                    grade_tag = "B+"
+                else:
+                    grade_tag = "B"
+
                 candidates.append({
                     "edge": quality_edge,
                     "conv_pct": conv_pct,
@@ -1211,9 +1214,7 @@ class LiveAccountTradingBot:
                 if not strat_ok:
                     reasons.append(f"Waiting for {strat_id}")
                 if not grade_ok:
-                    min_c = 84 if elite_a_plus_only else 76
-                    min_a = 20.0 if elite_a_plus_only else 18.0
-                    reasons.append(f"Below quality floor (Conv {conv_pct}%<{min_c}% or ADX {adx_val:.1f}<{min_a:.0f} or 4H unaligned)")
+                    reasons.append(f"Below B floor (Conv {conv_pct}%<68% or ADX {adx_val:.1f}<16.5 or 4H unaligned)")
                 if raw_prob < effective_min_prob:
                     reasons.append(f"Prob {raw_prob:.2f} < {effective_min_prob:.2f}")
                 block_msg = f"{bybit_sym} {direction} ({conv_pct}%): {', '.join(reasons)} [ADX:{adx_val:.1f}]"
@@ -1295,7 +1296,7 @@ class LiveAccountTradingBot:
             sl_str = self._format_step(sl_raw, tick_size)
             tp_str = self._format_step(tp_raw, tick_size)
 
-            # Layer 1 Local Human Price-Action Brain v2 + Optional Gemini Shadow-Compare
+            # Layer 1 Local Human Price-Action Brain v2 + Optional Gemini Shadow-Compare (Test Only)
             try:
                 import ai_regime_copilot
                 shadow_cfg_path = os.path.join(self.live_dir, "ai_shadow_config.json")
@@ -1353,7 +1354,6 @@ class LiveAccountTradingBot:
                 daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
                 daily_total_trades += 1
                 state["daily_total_trades"] = daily_total_trades
-                elite_a_plus_only = True
                 live_trades_this_cycle += 1
                 add_bot_log(
                     f"[DRY-RUN SIMULATED] (Grade {cand['grade']} • {cand['conv_pct']}% • {curr_session}): {bybit_sym} {cand['direction']} "
@@ -1387,7 +1387,6 @@ class LiveAccountTradingBot:
                 daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
                 daily_total_trades += 1
                 state["daily_total_trades"] = daily_total_trades
-                elite_a_plus_only = True
                 live_trades_this_cycle += 1
                 avail_usdt = max(0.0, avail_usdt - (notional / leverage))
 
@@ -1413,15 +1412,12 @@ class LiveAccountTradingBot:
 
         summary_detail = top_wait_tuple[1] if top_wait_tuple else (diagnostics[0] if diagnostics else "All pairs scanned")
         dry_tag = " [DRY-RUN]" if not live_orders_armed else ""
-        mode_tag = f"1/1 • A/A+ Mode ({daily_total_trades} today){dry_tag}" if daily_total_trades >= 1 else f"0/1 • Hunting 1st Setup{dry_tag}"
+        mode_tag = f"Active ({daily_total_trades} today • A+/A/B+/B){dry_tag}"
         sess_note = f"{curr_session}{' (Tight)' if session_prob_penalty > 0 else ''}"
         state["top_status_summary"] = f"{mode_tag} | {sess_note} | {summary_detail}"
 
         if live_trades_this_cycle == 0:
-            if daily_total_trades >= 1:
-                add_bot_log(f"Daily 1st Trade Done ({daily_total_trades} today • {sess_note}{dry_tag}) — Hunting A/A+ setups only | Top: {summary_detail}")
-            else:
-                add_bot_log(f"Scanning {coins_scanned_count} coins ({sess_note}{dry_tag}, Avail ${avail_usdt:.2f}) | Top: {summary_detail}")
+            add_bot_log(f"Scanning {coins_scanned_count} coins ({daily_total_trades} today • {sess_note}{dry_tag}, Avail ${avail_usdt:.2f}) | Top: {summary_detail}")
 
         if not bot_logs_enabled:
             state["last_bot_logs"] = []
