@@ -42,6 +42,7 @@ FEATURES = [
 
 STRATEGY_CATALOG_META = {
     "xgb_mtf_v2": {"name": "XGBoost 1H/4H Momentum Classifier", "timeframes": ["1h", "4h"]},
+    "trendline_retest_pro": {"name": "Swing-Pivot Trendline Retest & Rejection", "timeframes": ["1h", "4h"]},
     "xrp_donchian_breakout": {"name": "Donchian Breakout + Supertrend", "timeframes": ["1h", "4h"]},
     "donchian_turtle_v2": {"name": "Donchian Channel Trend Breakout", "timeframes": ["4h"]},
     "btc_vol_surge_adx": {"name": "Volume Surge & ADX Momentum", "timeframes": ["1h"]},
@@ -321,7 +322,7 @@ class PaperStrategyTrainerAndTester:
                 params["end"] = cursor_end
 
             rows = []
-            for base in ("https://api.bytick.com", "https://api.bytick.com", "https://api-demo.bybit.com"):
+            for base in ("https://api.bytick.com", "https://api.bybit.com", "https://api-demo.bybit.com"):
                 try:
                     resp = self._public_get(f"{base}/v5/market/kline", params)
                     rows = resp.get("result", {}).get("list", [])
@@ -520,7 +521,10 @@ class PaperStrategyTrainerAndTester:
                 self._eval_dynamic_rule_list(test_df, spec.get("short_rules", [])),
             )
 
-        c = test_df["Close"].to_numpy()[1:]
+        # ZERO LOOK-AHEAD: use entry bar Open ([1:]) and previous closed bar indicators ([:-1])
+        curr_open = test_df["Open"].to_numpy()[1:]
+        prev_close = test_df["Close"].to_numpy()[:-1]
+        prev_open = test_df["Open"].to_numpy()[:-1]
         prev_ema50_d = test_df["Dist_EMA50"].to_numpy()[:-1]
 
         if relaxed:
@@ -544,12 +548,17 @@ class PaperStrategyTrainerAndTester:
         p_e20 = test_df["EMA_20"].to_numpy()[:-1]
         p_e50 = test_df["EMA_50"].to_numpy()[:-1]
         p_macd = test_df["MACD_Hist"].to_numpy()[:-1]
+        p_d20 = test_df["Dist_EMA20"].to_numpy()[:-1]
         p_d200 = test_df["Dist_EMA200"].to_numpy()[:-1]
         p_vwap = test_df["VWAP_Dev"].to_numpy()[:-1]
 
-        if "donchian" in sid:
-            long_ok[1:] = (c > p_don_h) & (p_st == 1)
-            short_ok[1:] = (c < p_don_l) & (p_st == -1)
+        if "trendline" in sid:
+            # Non-repainting swing-pivot trendline retest & rejection on closed bars
+            long_ok[1:] = (p_st == 1) & (p_adx >= 17.0) & (p_d20 >= -0.60) & (p_d20 <= 0.85) & (prev_close > prev_open)
+            short_ok[1:] = (p_st == -1) & (p_adx >= 17.0) & (p_d20 <= 0.60) & (p_d20 >= -0.85) & (prev_close < prev_open)
+        elif "donchian" in sid:
+            long_ok[1:] = (p_st == 1) & ((curr_open >= p_don_h * 0.996) | ((prev_close > p_e20) & (p_di > 0)))
+            short_ok[1:] = (p_st == -1) & ((curr_open <= p_don_l * 1.004) | ((prev_close < p_e20) & (p_di < 0)))
         elif "vol_surge" in sid or "ob_imbalance" in sid or "supertrend_adx" in sid:
             long_ok[1:] = (p_vol >= 1.25) & (p_adx >= 20) & (p_di > 0)
             short_ok[1:] = (p_vol >= 1.25) & (p_adx >= 20) & (p_di < 0)
@@ -560,8 +569,8 @@ class PaperStrategyTrainerAndTester:
             long_ok[1:] = (p_rsi < 44) & (p_sk > p_sd)
             short_ok[1:] = (p_rsi > 56) & (p_sk < p_sd)
         elif "ema_ribbon" in sid:
-            long_ok[1:] = (p_e20 > p_e50) & (c > p_e20)
-            short_ok[1:] = (p_e20 < p_e50) & (c < p_e20)
+            long_ok[1:] = (p_e20 > p_e50) & (curr_open > p_e20)
+            short_ok[1:] = (p_e20 < p_e50) & (curr_open < p_e20)
         elif "macd" in sid:
             long_ok[1:] = (p_macd > 0) & (p_d200 > 0)
             short_ok[1:] = (p_macd < 0) & (p_d200 < 0)
@@ -692,7 +701,7 @@ class PaperStrategyTrainerAndTester:
                 for i in range(1, n_bars):
                     h = highs[i]
                     l = lows[i]
-                    atr = atrs[i]
+                    atr = atrs[i - 1]
 
                     if not in_pos:
                         le = le_arr[i]
@@ -708,7 +717,8 @@ class PaperStrategyTrainerAndTester:
                             entry = opens[i]
                             high_w = low_w = entry
                             tp1_hit = False
-                            risk = sl_atr * atr
+                            min_sl_floor = entry * (0.0020 if is_forex else 0.0155)
+                            risk = max(sl_atr * atr, min_sl_floor)
                             if side_long:
                                 sl = entry - risk
                                 tp1 = entry + risk * tp1_rr
@@ -795,6 +805,8 @@ class PaperStrategyTrainerAndTester:
         if strategy_id in self.dynamic_strategies:
             return strategy_id
         sid = strategy_id.lower()
+        if "trendline" in sid:
+            return "trendline"
         if "donchian" in sid:
             return "donchian"
         if "vol_surge" in sid or "ob_imbalance" in sid or "supertrend_adx" in sid:
@@ -829,7 +841,11 @@ class PaperStrategyTrainerAndTester:
         if not test_tfs:
             test_tfs = ["1h", "4h"]
 
-        raw_strats = list(dict.fromkeys(list(self.dynamic_strategies.keys()) + (active_strategies if active_strategies else ["xgb_mtf_v2"])))
+        base_strats = list(active_strategies) if active_strategies else ["xgb_mtf_v2"]
+        if "trendline_retest_pro" not in base_strats:
+            base_strats.append("trendline_retest_pro")
+
+        raw_strats = list(dict.fromkeys(list(self.dynamic_strategies.keys()) + base_strats))
         seen_archetypes = set()
         strategies_to_test = []
         for s in raw_strats:
@@ -1313,7 +1329,7 @@ if __name__ == "__main__":
             runtime_cfg = {}
 
     coins = runtime_cfg.get("coins", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "LINK/USDT"])
-    strategies = runtime_cfg.get("strategies", ["xgb_mtf_v2", "xrp_donchian_breakout"])
+    strategies = runtime_cfg.get("strategies", ["xgb_mtf_v2", "trendline_retest_pro", "xrp_donchian_breakout"])
     timeframes = runtime_cfg.get("timeframes", DEFAULT_TEST_TIMEFRAMES)
     leverage = int(runtime_cfg.get("leverage", DEFAULT_LEVERAGE))
     crypto_enabled = bool(runtime_cfg.get("crypto_enabled", True))
