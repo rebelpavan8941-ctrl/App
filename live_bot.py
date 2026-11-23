@@ -203,6 +203,7 @@ class LiveAccountTradingBot:
         return {}
 
     def _fetch_all_funding_rates(self) -> dict:
+        """Cached 60s lightweight call to pull live funding rates for all linear contracts."""
         now_s = time.time()
         cached_ts, cached_map = self._funding_cache
         if cached_map and (now_s - cached_ts) < 60.0:
@@ -310,6 +311,7 @@ class LiveAccountTradingBot:
 
     @staticmethod
     def _passes_anti_chase_guard(closed_bar: pd.Series, live_bar: pd.Series, side: str) -> tuple:
+        """Prevents chasing parabolic blow-offs while allowing healthy breakouts and normal 1H pullbacks."""
         rsi = float(closed_bar.get("RSI_14", 50.0))
         dist_ema20 = float(closed_bar.get("Dist_EMA20", 0.0))
         ret_1h = float(closed_bar.get("Ret_1h", 0.0))
@@ -1028,6 +1030,7 @@ class LiveAccountTradingBot:
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.08) and (float(closed_bar["Vol_Surge"]) >= 1.25)
 
+            # Allow decoupled high-strength leaders past BTC 4H Guard
             decoupled_leader = raw_4h_ok and (adx_val >= 25.0) and (raw_prob >= req_thresh + 0.06)
             guard_blocked = (
                 btc_macro_bearish
@@ -1087,7 +1090,7 @@ class LiveAccountTradingBot:
             learned_score = float(agentic_coin_scores.get(disp_sym, 0.0))
             base_min_prob = max(req_thresh, 0.24) + session_prob_penalty
 
-            # Strict Conviction Floor: NEVER trade 50% setups!
+            # Strict Conviction Floor: NEVER trade 50% setups
             if elite_a_plus_only:
                 effective_min_prob = base_min_prob + 0.04
                 grade_ok = (conv_pct >= 84) and raw_4h_ok and (adx_val >= 20.0) and (learned_score >= -4.0)
