@@ -1145,7 +1145,12 @@ class LiveAccountTradingBot:
                 continue
 
             if now_ms < int(loss_cooldown_until_ms.get(bybit_sym, 0)):
-                trade_blocks.append(f"{bybit_sym}: 4h post-loss cooldown active")
+                rem_min = max(1, int((int(loss_cooldown_until_ms.get(bybit_sym, 0)) - now_ms) / 60000))
+                cd_msg = f"{bybit_sym} {direction} ({conv_pct}%): 4h post-loss cooldown active ({rem_min}m left)"
+                trade_blocks.append(cd_msg)
+                diagnostics.append(cd_msg)
+                if top_wait_tuple is None or conv_pct > top_wait_tuple[0]:
+                    top_wait_tuple = (conv_pct, cd_msg)
                 continue
 
             if now_ms < int(agentic_veto_until_ms.get(bybit_sym, 0)):
@@ -1250,8 +1255,15 @@ class LiveAccountTradingBot:
                 add_bot_log(msg)
                 break
             if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
+                msg = f"{bybit_sym} {cand['direction']} ({cand['conv_pct']}%) skipped: Already traded this candle"
+                diagnostics.append(msg)
+                add_bot_log(msg)
                 continue
             if (now_ms - int(last_trade_epoch_ms.get(bybit_sym, 0))) < 30 * 60 * 1000:
+                rem_m = max(1, int((30 * 60 * 1000 - (now_ms - int(last_trade_epoch_ms.get(bybit_sym, 0)))) / 60000))
+                msg = f"{bybit_sym} {cand['direction']} ({cand['conv_pct']}%) skipped: 30m trade cooldown ({rem_m}m left)"
+                diagnostics.append(msg)
+                add_bot_log(msg)
                 continue
 
             filters = self._get_instrument_filters(bybit_sym)
