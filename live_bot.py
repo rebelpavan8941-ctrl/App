@@ -131,12 +131,9 @@ class LiveAccountTradingBot:
         self._instrument_cache = {}
         self._trend_4h_cache = {}
         self._ticker_cache = (0.0, {}, {})  # (ts, funding_rates, mark_prices)
-        self.api_warnings = []
 
         self.session = requests.Session()
-        from urllib3.util.retry import Retry
-        _retry = Retry(total=2, connect=2, read=0, status=0, backoff_factor=0.6)
-        adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12, max_retries=_retry)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
         self.session.mount("https://", adapter)
 
     def _load_state(self) -> dict:
@@ -145,11 +142,7 @@ class LiveAccountTradingBot:
                 with open(self.state_path, "r", encoding="utf-8-sig") as f:
                     return json.load(f)
             except Exception:
-                try:
-                    with open(self.state_path + ".prev", "r", encoding="utf-8-sig") as bf:
-                        return json.load(bf)
-                except Exception:
-                    pass
+                pass
         return {
             "traded_candle_ts": {},
             "last_trade_epoch_ms": {},
@@ -173,21 +166,8 @@ class LiveAccountTradingBot:
         }
 
     def _save_state(self, state: dict):
-        tmp_path = self.state_path + ".writing"
-        with open(tmp_path, "w", encoding="utf-8") as f:
+        with open(self.state_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except Exception:
-                pass
-        if os.path.exists(self.state_path):
-            try:
-                import shutil
-                shutil.copy2(self.state_path, self.state_path + ".prev")
-            except Exception:
-                pass
-        os.replace(tmp_path, self.state_path)
 
     def _load_agentic_memory(self) -> dict:
         if os.path.exists(self.memory_path):
@@ -291,23 +271,12 @@ class LiveAccountTradingBot:
                     resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=5.0)
                     self._update_rate_limits(resp)
                     if resp.status_code == 200:
-                        _j = resp.json()
-                        try:
-                            _rc = int(_j.get("retCode", 0))
-                            if path != "/v5/order/create" and _rc not in (0, 34040, 110043):
-                                self.api_warnings.append(f"{path} [{_rc}] {_j.get('retMsg', '')}")
-                        except Exception:
-                            pass
-                        return _j
-                    return {"retCode": -1, "retMsg": f"HTTP {resp.status_code} on {path}"}
+                        return resp.json()
             except Exception as e:
                 last_err = e
-                if method != "GET":
-                    return {"retCode": -1, "retMsg": f"Network error on {path}: {e} (verify position on exchange before retrying)"}
                 continue
         if last_err:
-            _tried = ", ".join(str(h).replace("https://", "") for h in self.host_candidates)
-            raise ConnectionError(f"Bybit unreachable (network/DNS problem on this phone). Tried: {_tried}. Last error: {type(last_err).__name__}") from last_err
+            raise last_err
         return {}
 
     def _get_instrument_filters(self, bybit_symbol: str):
@@ -678,8 +647,6 @@ class LiveAccountTradingBot:
                 return False
             elif op == "<=" and not (actual <= val):
                 return False
-            elif op not in (">", "<", ">=", "<="):
-                return False
         return True
 
     def _strategy_entry_filter(
@@ -757,20 +724,9 @@ class LiveAccountTradingBot:
             self._booster_cache.pop(oldest_key, None)
 
         sanitized_dict = _sanitize_xgb_model_json(model_dict)
-        # 1) In-memory load: no temp file, so nothing can delete it or collide with another thread
-        try:
-            booster = xgb.Booster()
-            booster.load_model(bytearray(json.dumps(sanitized_dict).encode("utf-8")))
-            self._booster_cache[cache_key] = booster
-            return booster
-        except Exception:
-            pass
-        # 2) Fallback: temp file whose name is unique per thread and per call
-        import threading
-        import uuid
         booster = xgb.Booster()
         os.makedirs(self.live_dir, exist_ok=True)
-        tmp_path = os.path.join(self.live_dir, f"_tmp_live_{cache_key}_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}.json")
+        tmp_path = os.path.join(self.live_dir, f"_tmp_live_{cache_key}_{os.getpid()}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(sanitized_dict, f)
@@ -934,25 +890,8 @@ class LiveAccountTradingBot:
 
     def emergency_close_all(self) -> list:
         state = self._load_state()
-        state["kill_until_ms"] = int(time.time() * 1000) + 60 * 60 * 1000
+        open_positions = self.sync_positions_and_trail_stops(state)
         closed = []
-        open_positions = []
-        try:
-            res_pos = self._bybit_request("GET", "/v5/position/list", {"category": self.category, "settleCoin": "USDT"})
-            for item in res_pos.get("result", {}).get("list", []):
-                if float(item.get("size", 0.0) or 0.0) > 0.0:
-                    open_positions.append({
-                        "symbol": str(item.get("symbol", "")).upper(),
-                        "side": "LONG" if str(item.get("side", "")).lower() == "buy" else "SHORT",
-                        "qty": item.get("size", "0"),
-                    })
-        except Exception as _e_pos:
-            open_positions = []
-            closed.append({"symbol": "ALL", "ok": False, "error": f"Could not fetch positions: {_e_pos}"})
-        try:
-            self._bybit_request("POST", "/v5/order/cancel-all", body={"category": self.category, "settleCoin": "USDT"})
-        except Exception:
-            pass
         for pos in open_positions:
             close_side = "Sell" if pos["side"] == "LONG" else "Buy"
             res = self._bybit_request("POST", "/v5/order/create", body={
@@ -997,19 +936,6 @@ class LiveAccountTradingBot:
             raise ValueError("No coins found in Live ML Model. Promote trained coins from Paper to Live first.")
 
         state = self._load_state()
-        if int(state.get("kill_until_ms", 0) or 0) > int(time.time() * 1000):
-            _mins = max(1, int((int(state.get("kill_until_ms", 0)) - int(time.time() * 1000)) / 60000))
-            return {
-                "ok": True,
-                "coins_scanned": 0,
-                "daily_total_trades": int(state.get("daily_total_trades", 0)),
-                "open_positions_count": 0,
-                "radar_signals": [],
-                "ml_model_version": "KILL-SWITCH",
-                "order_rejections": [],
-                "trade_blocks": [f"Kill switch active: new entries paused for {_mins} more minutes"],
-                "diagnostics": ["Kill switch active"],
-            }
         traded_candle_ts = state.setdefault("traded_candle_ts", {})
         last_trade_epoch_ms = state.setdefault("last_trade_epoch_ms", {})
         pos_opened_map = state.setdefault("position_opened_ms", {})
@@ -1063,60 +989,7 @@ class LiveAccountTradingBot:
             err_str = f"Bybit Wallet API Error [{bal_ret_code}]: {BYBIT_ERROR_HINTS.get(bal_ret_code, bal_msg)}"
             order_rejections.append(err_str)
             add_bot_log(err_str)
-        def _fnum(v, d=0.0):
-            try:
-                return float(v)
-            except Exception:
-                return d
-
-        try:
-            _acct0 = (bal_res.get("result", {}).get("list") or [{}])[0]
-        except Exception:
-            _acct0 = {}
-        avail_usdt = _fnum(_acct0.get("totalAvailableBalance"), 0.0)
-        total_equity_now = _fnum(_acct0.get("totalEquity"), 0.0)
-
-        # Auto daily-loss tracker: realized PnL since 00:00 IST
-        try:
-            day_start_ms = int(now_ist.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-            _cp_res = self._bybit_request("GET", "/v5/position/closed-pnl", {"category": self.category, "limit": 100})
-            realized_today = sum(
-                _fnum(r.get("closedPnl"))
-                for r in _cp_res.get("result", {}).get("list", [])
-                if int(r.get("updatedTime", 0) or 0) >= day_start_ms
-            )
-            if total_equity_now > 0.0:
-                start_eq = max(total_equity_now - realized_today, 1e-9)
-                calc_dd = max(0.0, -realized_today) / start_eq * 100.0
-                daily_drawdown_pct = max(float(daily_drawdown_pct), calc_dd)
-                state["daily_drawdown_pct"] = round(float(daily_drawdown_pct), 3)
-        except Exception:
-            pass
-
-        # Margin mode: check at most every 6h; auto-switch to Isolated only when no position is open
-        if live_orders_armed and (int(time.time() * 1000) - int(state.get("margin_check_ms", 0) or 0)) > 6 * 3600 * 1000:
-            try:
-                _ai = self._bybit_request("GET", "/v5/account/info", {})
-                _mm = str(_ai.get("result", {}).get("marginMode", ""))
-                if _mm == "ISOLATED_MARGIN":
-                    state["margin_check_ms"] = int(time.time() * 1000)
-                elif _mm:
-                    _pos_chk = self._bybit_request("GET", "/v5/position/list", {"category": self.category, "settleCoin": "USDT"})
-                    _has_pos = any(float(i.get("size", 0.0) or 0.0) > 0.0 for i in _pos_chk.get("result", {}).get("list", []))
-                    if _has_pos:
-                        add_bot_log(f"[MARGIN] Account is {_mm}; will switch to Isolated once all positions are closed.")
-                        state["margin_check_ms"] = int(time.time() * 1000) - int(5.5 * 3600 * 1000)
-                    else:
-                        _sw = self._bybit_request("POST", "/v5/account/set-margin-mode", body={"setMarginMode": "ISOLATED_MARGIN"})
-                        _reasons = (_sw.get("result") or {}).get("reasons") or []
-                        state["margin_check_ms"] = int(time.time() * 1000)
-                        if int(_sw.get("retCode", -1)) == 0 and not _reasons:
-                            add_bot_log(f"[MARGIN] Switched account from {_mm} to ISOLATED_MARGIN.")
-                        else:
-                            _why = "; ".join(str(r.get("reasonMsg", "")) for r in _reasons) or str(_sw.get("retMsg", ""))
-                            add_bot_log(f"[MARGIN] Could not switch to Isolated ({_why}). Set it manually in the Bybit app.")
-            except Exception:
-                pass
+        avail_usdt = float(bal_res.get("result", {}).get("list", [{}])[0].get("totalAvailableBalance", 0.0))
 
         btc_macro_bearish = False
         btc_adx = 20.0
@@ -1218,12 +1091,10 @@ class LiveAccountTradingBot:
                 order_rejections.append(err_msg)
                 continue
 
-            default_th = 0.24 if market_type == "FOREX" else 0.28
-            _lt = float(cfg.get("long_thresh", default_th))
-            _st = float(cfg.get("short_thresh", default_th))
-            direction = "LONG" if (p_long - _lt) >= (p_short - _st) else "SHORT"
+            direction = "LONG" if p_long >= p_short else "SHORT"
             raw_prob = p_long if direction == "LONG" else p_short
-            req_thresh = _lt if direction == "LONG" else _st
+            default_th = 0.24 if market_type == "FOREX" else 0.28
+            req_thresh = float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh", default_th))
 
             if interval == "240":
                 trend_4h = int(closed_bar["Supertrend"])
@@ -1368,6 +1239,7 @@ class LiveAccountTradingBot:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
+                order_rejections.append(msg)
                 add_bot_log(msg)
                 break
             if len(open_syms) >= 1:
@@ -1379,6 +1251,7 @@ class LiveAccountTradingBot:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT too low (${avail_usdt:.2f} < $2.00)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
+                order_rejections.append(msg)
                 add_bot_log(msg)
                 break
             if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
@@ -1428,17 +1301,6 @@ class LiveAccountTradingBot:
             risk_usdt = max(sim_equity * (scaled_risk_pct / 100.0), 0.15)
             notional = min(max(risk_usdt / (risk_dist / price), min_required_notional, 5.5), max(max_buying_power, min_required_notional))
             qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)
-            actual_risk_usdt = float(qty_str) * risk_dist
-            risk_ceiling = sim_equity * (max_risk_cap / 100.0) * 1.25
-            if live_orders_armed and actual_risk_usdt > risk_ceiling:
-                msg = (
-                    f"{bybit_sym} {cand['direction']} skipped: min lot forces risk ${actual_risk_usdt:.2f} "
-                    f"> ceiling ${risk_ceiling:.2f} ({max_risk_cap:.2f}% x1.25 of ${sim_equity:.2f})"
-                )
-                diagnostics.append(msg)
-                trade_blocks.append(msg)
-                add_bot_log(msg)
-                continue
 
             is_long = cand["direction"] == "LONG"
             sl_raw = (price - risk_dist) if is_long else (price + risk_dist)
@@ -1529,7 +1391,6 @@ class LiveAccountTradingBot:
                 "takeProfit": tp_str,
                 "slTriggerBy": "MarkPrice",
                 "positionIdx": 0,
-                "orderLinkId": f"{bybit_sym}-{cand['latest_bar_ms']}-{cand['direction'][0]}"[:36],
             })
             if res.get("retCode") == 0:
                 open_syms.add(bybit_sym)
@@ -1562,10 +1423,6 @@ class LiveAccountTradingBot:
                 order_rejections.append(rej_msg)
                 add_bot_log(f"ORDER REJECTED: {rej_msg}")
 
-        for _w in self.api_warnings[-5:]:
-            diagnostics.append(f"API warning: {_w}")
-            add_bot_log(f"[API WARNING] {_w}")
-        self.api_warnings.clear()
         summary_detail = top_wait_tuple[1] if top_wait_tuple else (diagnostics[0] if diagnostics else "All pairs scanned")
         dry_tag = " [DRY-RUN]" if not live_orders_armed else ""
         mode_tag = f"Active ({daily_total_trades} today • A+/A/B+/B){dry_tag}"
@@ -1592,7 +1449,6 @@ class LiveAccountTradingBot:
             "ok": True,
             "coins_scanned": coins_scanned_count,
             "daily_total_trades": daily_total_trades,
-            "daily_drawdown_pct": round(float(daily_drawdown_pct), 3),
             "open_positions_count": len(open_syms),
             "radar_signals": radar_signals,
             "ml_model_version": master.get("version", f"LIVE_PORTFOLIO_{len(portfolio)}C"),
