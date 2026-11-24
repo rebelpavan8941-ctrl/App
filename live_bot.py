@@ -134,7 +134,9 @@ class LiveAccountTradingBot:
         self.api_warnings = []
 
         self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
+        from urllib3.util.retry import Retry
+        _retry = Retry(total=2, connect=2, read=0, status=0, backoff_factor=0.6)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12, max_retries=_retry)
         self.session.mount("https://", adapter)
 
     def _load_state(self) -> dict:
@@ -304,7 +306,8 @@ class LiveAccountTradingBot:
                     return {"retCode": -1, "retMsg": f"Network error on {path}: {e} (verify position on exchange before retrying)"}
                 continue
         if last_err:
-            raise last_err
+            _tried = ", ".join(str(h).replace("https://", "") for h in self.host_candidates)
+            raise ConnectionError(f"Bybit unreachable (network/DNS problem on this phone). Tried: {_tried}. Last error: {type(last_err).__name__}") from last_err
         return {}
 
     def _get_instrument_filters(self, bybit_symbol: str):
@@ -932,8 +935,9 @@ class LiveAccountTradingBot:
                         "side": "LONG" if str(item.get("side", "")).lower() == "buy" else "SHORT",
                         "qty": item.get("size", "0"),
                     })
-        except Exception:
+        except Exception as _e_pos:
             open_positions = []
+            closed.append({"symbol": "ALL", "ok": False, "error": f"Could not fetch positions: {_e_pos}"})
         try:
             self._bybit_request("POST", "/v5/order/cancel-all", body={"category": self.category, "settleCoin": "USDT"})
         except Exception:
@@ -1078,16 +1082,28 @@ class LiveAccountTradingBot:
         except Exception:
             pass
 
-        # Warn (do not block) if account is not in Isolated margin
-        if live_orders_armed and not getattr(self, "_margin_checked", False):
+        # Margin mode: check at most every 6h; auto-switch to Isolated only when no position is open
+        if live_orders_armed and (int(time.time() * 1000) - int(state.get("margin_check_ms", 0) or 0)) > 6 * 3600 * 1000:
             try:
                 _ai = self._bybit_request("GET", "/v5/account/info", {})
                 _mm = str(_ai.get("result", {}).get("marginMode", ""))
-                self._margin_checked = True
-                if _mm and _mm != "ISOLATED_MARGIN":
-                    _mm_msg = f"Account margin mode is {_mm}, but the app says Isolated. Switch to Isolated Margin in Bybit."
-                    diagnostics.append(_mm_msg)
-                    add_bot_log(f"[WARNING] {_mm_msg}")
+                if _mm == "ISOLATED_MARGIN":
+                    state["margin_check_ms"] = int(time.time() * 1000)
+                elif _mm:
+                    _pos_chk = self._bybit_request("GET", "/v5/position/list", {"category": self.category, "settleCoin": "USDT"})
+                    _has_pos = any(float(i.get("size", 0.0) or 0.0) > 0.0 for i in _pos_chk.get("result", {}).get("list", []))
+                    if _has_pos:
+                        add_bot_log(f"[MARGIN] Account is {_mm}; will switch to Isolated once all positions are closed.")
+                        state["margin_check_ms"] = int(time.time() * 1000) - int(5.5 * 3600 * 1000)
+                    else:
+                        _sw = self._bybit_request("POST", "/v5/account/set-margin-mode", body={"setMarginMode": "ISOLATED_MARGIN"})
+                        _reasons = (_sw.get("result") or {}).get("reasons") or []
+                        state["margin_check_ms"] = int(time.time() * 1000)
+                        if int(_sw.get("retCode", -1)) == 0 and not _reasons:
+                            add_bot_log(f"[MARGIN] Switched account from {_mm} to ISOLATED_MARGIN.")
+                        else:
+                            _why = "; ".join(str(r.get("reasonMsg", "")) for r in _reasons) or str(_sw.get("retMsg", ""))
+                            add_bot_log(f"[MARGIN] Could not switch to Isolated ({_why}). Set it manually in the Bybit app.")
             except Exception:
                 pass
 
