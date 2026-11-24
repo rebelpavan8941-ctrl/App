@@ -146,7 +146,7 @@ class LiveAccountTradingBot:
                     return json.load(f)
             except Exception:
                 try:
-                    with open(self.state_path + ".bak", "r", encoding="utf-8-sig") as bf:
+                    with open(self.state_path + ".prev", "r", encoding="utf-8-sig") as bf:
                         return json.load(bf)
                 except Exception:
                     pass
@@ -173,7 +173,7 @@ class LiveAccountTradingBot:
         }
 
     def _save_state(self, state: dict):
-        tmp_path = self.state_path + ".tmp"
+        tmp_path = self.state_path + ".writing"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
             f.flush()
@@ -184,7 +184,7 @@ class LiveAccountTradingBot:
         if os.path.exists(self.state_path):
             try:
                 import shutil
-                shutil.copy2(self.state_path, self.state_path + ".bak")
+                shutil.copy2(self.state_path, self.state_path + ".prev")
             except Exception:
                 pass
         os.replace(tmp_path, self.state_path)
@@ -757,9 +757,20 @@ class LiveAccountTradingBot:
             self._booster_cache.pop(oldest_key, None)
 
         sanitized_dict = _sanitize_xgb_model_json(model_dict)
+        # 1) In-memory load: no temp file, so nothing can delete it or collide with another thread
+        try:
+            booster = xgb.Booster()
+            booster.load_model(bytearray(json.dumps(sanitized_dict).encode("utf-8")))
+            self._booster_cache[cache_key] = booster
+            return booster
+        except Exception:
+            pass
+        # 2) Fallback: temp file whose name is unique per thread and per call
+        import threading
+        import uuid
         booster = xgb.Booster()
         os.makedirs(self.live_dir, exist_ok=True)
-        tmp_path = os.path.join(self.live_dir, f"_tmp_live_{cache_key}_{os.getpid()}.json")
+        tmp_path = os.path.join(self.live_dir, f"_tmp_live_{cache_key}_{os.getpid()}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(sanitized_dict, f)
@@ -1357,7 +1368,6 @@ class LiveAccountTradingBot:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
-                order_rejections.append(msg)
                 add_bot_log(msg)
                 break
             if len(open_syms) >= 1:
@@ -1369,7 +1379,6 @@ class LiveAccountTradingBot:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT too low (${avail_usdt:.2f} < $2.00)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
-                order_rejections.append(msg)
                 add_bot_log(msg)
                 break
             if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
