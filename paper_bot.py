@@ -768,7 +768,7 @@ class PaperStrategyTrainerAndTester:
                 losses = arr[arr < 0]
                 total_trades = int(len(arr))
                 wr = round((len(wins) / total_trades * 100.0), 2) if total_trades > 0 else 0.0
-                pf = round(float(wins.sum() / abs(losses.sum())), 2) if len(losses) > 0 else round(float(wins.sum()), 2)
+                pf = round(float(wins.sum() / abs(losses.sum())), 2) if len(losses) > 0 else (5.0 if total_trades >= min_req_trades else 1.0)
                 net_usdt = round(float(equity - initial_capital), 2)
                 net_pct = round((net_usdt / initial_capital) * 100.0, 2)
                 sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
@@ -877,7 +877,7 @@ class PaperStrategyTrainerAndTester:
             if len(raw_4h) >= 210:
                 df_4h = self.build_matrix(raw_4h, max_dd=dd_atr, expansion=exp_atr, horizon=hor_bars)
                 if not df_4h.empty:
-                    htf_trend = df_4h["Supertrend"]
+                    htf_trend = df_4h["Supertrend"].shift(1).fillna(0)
                 del df_4h
 
             best_candidate = None
@@ -1151,7 +1151,12 @@ class PaperStrategyTrainerAndTester:
             l_pnl = float(l_data.get("net_pnl_usdt", l_stats.get("net_pnl_usdt", 0.0))) if isinstance(l_data, dict) else 0.0
 
             is_new_coin = sym not in live_portfolio
-            is_better = (p_wr > l_wr and p_pf >= l_pf and p_pnl > 0) or (is_new_coin and p_wr >= 52.0 and p_pf >= 1.25 and p_pnl > 0)
+            MIN_PROMOTE_TRADES = 20
+            p_trades = int(p_stats.get("trades", 0) or 0)
+            is_better = p_trades >= MIN_PROMOTE_TRADES and (
+                (p_wr > l_wr and p_pf >= l_pf and p_pnl > 0)
+                or (is_new_coin and p_wr >= 52.0 and p_pf >= 1.25 and p_pnl > 0)
+            )
 
             comparisons.append({
                 "symbol": sym,
