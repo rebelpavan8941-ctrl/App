@@ -4,11 +4,13 @@ import sys
 import json
 import time
 import glob
+import datetime
 import requests
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 
+IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 BYBIT_TAKER_FEE = 0.00055    # 0.055% per side (0.11% round-trip for Crypto)
 FOREX_HALF_SPREAD = 0.00006  # 0.6 pip per side (1.2 pips = 0.012% round-trip for Forex)
 MAX_LEVERAGE = 20
@@ -111,12 +113,14 @@ class PaperStrategyTrainerAndTester:
     def __init__(self, paper_dir: str, models_dir: str):
         self.paper_dir = paper_dir
         self.models_dir = models_dir
+        self.live_dir = os.path.join(os.path.dirname(paper_dir), "LIVE_ACCOUNT")
         self.paper_master_path = os.path.join(models_dir, "PAPER", "UNIFIED_PORTFOLIO_MASTER.json")
         self.paper_history_dir = os.path.join(models_dir, "PAPER", "history")
         self.live_master_path = os.path.join(models_dir, "LIVE", "UNIFIED_PORTFOLIO_MASTER.json")
         self.legacy_master_path = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
         self.paper_results_path = os.path.join(paper_dir, "paper_trained_results.json")
         self.comparison_path = os.path.join(paper_dir, "paper_vs_live_comparison.json")
+        self.analysis_report_path = os.path.join(paper_dir, "agentic_model_analysis.json")
         self.discovered_strats_path = os.path.join(paper_dir, "ai_discovered_strategies.json")
         self.adopted_strats_path = os.path.join(paper_dir, "ai_adopted_strategies.json")
         self.rate_limit_remaining = 120
@@ -127,6 +131,7 @@ class PaperStrategyTrainerAndTester:
         self.session.mount("https://", adapter)
 
         os.makedirs(paper_dir, exist_ok=True)
+        os.makedirs(self.live_dir, exist_ok=True)
         os.makedirs(os.path.join(models_dir, "PAPER"), exist_ok=True)
         os.makedirs(self.paper_history_dir, exist_ok=True)
         os.makedirs(os.path.join(models_dir, "LIVE"), exist_ok=True)
@@ -201,7 +206,7 @@ class PaperStrategyTrainerAndTester:
                 pf = float(cdata.get("profit_factor", 0.0))
                 wr = float(cdata.get("win_rate_pct", 0.0))
                 trades = int(cdata.get("trades", 0))
-                if pnl > 0.0 and pf >= 1.15 and trades >= 4:
+                if pnl > 0.0 and pf >= 1.25 and trades >= 14:
                     best_cfg = dict(cdata.get("config", {}))
                     spec = dict(self.dynamic_strategies[sid])
                     spec["adopted_at"] = int(time.time())
@@ -210,11 +215,11 @@ class PaperStrategyTrainerAndTester:
                     spec["proven_win_rate_pct"] = wr
                     spec["proven_net_pnl_usdt"] = pnl
                     spec["fixed_config"] = {
-                        "long_thresh": best_cfg.get("long_thresh", 0.28),
-                        "short_thresh": best_cfg.get("short_thresh", 0.28),
-                        "sl_atr": best_cfg.get("sl_atr", 1.30),
+                        "long_thresh": best_cfg.get("long_thresh", 0.24),
+                        "short_thresh": best_cfg.get("short_thresh", 0.24),
+                        "sl_atr": best_cfg.get("sl_atr", 1.25),
                         "tp1_rr": best_cfg.get("tp1_rr", 1.90),
-                        "tp2_rr": best_cfg.get("tp2_rr", 3.30),
+                        "tp2_rr": best_cfg.get("tp2_rr", 3.40),
                         "trail_atr": best_cfg.get("trail_atr", 1.80),
                         "timeframe": best_cfg.get("timeframe", "1H"),
                         "mtf_alignment_mode": best_cfg.get("mtf_alignment_mode", "SOFT"),
@@ -232,10 +237,9 @@ class PaperStrategyTrainerAndTester:
         """Auto-removes Gemini strategies failing Paper backtest thresholds or Live performance."""
         try:
             import ai_regime_copilot
-            live_dir_guess = os.path.join(os.path.dirname(self.paper_dir), "LIVE_ACCOUNT")
             prune_res = ai_regime_copilot.prune_underperforming_gemini_strategies(
                 paper_dir=self.paper_dir,
-                live_dir=live_dir_guess,
+                live_dir=self.live_dir,
                 models_dir=self.models_dir,
             )
             if prune_res.get("removed"):
@@ -265,7 +269,7 @@ class PaperStrategyTrainerAndTester:
                                 runs.append(m)
                     if runs:
                         best_r = max(runs, key=lambda r: (float(r.get("net_pnl_usdt", 0.0)), float(r.get("profit_factor", 0.0))))
-                        if int(best_r.get("trades", 0)) < 4 or float(best_r.get("net_pnl_usdt", 0.0)) <= 0.0 or float(best_r.get("profit_factor", 0.0)) < 1.15:
+                        if int(best_r.get("trades", 0)) < 14 or float(best_r.get("net_pnl_usdt", 0.0)) <= 0.0 or float(best_r.get("profit_factor", 0.0)) < 1.25:
                             continue
                     kept[sid] = spec
                 if len(kept) != len(strats):
@@ -537,14 +541,14 @@ class PaperStrategyTrainerAndTester:
             y_s.iloc[-5:] = 1
 
         params = dict(
-            n_estimators=105,
-            max_depth=3,
-            learning_rate=0.045,
-            subsample=0.80,
-            colsample_bytree=0.80,
-            min_child_weight=5,
-            reg_alpha=0.5,
-            reg_lambda=1.5,
+            n_estimators=125,
+            max_depth=4,
+            learning_rate=0.04,
+            subsample=0.82,
+            colsample_bytree=0.82,
+            min_child_weight=4,
+            reg_alpha=0.4,
+            reg_lambda=1.4,
             n_jobs=2,
             eval_metric="logloss",
             random_state=42,
@@ -593,8 +597,6 @@ class PaperStrategyTrainerAndTester:
             )
 
         curr_open = test_df["Open"].to_numpy()[1:]
-        prev_close = test_df["Close"].to_numpy()[:-1]
-        prev_open = test_df["Open"].to_numpy()[:-1]
         prev_ema50_d = test_df["Dist_EMA50"].to_numpy()[:-1]
 
         if relaxed:
@@ -618,7 +620,6 @@ class PaperStrategyTrainerAndTester:
         p_e20 = test_df["EMA_20"].to_numpy()[:-1]
         p_e50 = test_df["EMA_50"].to_numpy()[:-1]
         p_macd = test_df["MACD_Hist"].to_numpy()[:-1]
-        p_d20 = test_df["Dist_EMA20"].to_numpy()[:-1]
         p_d200 = test_df["Dist_EMA200"].to_numpy()[:-1]
         p_vwap = test_df["VWAP_Dev"].to_numpy()[:-1]
 
@@ -713,41 +714,42 @@ class PaperStrategyTrainerAndTester:
         round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (BYBIT_TAKER_FEE * 2.0)
         dyn_spec = self.dynamic_strategies.get(strategy_id)
 
+        # Wide sweep covering BOTH 110-150 high-frequency setups (0.18-0.26) AND high-PF sniper setups (0.30-0.38)
         param_configs = [
-            (0.18, 1.05, 1.60, False, 1.8),
-            (0.24, 1.15, 1.75, False, 1.8),
-            (0.30, 1.30, 1.90, True, 1.8),
-            (0.36, 1.45, 2.05, True, 1.8),
-            (0.42, 1.65, 2.20, True, 1.8),
+            (0.16, 1.10, 1.75, False, 1.6),
+            (0.20, 1.20, 1.90, False, 1.7),
+            (0.24, 1.25, 2.00, False, 1.8),
+            (0.28, 1.35, 2.15, True, 1.8),
+            (0.34, 1.45, 2.30, True, 1.9),
         ] if is_forex else [
-            (0.22, 1.15, 1.70, False, 1.8),
-            (0.28, 1.25, 1.85, False, 1.8),
-            (0.34, 1.35, 2.00, True, 1.8),
-            (0.40, 1.50, 2.15, True, 1.8),
-            (0.46, 1.70, 2.35, True, 1.8),
+            (0.18, 1.15, 1.80, False, 1.6),
+            (0.22, 1.25, 1.95, False, 1.7),
+            (0.26, 1.30, 2.10, False, 1.8),
+            (0.30, 1.40, 2.25, True, 1.8),
+            (0.36, 1.50, 2.40, True, 1.9),
         ]
 
         if extended_param_sweep or dyn_spec is not None:
             param_configs.extend([
-                (0.20, 1.60, 2.40, False, 2.2),
-                (0.26, 1.80, 2.60, False, 2.4),
-                (0.32, 0.95, 1.55, False, 1.4),
-                (0.38, 1.95, 2.80, True, 2.5),
+                (0.19, 1.45, 2.35, False, 2.0),
+                (0.23, 1.60, 2.50, False, 2.1),
+                (0.27, 1.05, 1.70, False, 1.5),
+                (0.32, 1.70, 2.65, True, 2.2),
             ])
 
         if dyn_spec and isinstance(dyn_spec.get("fixed_config"), dict):
             fc = dyn_spec["fixed_config"]
             param_configs.insert(0, (
-                float(fc.get("long_thresh", 0.28)),
-                float(fc.get("sl_atr", 1.30)),
-                float(fc.get("tp1_rr", 1.90)),
+                float(fc.get("long_thresh", 0.24)),
+                float(fc.get("sl_atr", 1.25)),
+                float(fc.get("tp1_rr", 1.95)),
                 str(fc.get("mtf_alignment_mode", "SOFT")).upper() == "STRICT",
                 float(fc.get("trail_atr", 1.80)),
             ))
 
         if extra_quantile_thresholds:
             for qt in extra_quantile_thresholds:
-                param_configs.append((round(float(qt), 4), 1.25, 1.85, False, 1.9))
+                param_configs.append((round(float(qt), 4), 1.25, 1.95, False, 1.8))
 
         opens = test_df["Open"].to_numpy()
         highs = test_df["High"].to_numpy()
@@ -758,7 +760,6 @@ class PaperStrategyTrainerAndTester:
 
         f_long, f_short = self._compute_vectorized_filter_masks(test_df, strategy_id, relaxed=relaxed_filter)
 
-        min_req_trades = 4 if is_forex else 8
         best_eval = None
         best_score = -9999999.0
 
@@ -769,7 +770,7 @@ class PaperStrategyTrainerAndTester:
                 if mtf_mode_label == "OFF" and require_htf:
                     continue
 
-                tp2_rr = tp1_rr * 1.75
+                tp2_rr = tp1_rr * 1.80
                 cfg = {
                     "long_thresh": thresh,
                     "short_thresh": thresh,
@@ -842,8 +843,10 @@ class PaperStrategyTrainerAndTester:
                                 high_w = h
                             if h >= tp1 and not tp1_hit:
                                 tp1_hit = True
-                                sl = entry + 0.20 * (tp1 - entry)
-                            if tp1_hit:
+                                # Lock +0.35R risk-free on TP1 without choking TP2 runner
+                                sl = max(sl, entry + 0.35 * (tp1 - entry))
+                            # Engage ATR trailing only once price advances >= 75% toward TP2
+                            if tp1_hit and high_w >= entry + 0.75 * (tp2 - entry):
                                 tr_sl = high_w - trail_mult * atr
                                 if tr_sl > sl:
                                     sl = tr_sl
@@ -859,8 +862,10 @@ class PaperStrategyTrainerAndTester:
                                 low_w = l
                             if l <= tp1 and not tp1_hit:
                                 tp1_hit = True
-                                sl = entry - 0.20 * (entry - tp1)
-                            if tp1_hit:
+                                # Lock +0.35R risk-free on TP1 without choking TP2 runner
+                                sl = min(sl, entry - 0.35 * (entry - tp1))
+                            # Engage ATR trailing only once price advances >= 75% toward TP2
+                            if tp1_hit and low_w <= entry - 0.75 * (entry - tp2):
                                 tr_sl = low_w + trail_mult * atr
                                 if tr_sl < sl:
                                     sl = tr_sl
@@ -880,21 +885,36 @@ class PaperStrategyTrainerAndTester:
                 pf = round(float(wins.sum() / abs(losses.sum())), 2) if len(losses) > 0 else round(float(wins.sum()), 2)
                 net_usdt = round(float(equity - initial_capital), 2)
                 net_pct = round((net_usdt / initial_capital) * 100.0, 2)
-                sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
 
                 # Walk-forward two-half stability check against single-spike overfitting
                 half_idx = max(1, total_trades // 2)
                 first_half_pnl = float(arr[:half_idx].sum()) if total_trades >= 4 else net_usdt
                 second_half_pnl = float(arr[half_idx:].sum()) if total_trades >= 4 else net_usdt
-                walk_forward_mult = 1.15 if (first_half_pnl > 0.0 and second_half_pnl > 0.0) else 0.72
+                wf_both_positive = (total_trades >= 14 and first_half_pnl > 0.0 and second_half_pnl > 0.0)
+                walk_forward_mult = 1.20 if wf_both_positive else 0.75
+
+                # Dual-Tier Scoring:
+                # Tier A: High-Frequency Edge (85-175 trades, PF >= 1.50, WR >= 50%)
+                # Tier B: High-Precision Sniper Edge (18-84 trades, PF >= 2.15, WR >= 55%)
+                sniper_floor = 12 if is_forex else 18
+                freq_floor = 45 if is_forex else 85
+
+                is_tier_a = (total_trades >= freq_floor and pf >= 1.50 and wr >= 50.0 and net_usdt > 0)
+                is_tier_b_sniper = (sniper_floor <= total_trades < freq_floor and pf >= 2.15 and wr >= 55.0 and net_usdt > 0)
 
                 if total_trades == 0:
                     score = -100000.0
-                elif total_trades >= (4 if dyn_spec is not None else min_req_trades) and pf >= 1.20 and wr >= 48.0 and net_usdt > 0:
-                    score = ((net_usdt * (sample_conf / 3.5)) + (pf * 30.0) + (wr * 0.5)) * walk_forward_mult
-                elif total_trades >= min_req_trades and pf >= 1.10 and net_usdt > 0:
-                    score = ((net_usdt * 0.6) + (pf * 20.0) + (wr * 0.3)) * walk_forward_mult
-                elif total_trades >= min_req_trades:
+                elif is_tier_a:
+                    freq_bonus = 1.25 if (105 <= total_trades <= 165) else 1.10
+                    pf_bonus = min(pf, 4.0) * 42.0
+                    score = ((net_usdt * 1.45) + pf_bonus + (wr * 0.65)) * freq_bonus * walk_forward_mult
+                elif is_tier_b_sniper:
+                    # High-PF sniper coin (PF 2.5-3.5+ with fewer setups) scored on equal footing
+                    pf_bonus = min(pf, 4.5) * 58.0
+                    score = ((net_usdt * 1.75) + pf_bonus + (wr * 0.85)) * walk_forward_mult
+                elif total_trades >= sniper_floor and pf >= 1.25 and net_usdt > 0:
+                    score = ((net_usdt * 0.75) + (pf * 25.0) + (wr * 0.35)) * walk_forward_mult
+                elif total_trades >= sniper_floor:
                     score = -5000.0 + net_usdt + (pf * 15.0) + (wr * 0.2)
                 else:
                     score = -25000.0 + (total_trades * 150.0) + net_usdt
@@ -912,6 +932,8 @@ class PaperStrategyTrainerAndTester:
                             "net_pnl_pct": net_pct,
                             "net_pnl_usdt": net_usdt,
                             "net_pnl": net_usdt,
+                            "walk_forward_ok": wf_both_positive,
+                            "edge_tier": "HIGH_FREQ_110_150" if is_tier_a else ("SNIPER_HIGH_PF" if is_tier_b_sniper else "STANDARD"),
                         },
                     }
         return best_eval
@@ -939,6 +961,147 @@ class PaperStrategyTrainerAndTester:
         if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid or "orb" in sid:
             return "vwap_smc"
         return "default"
+
+    def _append_bot_log_to_state(self, state_file: str, lines: list):
+        if not lines:
+            return
+        try:
+            st = {}
+            if os.path.exists(state_file):
+                with open(state_file, "r", encoding="utf-8-sig") as f:
+                    st = json.load(f)
+            logs = st.setdefault("last_bot_logs", [])
+            logs.extend(lines)
+            st["last_bot_logs"] = logs[-80:]
+            with open(state_file, "w", encoding="utf-8") as wf:
+                json.dump(st, wf, indent=2)
+        except Exception:
+            pass
+
+    def agentic_analyze_and_auto_promote(self, trained_coins: dict) -> dict:
+        """
+        Agentic AI Post-Training Analyzer:
+        Evaluates all trained coins (both 110-150 trade High-Frequency winners AND
+        18-84 trade High-PF Sniper setups), logs per-coin verdicts, and automatically
+        promotes qualifying winners into LIVE/UNIFIED_PORTFOLIO_MASTER.json.
+        """
+        live_portfolio = {}
+        if os.path.exists(self.live_master_path):
+            try:
+                with open(self.live_master_path, "r", encoding="utf-8-sig") as f:
+                    live_portfolio = json.load(f).get("portfolio", {}) or {}
+            except Exception:
+                live_portfolio = {}
+
+        clock_str = datetime.datetime.now(IST_TZ).strftime("%H:%M:%S IST")
+        promoted_coins = []
+        held_coins = []
+        analysis_items = []
+        log_entries = []
+
+        ranked_coins = sorted(
+            trained_coins.items(),
+            key=lambda kv: (
+                float(kv[1].get("profit_factor", 0.0)) * 40.0 + float(kv[1].get("net_pnl_usdt", 0.0)),
+            ),
+            reverse=True,
+        )
+
+        for sym, cdata in ranked_coins:
+            if not isinstance(cdata, dict):
+                continue
+            st = cdata.get("stats", {}) or {}
+            trades = int(cdata.get("trades", st.get("trades", 0)))
+            wr = float(cdata.get("win_rate_pct", st.get("win_rate_pct", 0.0)))
+            pf = float(cdata.get("profit_factor", st.get("profit_factor", 0.0)))
+            pnl = float(cdata.get("net_pnl_usdt", st.get("net_pnl_usdt", 0.0)))
+            wf_ok = bool(st.get("walk_forward_ok", True))
+            is_fx = (classify_market(sym) == "FOREX")
+
+            sniper_min = 12 if is_fx else 18
+            freq_min = 45 if is_fx else 85
+
+            qualifies_freq = (trades >= freq_min and pf >= 1.50 and wr >= 50.0 and pnl > 0.0)
+            qualifies_sniper = (sniper_min <= trades < freq_min and pf >= 2.15 and wr >= 55.0 and pnl > 0.0)
+            qualifies = (qualifies_freq or qualifies_sniper) and (wf_ok or pf >= 2.30)
+
+            archetype = "HIGH-FREQ" if qualifies_freq else ("SNIPER-HIGH-PF" if qualifies_sniper else "SUB-THRESHOLD")
+            in_live = sym in live_portfolio
+
+            if in_live:
+                l_data = live_portfolio.get(sym, {})
+                l_pf = float(l_data.get("profit_factor", 0.0))
+                l_pnl = float(l_data.get("net_pnl_usdt", l_data.get("net_pnl", 0.0)))
+                l_trades = int(l_data.get("trades", 0))
+                beats_live = (
+                    (pf > l_pf and pnl >= l_pnl * 0.90)
+                    or (pnl > l_pnl * 1.05 and pf >= l_pf * 0.92)
+                    or (l_trades < sniper_min and trades >= sniper_min and pf >= 1.50)
+                )
+                should_promote = qualifies and beats_live
+                reason = (
+                    f"Upgraded Live ({archetype}: PF {l_pf:.2f}->{pf:.2f}, {trades} trades, WR {wr:.1f}%, +${pnl:.0f})"
+                    if should_promote
+                    else f"Kept existing Live champion (Paper PF {pf:.2f} vs Live PF {l_pf:.2f})"
+                )
+            else:
+                should_promote = qualifies
+                if should_promote:
+                    reason = f"Auto-Promoted ({archetype}: PF {pf:.2f}, WR {wr:.1f}%, {trades} trades, +${pnl:.0f})"
+                else:
+                    why_parts = []
+                    if trades < sniper_min:
+                        why_parts.append(f"low sample ({trades}<{sniper_min})")
+                    if pnl <= 0.0:
+                        why_parts.append(f"negative PnL (${pnl:.0f})")
+                    elif trades >= freq_min and pf < 1.50:
+                        why_parts.append(f"PF {pf:.2f}<1.50")
+                    elif trades < freq_min and pf < 2.15:
+                        why_parts.append(f"Sniper PF {pf:.2f}<2.15")
+                    if wr < 50.0:
+                        why_parts.append(f"WR {wr:.1f}%<50%")
+                    if not wf_ok and pf < 2.30:
+                        why_parts.append("uneven walk-forward")
+                    reason = f"Held in Paper ({', '.join(why_parts) or 'below live bar'})"
+
+            if should_promote and self.move_coin_to_live_model(sym):
+                promoted_coins.append(sym)
+                log_entries.append(f"[{clock_str}] [AGENTIC AI PROMOTE] {sym}: {reason}")
+            else:
+                held_coins.append(sym)
+                log_entries.append(f"[{clock_str}] [AGENTIC AI AUDIT] {sym}: {reason}")
+
+            analysis_items.append({
+                "symbol": sym,
+                "archetype": archetype,
+                "trades": trades,
+                "win_rate_pct": wr,
+                "profit_factor": pf,
+                "net_pnl_usdt": pnl,
+                "walk_forward_ok": wf_ok,
+                "auto_promoted": should_promote,
+                "verdict": reason,
+            })
+
+        summary_msg = (
+            f"Agentic AI Model Audit: Auto-promoted {len(promoted_coins)}/{len(analysis_items)} coins to Live "
+            f"({', '.join(promoted_coins) if promoted_coins else 'None qualified'})."
+        )
+        log_entries.insert(0, f"[{clock_str}] {summary_msg}")
+
+        report = {
+            "analyzed_at": int(time.time()),
+            "summary": summary_msg,
+            "promoted_coins": promoted_coins,
+            "held_coins": held_coins,
+            "coins": analysis_items,
+        }
+        with open(self.analysis_report_path, "w", encoding="utf-8") as rf:
+            json.dump(report, rf, indent=2)
+
+        self._append_bot_log_to_state(os.path.join(self.paper_dir, "paper_engine_state.json"), log_entries)
+        self._append_bot_log_to_state(os.path.join(self.live_dir, "live_engine_state.json"), log_entries)
+        return report
 
     def train_and_evaluate_paper_coins(
         self,
@@ -978,7 +1141,6 @@ class PaperStrategyTrainerAndTester:
                 seen_archetypes.add(arch)
                 strategies_to_test.append(s)
 
-        # Load existing Paper champions so already-present coins only upgrade when retrain beats them
         existing_paper_portfolio = {}
         if os.path.exists(self.paper_master_path):
             try:
@@ -1003,7 +1165,8 @@ class PaperStrategyTrainerAndTester:
             exp_atr = 0.90 if is_fx else 1.15
             dd_atr = 0.85 if is_fx else 0.95
             hor_bars = 12 if is_fx else 10
-            min_req_trades = 4 if is_fx else 8
+            sniper_floor = 12 if is_fx else 18
+            freq_floor = 45 if is_fx else 85
 
             htf_trend = None
             raw_4h = self.fetch_bybit_history(symbol, timeframe="4h", days=TRAINING_WINDOW_DAYS)
@@ -1099,13 +1262,16 @@ class PaperStrategyTrainerAndTester:
             cur_trades = best_candidate["stats"]["trades"] if best_candidate else 0
             cur_pnl = best_candidate["stats"]["net_pnl_usdt"] if best_candidate else -999.0
             cur_pf = best_candidate["stats"]["profit_factor"] if best_candidate else 0.0
+            passes_either_tier = (cur_trades >= freq_floor and cur_pf >= 1.50 and cur_pnl > 0.0) or (
+                sniper_floor <= cur_trades < freq_floor and cur_pf >= 2.15 and cur_pnl > 0.0
+            )
 
-            if (cur_trades < min_req_trades or cur_pnl <= 0.0 or cur_pf < 1.15) and cached_tf_bundles:
+            if (not passes_either_tier) and cached_tf_bundles:
                 for tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds, htf_dir_aligned in cached_tf_bundles:
                     q_thresholds = sorted(set([
-                        float(np.quantile(np.maximum(p_long, p_short), 0.72)),
-                        float(np.quantile(np.maximum(p_long, p_short), 0.80)),
-                        float(np.quantile(np.maximum(p_long, p_short), 0.88)),
+                        float(np.quantile(np.maximum(p_long, p_short), 0.65)),
+                        float(np.quantile(np.maximum(p_long, p_short), 0.75)),
+                        float(np.quantile(np.maximum(p_long, p_short), 0.85)),
                     ]))
                     eval_res = self._simulate_strategy_on_tf(
                         test_df=test_df,
@@ -1126,6 +1292,7 @@ class PaperStrategyTrainerAndTester:
                     if best_candidate is None or eval_res["score"] > best_candidate["score"]:
                         cur_trades = st["trades"]
                         cur_pnl = st["net_pnl_usdt"]
+                        cur_pf = st["profit_factor"]
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
                         cfg["strategy"] = f"Adaptive Tuned XGBoost ({tf.upper()} • MTF:{best_mtf})"
@@ -1144,8 +1311,8 @@ class PaperStrategyTrainerAndTester:
                             },
                         }
 
-            if (cur_trades < min_req_trades or cur_pnl <= 0.0) and cached_tf_bundles:
-                for tf, raw, _, _, _, _, _, _, _, htf_dir_aligned in [b for b in cached_tf_bundles if b[0] in ("1h", "4h")]:
+            if (cur_trades < sniper_floor or cur_pnl <= 0.0) and cached_tf_bundles:
+                for tf, raw, _, _, _, _, _, _, _, htf_dir_aligned in [b for b in cached_tf_bundles if b[0] in ("30m", "1h", "4h")]:
                     df_sens = self.build_matrix(raw, max_dd=1.15, expansion=0.75, horizon=14)
                     if len(df_sens) < 180:
                         continue
@@ -1159,8 +1326,8 @@ class PaperStrategyTrainerAndTester:
                     pl2 = clf_l2.predict_proba(X_test_s)[:, 1]
                     ps2 = clf_s2.predict_proba(X_test_s)[:, 1]
                     q_sens = sorted(set([
-                        float(np.quantile(np.maximum(pl2, ps2), 0.72)),
-                        float(np.quantile(np.maximum(pl2, ps2), 0.82)),
+                        float(np.quantile(np.maximum(pl2, ps2), 0.66)),
+                        float(np.quantile(np.maximum(pl2, ps2), 0.78)),
                     ]))
                     htf_sens = None
                     if tf != "4h" and htf_trend is not None and not htf_trend.empty:
@@ -1228,25 +1395,30 @@ class PaperStrategyTrainerAndTester:
                 "models": best_candidate["models"],
             }
 
-            # Champion vs Challenger: only replace existing Paper coin if new retrain beats it
+            # Champion vs Challenger: accept new model if it improves PF/PnL OR expands a tiny sample into High-Freq
             prev_champ = existing_paper_portfolio.get(symbol)
             if isinstance(prev_champ, dict) and isinstance(prev_champ.get("models"), dict):
+                old_trades = int(prev_champ.get("trades", 0))
                 old_pf = float(prev_champ.get("profit_factor", 0.0))
                 old_pnl = float(prev_champ.get("net_pnl_usdt", prev_champ.get("net_pnl", 0.0)))
                 old_wr = float(prev_champ.get("win_rate_pct", 0.0))
+                new_trades = int(st["trades"])
                 new_pf = float(st["profit_factor"])
                 new_pnl = float(st["net_pnl_usdt"])
                 new_wr = float(st["win_rate_pct"])
 
-                improved = (
+                freq_expanded = (old_trades < freq_floor and new_trades >= freq_floor and new_pf >= 1.50 and new_pnl > 0.0)
+                improved = freq_expanded or (
                     new_pnl > 0.0
+                    and new_trades >= sniper_floor
                     and (
-                        (new_pf > old_pf and new_pnl >= old_pnl * 0.95)
-                        or (new_pnl > old_pnl and new_pf >= old_pf * 0.95)
+                        (new_pf > old_pf and new_pnl >= old_pnl * 0.92)
+                        or (new_pnl > old_pnl and new_pf >= old_pf * 0.92)
                         or (new_wr > old_wr + 3.0 and new_pf >= old_pf and new_pnl > 0.0)
                     )
                 )
-                if not improved and old_pnl > 0.0 and old_pf >= 1.15:
+                old_valid = (old_trades >= freq_floor and old_pf >= 1.50) or (sniper_floor <= old_trades < freq_floor and old_pf >= 2.15)
+                if not improved and old_valid and old_pnl > 0.0:
                     coin_entry = dict(prev_champ)
                     coin_entry["tested_matrix"] = all_tf_runs
 
@@ -1282,6 +1454,7 @@ class PaperStrategyTrainerAndTester:
         self._prune_old_trained_models(keep_latest=MAX_KEPT_MODEL_VERSIONS)
 
         self.auto_compare_with_live(trained_coins)
+        self.agentic_analyze_and_auto_promote(trained_coins)
         gc.collect()
         return trained_coins
 
@@ -1297,6 +1470,7 @@ class PaperStrategyTrainerAndTester:
         comparisons = []
         for sym, p_data in paper_coins_dict.items():
             p_stats = p_data.get("stats", {})
+            p_trades = int(p_data.get("trades", p_stats.get("trades", 0)))
             p_wr = float(p_stats.get("win_rate_pct", 0.0))
             p_pf = float(p_stats.get("profit_factor", 0.0))
             p_pnl = float(p_stats.get("net_pnl_usdt", 0.0))
@@ -1307,8 +1481,14 @@ class PaperStrategyTrainerAndTester:
             l_pf = float(l_data.get("profit_factor", l_stats.get("profit_factor", 0.0))) if isinstance(l_data, dict) else 0.0
             l_pnl = float(l_data.get("net_pnl_usdt", l_stats.get("net_pnl_usdt", 0.0))) if isinstance(l_data, dict) else 0.0
 
+            is_fx = (classify_market(sym) == "FOREX")
+            sniper_min = 12 if is_fx else 18
+            freq_min = 45 if is_fx else 85
+            qualifies = (p_trades >= freq_min and p_pf >= 1.50 and p_wr >= 50.0 and p_pnl > 0) or (
+                sniper_min <= p_trades < freq_min and p_pf >= 2.15 and p_wr >= 55.0 and p_pnl > 0
+            )
             is_new_coin = sym not in live_portfolio
-            is_better = (p_wr > l_wr and p_pf >= l_pf and p_pnl > 0) or (is_new_coin and p_wr >= 52.0 and p_pf >= 1.25 and p_pnl > 0)
+            is_better = (qualifies and p_pf >= l_pf and p_pnl > l_pnl * 0.90) or (is_new_coin and qualifies)
 
             comparisons.append({
                 "symbol": sym,
@@ -1512,4 +1692,4 @@ if __name__ == "__main__":
             crypto_enabled=crypto_enabled,
             forex_enabled=forex_enabled,
         )
-        print(f"Trained & evaluated {len(results)} Paper coins across 4.5 months (135 days) & OFF/SOFT/STRICT 4H MTF modes.")
+        print(f"Trained & evaluated {len(results)} Paper coins across 4.5 months (135 days) & auto-promoted qualifying winners to Live.")
