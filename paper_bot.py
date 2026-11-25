@@ -225,7 +225,6 @@ class PaperStrategyTrainerAndTester:
         except Exception:
             pass
 
-        # Built-in fallback pruning if ai_regime_copilot is unavailable
         for fpath in (self.discovered_strats_path, self.adopted_strats_path):
             if not os.path.exists(fpath):
                 continue
@@ -604,7 +603,6 @@ class PaperStrategyTrainerAndTester:
         p_vwap = test_df["VWAP_Dev"].to_numpy()[:-1]
 
         if "trendline" in sid:
-            # Non-repainting confirmed swing-pivot trendline bounce/rejection on closed bars
             highs_all = test_df["High"].to_numpy(dtype=float)
             lows_all = test_df["Low"].to_numpy(dtype=float)
             closes_all = test_df["Close"].to_numpy(dtype=float)
@@ -623,11 +621,10 @@ class PaperStrategyTrainerAndTester:
             sl_ptr = 0
             sh_ptr = 0
             for idx in range(1, n):
-                c_bar = idx - 1  # Last closed candle before entry
+                c_bar = idx - 1
                 atr_v = atrs_all[c_bar]
                 if atr_v <= 0 or adx_all[c_bar] < 17.0:
                     continue
-                # Only use pivots whose 3 right confirmation bars have fully closed (j <= c_bar - 3)
                 while sl_ptr < len(swing_lows) and swing_lows[sl_ptr][0] <= c_bar - 3:
                     sl_ptr += 1
                 while sh_ptr < len(swing_highs) and swing_highs[sh_ptr][0] <= c_bar - 3:
@@ -865,12 +862,18 @@ class PaperStrategyTrainerAndTester:
                 net_pct = round((net_usdt / initial_capital) * 100.0, 2)
                 sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
 
+                # Walk-forward two-half stability check against single-spike overfitting
+                half_idx = max(1, total_trades // 2)
+                first_half_pnl = float(arr[:half_idx].sum()) if total_trades >= 4 else net_usdt
+                second_half_pnl = float(arr[half_idx:].sum()) if total_trades >= 4 else net_usdt
+                walk_forward_mult = 1.15 if (first_half_pnl > 0.0 and second_half_pnl > 0.0) else 0.72
+
                 if total_trades == 0:
                     score = -100000.0
                 elif total_trades >= (4 if dyn_spec is not None else min_req_trades) and pf >= 1.20 and wr >= 48.0 and net_usdt > 0:
-                    score = (net_usdt * (sample_conf / 3.5)) + (pf * 30.0) + (wr * 0.5)
+                    score = ((net_usdt * (sample_conf / 3.5)) + (pf * 30.0) + (wr * 0.5)) * walk_forward_mult
                 elif total_trades >= min_req_trades and pf >= 1.10 and net_usdt > 0:
-                    score = (net_usdt * 0.6) + (pf * 20.0) + (wr * 0.3)
+                    score = ((net_usdt * 0.6) + (pf * 20.0) + (wr * 0.3)) * walk_forward_mult
                 elif total_trades >= min_req_trades:
                     score = -5000.0 + net_usdt + (pf * 15.0) + (wr * 0.2)
                 else:
@@ -954,6 +957,15 @@ class PaperStrategyTrainerAndTester:
             if arch not in seen_archetypes:
                 seen_archetypes.add(arch)
                 strategies_to_test.append(s)
+
+        # Load existing Paper champions so already-present coins only upgrade when retrain beats them
+        existing_paper_portfolio = {}
+        if os.path.exists(self.paper_master_path):
+            try:
+                with open(self.paper_master_path, "r", encoding="utf-8-sig") as ef:
+                    existing_paper_portfolio = json.load(ef).get("portfolio", {}) or {}
+            except Exception:
+                existing_paper_portfolio = {}
 
         filtered_coins = []
         for sym in added_coins:
@@ -1177,9 +1189,6 @@ class PaperStrategyTrainerAndTester:
                 continue
 
             st = best_candidate["stats"]
-            total_net_pnl += st["net_pnl_usdt"]
-            win_rates.append(st["win_rate_pct"])
-
             best_mtf_mode = best_candidate["cfg"].get("mtf_alignment_mode", "STRICT")
             coin_entry = {
                 "market": classify_market(symbol),
@@ -1198,6 +1207,31 @@ class PaperStrategyTrainerAndTester:
                 "config": best_candidate["cfg"],
                 "models": best_candidate["models"],
             }
+
+            # Champion vs Challenger: only replace existing Paper coin if new retrain beats it
+            prev_champ = existing_paper_portfolio.get(symbol)
+            if isinstance(prev_champ, dict) and isinstance(prev_champ.get("models"), dict):
+                old_pf = float(prev_champ.get("profit_factor", 0.0))
+                old_pnl = float(prev_champ.get("net_pnl_usdt", prev_champ.get("net_pnl", 0.0)))
+                old_wr = float(prev_champ.get("win_rate_pct", 0.0))
+                new_pf = float(st["profit_factor"])
+                new_pnl = float(st["net_pnl_usdt"])
+                new_wr = float(st["win_rate_pct"])
+
+                improved = (
+                    new_pnl > 0.0
+                    and (
+                        (new_pf > old_pf and new_pnl >= old_pnl * 0.95)
+                        or (new_pnl > old_pnl and new_pf >= old_pf * 0.95)
+                        or (new_wr > old_wr + 3.0 and new_pf >= old_pf and new_pnl > 0.0)
+                    )
+                )
+                if not improved and old_pnl > 0.0 and old_pf >= 1.15:
+                    coin_entry = dict(prev_champ)
+                    coin_entry["tested_matrix"] = all_tf_runs
+
+            total_net_pnl += float(coin_entry.get("net_pnl_usdt", 0.0))
+            win_rates.append(float(coin_entry.get("win_rate_pct", 0.0)))
             trained_coins[symbol] = coin_entry
             paper_portfolio[symbol] = coin_entry
 
