@@ -50,6 +50,35 @@ BYBIT_ERROR_HINTS = {
 }
 
 
+def _safe_float(val, default: float = 0.0) -> float:
+    if val is None:
+        return default
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return float(val) if math.isfinite(float(val)) else default
+    s = str(val).strip()
+    if not s:
+        return default
+    try:
+        num = float(s)
+        return num if math.isfinite(num) else default
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_int(val, default: int = 0) -> int:
+    if val is None:
+        return default
+    if isinstance(val, int) and not isinstance(val, bool):
+        return val
+    s = str(val).strip()
+    if not s:
+        return default
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return default
+
+
 def get_ist_session_name(dt_ist: datetime.datetime) -> str:
     hm = dt_ist.hour * 60 + dt_ist.minute
     if 330 <= hm < 810:      # 05:30 - 13:30 IST
@@ -130,7 +159,7 @@ class LiveAccountTradingBot:
         self._booster_cache = {}
         self._instrument_cache = {}
         self._trend_4h_cache = {}
-        self._ticker_cache = (0.0, {}, {})  # (ts, funding_rates, mark_prices)
+        self._ticker_cache = (0.0, {}, {})
 
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
@@ -204,7 +233,6 @@ class LiveAccountTradingBot:
         return {}
 
     def _fetch_tickers_cached(self) -> tuple:
-        """Single 45s cached call returning (funding_rates_dict, mark_prices_dict) to save battery."""
         now_s = time.time()
         c_ts, c_fr, c_px = self._ticker_cache
         if c_px and (now_s - c_ts) < 45.0:
@@ -218,17 +246,11 @@ class LiveAccountTradingBot:
                 if not sym:
                     continue
                 fr_raw = row.get("fundingRate", "")
-                if fr_raw not in ("", None):
-                    try:
-                        rates[sym] = float(fr_raw)
-                    except Exception:
-                        pass
-                px_raw = row.get("markPrice") or row.get("lastPrice") or ""
-                if px_raw not in ("", None):
-                    try:
-                        prices[sym] = float(px_raw)
-                    except Exception:
-                        pass
+                if str(fr_raw).strip() != "":
+                    rates[sym] = _safe_float(fr_raw, 0.0)
+                px_val = _safe_float(row.get("markPrice") or row.get("lastPrice"), 0.0)
+                if px_val > 0.0:
+                    prices[sym] = px_val
             if prices:
                 self._ticker_cache = (now_s, rates, prices)
         except Exception:
@@ -279,6 +301,21 @@ class LiveAccountTradingBot:
             raise last_err
         return {}
 
+    def _extract_available_usdt(self, bal_res: dict) -> float:
+        acct_list = bal_res.get("result", {}).get("list", [])
+        if not acct_list or not isinstance(acct_list[0], dict):
+            return 0.0
+        acct = acct_list[0]
+        raw_avail = str(acct.get("totalAvailableBalance", "")).strip()
+        if raw_avail != "":
+            return _safe_float(raw_avail, 0.0)
+        for c_item in acct.get("coin", []) or []:
+            if str(c_item.get("coin", "")).upper() == "USDT":
+                wb = _safe_float(c_item.get("walletBalance"), 0.0)
+                im = _safe_float(c_item.get("totalPositionIM"), 0.0) + _safe_float(c_item.get("totalOrderIM"), 0.0)
+                return max(0.0, wb - im)
+        return _safe_float(acct.get("totalEquity"), 0.0)
+
     def _get_instrument_filters(self, bybit_symbol: str):
         if bybit_symbol in self._instrument_cache:
             return self._instrument_cache[bybit_symbol]
@@ -288,18 +325,22 @@ class LiveAccountTradingBot:
             return None
         lot = items[0].get("lotSizeFilter", {})
         pf = items[0].get("priceFilter", {})
+        qty_step = str(lot.get("qtyStep", "")).strip() or "0.001"
+        tick_size = str(pf.get("tickSize", "")).strip() or "0.0001"
         res = (
-            lot.get("qtyStep", "0.001"),
-            float(lot.get("minOrderQty", "0.001")),
-            float(lot.get("minNotionalValue", "5.0")),
-            pf.get("tickSize", "0.0001"),
+            qty_step,
+            _safe_float(lot.get("minOrderQty"), 0.001),
+            _safe_float(lot.get("minNotionalValue"), 5.0),
+            tick_size,
         )
         self._instrument_cache[bybit_symbol] = res
         return res
 
     @staticmethod
     def _format_step(val: float, step_str: str, round_up: bool = False) -> str:
-        step = float(step_str)
+        step = _safe_float(step_str, 0.001)
+        if step <= 0.0:
+            step = 0.001
         scaled = math.ceil(val / step) * step if round_up else round(val / step) * step
         clean_step = step_str.rstrip("0")
         decimals = len(clean_step.split(".")[1]) if "." in clean_step else 0
@@ -321,13 +362,13 @@ class LiveAccountTradingBot:
 
     @staticmethod
     def _passes_anti_chase_guard(closed_bar: pd.Series, live_bar: pd.Series, side: str) -> tuple:
-        rsi = float(closed_bar.get("RSI_14", 50.0))
-        dist_ema20 = float(closed_bar.get("Dist_EMA20", 0.0))
-        ret_1h = float(closed_bar.get("Ret_1h", 0.0))
-        di_spread = float(closed_bar.get("DI_Spread", 0.0))
+        rsi = _safe_float(closed_bar.get("RSI_14"), 50.0)
+        dist_ema20 = _safe_float(closed_bar.get("Dist_EMA20"), 0.0)
+        ret_1h = _safe_float(closed_bar.get("Ret_1h"), 0.0)
+        di_spread = _safe_float(closed_bar.get("DI_Spread"), 0.0)
 
-        closed_px = float(closed_bar.get("Close", 0.0))
-        live_px = float(live_bar.get("Close", closed_px))
+        closed_px = _safe_float(closed_bar.get("Close"), 0.0)
+        live_px = _safe_float(live_bar.get("Close"), closed_px)
         intrabar_move = ((live_px - closed_px) / closed_px) if closed_px > 0 else 0.0
 
         if side == "SHORT":
@@ -377,7 +418,6 @@ class LiveAccountTradingBot:
             pass
 
     def _sync_virtual_positions(self, state: dict, mark_prices: dict, trail_ratio: float, now_ms: int, add_bot_log) -> list:
-        """Simulates SL, TP, +65% Break-Even, +70% Trailing Stop, and 8h Time-Stop for Dry-Run positions."""
         v_list = state.get("virtual_open_positions") or []
         if not v_list:
             return []
@@ -387,12 +427,12 @@ class LiveAccountTradingBot:
         for vp in v_list:
             sym = str(vp.get("symbol", "")).upper()
             side = str(vp.get("side", "LONG")).upper()
-            entry = float(vp.get("entry_price", 0.0))
-            qty = float(vp.get("qty", 0.0))
-            sl = float(vp.get("sl", 0.0))
-            tp = float(vp.get("tp", 0.0))
-            opened_ms = int(vp.get("opened_ms", now_ms))
-            mark = float(mark_prices.get(sym, vp.get("mark_price", entry)))
+            entry = _safe_float(vp.get("entry_price"), 0.0)
+            qty = _safe_float(vp.get("qty"), 0.0)
+            sl = _safe_float(vp.get("sl"), 0.0)
+            tp = _safe_float(vp.get("tp"), 0.0)
+            opened_ms = _safe_int(vp.get("opened_ms"), now_ms)
+            mark = _safe_float(mark_prices.get(sym), _safe_float(vp.get("mark_price"), entry))
             if mark <= 0.0:
                 mark = entry
 
@@ -404,7 +444,6 @@ class LiveAccountTradingBot:
             tp_dist = abs(tp - entry)
             profit_dist = (mark - entry) if is_long else (entry - mark)
 
-            # Update Break-Even at +65% TP & Trailing Stop at +70% TP
             if tp_dist > 0.0 and profit_dist >= tp_dist * 0.65:
                 be_sl = (entry + tp_dist * 0.15) if is_long else (entry - tp_dist * 0.15)
                 if (is_long and be_sl > sl) or ((not is_long) and be_sl < sl):
@@ -453,12 +492,12 @@ class LiveAccountTradingBot:
             return
         for row in res.get("result", {}).get("list", []):
             sym = str(row.get("symbol", "")).upper()
-            pnl = float(row.get("closedPnl", 0.0))
-            updated_ms = int(row.get("updatedTime", 0))
+            pnl = _safe_float(row.get("closedPnl"), 0.0)
+            updated_ms = _safe_int(row.get("updatedTime"), 0)
             order_id = str(row.get("orderId", f"{sym}_{updated_ms}"))
             if sym and pnl < 0.0 and updated_ms > 0 and (now_ms - updated_ms) < 4 * 60 * 60 * 1000:
                 target_cd = updated_ms + (4 * 60 * 60 * 1000)
-                if target_cd > int(loss_cd.get(sym, 0)):
+                if target_cd > _safe_int(loss_cd.get(sym), 0):
                     loss_cd[sym] = target_cd
 
             if sym and updated_ms > 0 and order_id not in reflected:
@@ -471,8 +510,8 @@ class LiveAccountTradingBot:
                         sym,
                         side_label,
                         pnl,
-                        float(row.get("avgEntryPrice", 0.0)),
-                        float(row.get("avgExitPrice", 0.0)),
+                        _safe_float(row.get("avgEntryPrice"), 0.0),
+                        _safe_float(row.get("avgExitPrice"), 0.0),
                     )
                     if ref_res.get("lesson"):
                         add_bot_log(f"[AGENTIC REFLECTION] {ref_res['lesson']}")
@@ -623,8 +662,8 @@ class LiveAccountTradingBot:
             if not df_4h.empty:
                 ref_bar = df_4h.iloc[-2] if len(df_4h) >= 2 else df_4h.iloc[-1]
                 st = int(ref_bar["Supertrend"])
-                adx = float(ref_bar.get("ADX", 20.0))
-                natr = float(ref_bar.get("NATR", 1.8))
+                adx = _safe_float(ref_bar.get("ADX"), 20.0)
+                natr = _safe_float(ref_bar.get("NATR"), 1.8)
                 self._trend_4h_cache[bybit_sym] = (now_s, st, adx, natr)
                 return st, adx, natr
         return 0, 20.0, 1.8
@@ -635,10 +674,10 @@ class LiveAccountTradingBot:
         for rule in rules:
             ind = str(rule.get("ind", ""))
             op = str(rule.get("op", ""))
-            val = float(rule.get("val", 0.0))
+            val = _safe_float(rule.get("val"), 0.0)
             if ind not in bar.index:
                 return False
-            actual = float(bar[ind])
+            actual = _safe_float(bar[ind], 0.0)
             if op == ">" and not (actual > val):
                 return False
             elif op == "<" and not (actual < val):
@@ -744,7 +783,7 @@ class LiveAccountTradingBot:
         if entry <= 0.0 or tp_dist <= 0.0:
             return False
         act_px = (entry + tp_dist * 0.70) if side == "LONG" else (entry - tp_dist * 0.70)
-        trail_dist = max(tp_dist * min(max(trail_ratio, 0.40), 0.50), float(tick_size) * 2.0)
+        trail_dist = max(tp_dist * min(max(trail_ratio, 0.40), 0.50), _safe_float(tick_size, 0.0001) * 2.0)
         try:
             t_res = self._bybit_request("POST", "/v5/position/trading-stop", body={
                 "category": self.category,
@@ -766,19 +805,19 @@ class LiveAccountTradingBot:
         active_list = []
 
         for item in res.get("result", {}).get("list", []):
-            size = float(item.get("size", 0.0))
+            size = _safe_float(item.get("size"), 0.0)
             if size <= 0.0:
                 continue
 
-            bybit_sym = item.get("symbol", "").upper()
-            side = "LONG" if item.get("side", "").lower() == "buy" else "SHORT"
-            entry = float(item.get("avgPrice", 0.0))
-            mark = float(item.get("markPrice", entry))
-            cur_sl = float(item.get("stopLoss", 0.0) or 0.0)
-            cur_tp = float(item.get("takeProfit", 0.0) or 0.0)
-            cur_trail = float(item.get("trailingStop", 0.0) or 0.0)
-            created_ms = int(item.get("createdTime", 0) or 0)
-            opened_ms = int(pos_opened_map.get(bybit_sym, created_ms or now_ms))
+            bybit_sym = str(item.get("symbol", "")).upper()
+            side = "LONG" if str(item.get("side", "")).lower() == "buy" else "SHORT"
+            entry = _safe_float(item.get("avgPrice"), 0.0)
+            mark = _safe_float(item.get("markPrice"), entry)
+            cur_sl = _safe_float(item.get("stopLoss"), 0.0)
+            cur_tp = _safe_float(item.get("takeProfit"), 0.0)
+            cur_trail = _safe_float(item.get("trailingStop"), 0.0)
+            created_ms = _safe_int(item.get("createdTime"), 0)
+            opened_ms = _safe_int(pos_opened_map.get(bybit_sym), created_ms or now_ms)
             pos_opened_map[bybit_sym] = opened_ms
 
             if entry > 0.0 and mark > 0.0 and cur_tp > 0.0:
@@ -881,10 +920,10 @@ class LiveAccountTradingBot:
             active_list.append({
                 "symbol": bybit_sym,
                 "side": side,
-                "qty": item.get("size", "0"),
+                "qty": str(item.get("size", "0")),
                 "entry_price": entry,
                 "mark_price": mark,
-                "unrealized_pnl": float(item.get("unrealisedPnl", 0.0)),
+                "unrealized_pnl": _safe_float(item.get("unrealisedPnl"), 0.0),
             })
         return active_list
 
@@ -961,8 +1000,8 @@ class LiveAccountTradingBot:
         curr_session = get_ist_session_name(now_ist)
 
         sess_data = session_stats.get(curr_session, {}) if isinstance(session_stats, dict) else {}
-        sess_wins = int(sess_data.get("wins", 0))
-        sess_losses = int(sess_data.get("losses", 0))
+        sess_wins = _safe_int(sess_data.get("wins"), 0)
+        sess_losses = _safe_int(sess_data.get("losses"), 0)
         sess_total = sess_wins + sess_losses
         session_prob_penalty = 0.03 if (sess_total >= 4 and (sess_wins / max(sess_total, 1)) < 0.35) else 0.0
 
@@ -976,20 +1015,20 @@ class LiveAccountTradingBot:
             state["daily_total_trades"] = 0
             add_bot_log(f"Daily Counter Auto-Renewed for {today_ist_str} (12:00 AM IST).")
 
-        daily_total_trades = int(state.get("daily_total_trades", 0))
+        daily_total_trades = _safe_int(state.get("daily_total_trades"), 0)
         now_ms = int(time.time() * 1000)
 
         self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log)
         funding_rates, mark_prices = self._fetch_tickers_cached() if crypto_enabled else ({}, {})
 
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
-        bal_ret_code = int(bal_res.get("retCode", -1)) if bal_res else -1
+        bal_ret_code = _safe_int(bal_res.get("retCode"), -1) if bal_res else -1
         if bal_ret_code != 0:
             bal_msg = bal_res.get("retMsg", "Unable to fetch Unified USDT balance")
             err_str = f"Bybit Wallet API Error [{bal_ret_code}]: {BYBIT_ERROR_HINTS.get(bal_ret_code, bal_msg)}"
             order_rejections.append(err_str)
             add_bot_log(err_str)
-        avail_usdt = float(bal_res.get("result", {}).get("list", [{}])[0].get("totalAvailableBalance", 0.0))
+        avail_usdt = self._extract_available_usdt(bal_res) if bal_ret_code == 0 else 0.0
 
         btc_macro_bearish = False
         btc_adx = 20.0
@@ -1044,8 +1083,8 @@ class LiveAccountTradingBot:
                     self._trend_4h_cache[sym_k] = (
                         now_s,
                         int(ref_bar["Supertrend"]),
-                        float(ref_bar.get("ADX", 20.0)),
-                        float(ref_bar.get("NATR", 1.8)),
+                        _safe_float(ref_bar.get("ADX"), 20.0),
+                        _safe_float(ref_bar.get("NATR"), 1.8),
                     )
 
         candidates = []
@@ -1094,7 +1133,7 @@ class LiveAccountTradingBot:
             direction = "LONG" if p_long >= p_short else "SHORT"
             raw_prob = p_long if direction == "LONG" else p_short
             default_th = 0.24 if market_type == "FOREX" else 0.28
-            req_thresh = float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh", default_th))
+            req_thresh = _safe_float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh"), default_th)
 
             if interval == "240":
                 trend_4h = int(closed_bar["Supertrend"])
@@ -1102,9 +1141,9 @@ class LiveAccountTradingBot:
                 cached_4h = self._trend_4h_cache.get(bybit_sym)
                 trend_4h = cached_4h[1] if cached_4h else 0
 
-            adx_val = float(closed_bar.get("ADX", 0.0))
+            adx_val = _safe_float(closed_bar.get("ADX"), 0.0)
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
-            high_conv_rev = (raw_prob >= req_thresh + 0.08) and (float(closed_bar["Vol_Surge"]) >= 1.25)
+            high_conv_rev = (raw_prob >= req_thresh + 0.08) and (_safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.25)
 
             decoupled_leader = raw_4h_ok and (adx_val >= 25.0) and (raw_prob >= req_thresh + 0.06)
             guard_blocked = (
@@ -1115,14 +1154,14 @@ class LiveAccountTradingBot:
                 and not decoupled_leader
             )
 
-            fr_val = float(funding_rates.get(bybit_sym, 0.0)) if market_type == "CRYPTO" else 0.0
+            fr_val = _safe_float(funding_rates.get(bybit_sym), 0.0) if market_type == "CRYPTO" else 0.0
             funding_blocked = (direction == "LONG" and fr_val > 0.0004) or (direction == "SHORT" and fr_val < -0.0004)
 
             effective_mtf = str(cfg.get("mtf_alignment_mode") or entry.get("mtf_alignment_mode") or mtf_mode).upper()
             if effective_mtf == "OFF":
                 mtf_aligned = not guard_blocked
             elif effective_mtf == "SOFT":
-                mtf_aligned = (raw_4h_ok or (raw_prob >= (req_thresh + 0.05) and float(closed_bar["Vol_Surge"]) >= 1.15)) and not guard_blocked
+                mtf_aligned = (raw_4h_ok or (raw_prob >= (req_thresh + 0.05) and _safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.15)) and not guard_blocked
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
@@ -1140,12 +1179,12 @@ class LiveAccountTradingBot:
                 "raw_prob": round(raw_prob, 4),
             })
 
-            if now_ms < int(restricted_until_ms.get(bybit_sym, 0)):
+            if now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0):
                 trade_blocks.append(f"{bybit_sym}: Contract agreement unsigned on Bybit [110126]")
                 continue
 
-            if now_ms < int(loss_cooldown_until_ms.get(bybit_sym, 0)):
-                rem_min = max(1, int((int(loss_cooldown_until_ms.get(bybit_sym, 0)) - now_ms) / 60000))
+            if now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0):
+                rem_min = max(1, int((_safe_int(loss_cooldown_until_ms.get(bybit_sym), 0) - now_ms) / 60000))
                 cd_msg = f"{bybit_sym} {direction} ({conv_pct}%): 4h post-loss cooldown active ({rem_min}m left)"
                 trade_blocks.append(cd_msg)
                 diagnostics.append(cd_msg)
@@ -1153,7 +1192,7 @@ class LiveAccountTradingBot:
                     top_wait_tuple = (conv_pct, cd_msg)
                 continue
 
-            if now_ms < int(agentic_veto_until_ms.get(bybit_sym, 0)):
+            if now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0):
                 trade_blocks.append(f"{bybit_sym}: Vetoed by Agentic AI Supervisor")
                 continue
 
@@ -1164,19 +1203,16 @@ class LiveAccountTradingBot:
             anti_chase_ok, chase_reason = self._passes_anti_chase_guard(closed_bar, live_bar, direction)
             strat_ok = self._strategy_entry_filter(
                 strat_id,
-                float(live_bar["Open"]),
+                _safe_float(live_bar["Open"], 0.0),
                 closed_bar,
                 direction,
                 relaxed=is_relaxed,
                 custom_rules=custom_rules,
             )
 
-            learned_score = float(agentic_coin_scores.get(disp_sym, 0.0))
+            learned_score = _safe_float(agentic_coin_scores.get(disp_sym), 0.0)
             effective_min_prob = max(req_thresh * 0.96, 0.22) + session_prob_penalty
-
-            # Allow A+, A, B+, and B setups all day (gated by Layer 1 Human AI + Focus Mode)
             grade_ok = (conv_pct >= 68) and raw_4h_ok and (adx_val >= 16.5) and (learned_score >= -10.0)
-
             quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 20.0 else 0.0) + (learned_score * 0.002)
 
             if mtf_aligned and strat_ok and anti_chase_ok and grade_ok and (not funding_blocked) and raw_prob >= effective_min_prob:
@@ -1259,8 +1295,8 @@ class LiveAccountTradingBot:
                 diagnostics.append(msg)
                 add_bot_log(msg)
                 continue
-            if (now_ms - int(last_trade_epoch_ms.get(bybit_sym, 0))) < 30 * 60 * 1000:
-                rem_m = max(1, int((30 * 60 * 1000 - (now_ms - int(last_trade_epoch_ms.get(bybit_sym, 0)))) / 60000))
+            if (now_ms - _safe_int(last_trade_epoch_ms.get(bybit_sym), 0)) < 30 * 60 * 1000:
+                rem_m = max(1, int((30 * 60 * 1000 - (now_ms - _safe_int(last_trade_epoch_ms.get(bybit_sym), 0))) / 60000))
                 msg = f"{bybit_sym} {cand['direction']} ({cand['conv_pct']}%) skipped: 30m trade cooldown ({rem_m}m left)"
                 diagnostics.append(msg)
                 add_bot_log(msg)
@@ -1277,11 +1313,13 @@ class LiveAccountTradingBot:
             live_bar = cand["live_bar"]
             closed_bar = cand["closed_bar"]
             cfg = cand["cfg"]
-            price = float(live_bar["Close"])
-            atr = float(closed_bar["ATR"])
+            price = _safe_float(live_bar["Close"], 0.0)
+            atr = _safe_float(closed_bar["ATR"], 0.0)
+            if price <= 0.0 or atr <= 0.0:
+                continue
 
-            sl_atr = max(float(cfg.get("sl_atr", 1.55)) * sl_mult, 1.50)
-            tp_rr = min(max(float(cfg.get("tp1_rr", 1.65)) * tp_mult, 1.50), 1.85)
+            sl_atr = max(_safe_float(cfg.get("sl_atr"), 1.55) * sl_mult, 1.50)
+            tp_rr = min(max(_safe_float(cfg.get("tp1_rr"), 1.65) * tp_mult, 1.50), 1.85)
 
             min_sl_floor = price * (0.0020 if cand["market_type"] == "FOREX" else 0.0155)
             risk_dist = max(sl_atr * atr, min_sl_floor)
@@ -1295,7 +1333,7 @@ class LiveAccountTradingBot:
                 add_bot_log(msg)
                 continue
 
-            conv_scale = self._conviction_risk_scale(float(cand.get("raw_prob", 0.3)), float(cand.get("req_thresh", 0.3)))
+            conv_scale = self._conviction_risk_scale(_safe_float(cand.get("raw_prob"), 0.3), _safe_float(cand.get("req_thresh"), 0.3))
             max_risk_cap = max(risk_per_trade_pct * 1.20, 2.50)
             scaled_risk_pct = min(max(risk_per_trade_pct * conv_scale, 0.50), max_risk_cap)
             risk_usdt = max(sim_equity * (scaled_risk_pct / 100.0), 0.15)
@@ -1308,7 +1346,6 @@ class LiveAccountTradingBot:
             sl_str = self._format_step(sl_raw, tick_size)
             tp_str = self._format_step(tp_raw, tick_size)
 
-            # Layer 1 Local Human Price-Action Brain v2 + Optional Gemini Shadow-Compare (Test Only)
             try:
                 import ai_regime_copilot
                 shadow_cfg_path = os.path.join(self.live_dir, "ai_shadow_config.json")
@@ -1325,8 +1362,8 @@ class LiveAccountTradingBot:
                     symbol=bybit_sym,
                     side=cand["direction"],
                     candles_df=cand.get("candles_df"),
-                    adx_val=float(cand.get("adx_val", 20.0)),
-                    funding_rate=float(cand.get("fr_val", 0.0)),
+                    adx_val=_safe_float(cand.get("adx_val"), 20.0),
+                    funding_rate=_safe_float(cand.get("fr_val"), 0.0),
                     session_name=curr_session,
                     gemini_enabled=gem_shadow_on,
                     gemini_api_key=gem_shadow_key,
@@ -1347,24 +1384,23 @@ class LiveAccountTradingBot:
                 add_bot_log(f"[LAYER 1 ERROR] {bybit_sym} {cand['direction']} skipped: {l1_err}")
                 continue
 
-            # VIRTUAL DRY-RUN MODE when Exchange Live Orders toggle is OFF
             if not live_orders_armed:
                 v_list = state.setdefault("virtual_open_positions", [])
                 v_list.append({
                     "symbol": bybit_sym,
                     "side": cand["direction"],
-                    "qty": float(qty_str),
+                    "qty": _safe_float(qty_str, 0.0),
                     "entry_price": price,
                     "mark_price": price,
-                    "sl": float(sl_str),
-                    "tp": float(tp_str),
+                    "sl": _safe_float(sl_str, 0.0),
+                    "tp": _safe_float(tp_str, 0.0),
                     "unrealized_pnl": 0.0,
                     "opened_ms": now_ms,
                 })
                 open_syms.add(bybit_sym)
                 traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
                 last_trade_epoch_ms[bybit_sym] = now_ms
-                daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
+                daily_coin_trades[bybit_sym] = _safe_int(daily_coin_trades.get(bybit_sym), 0) + 1
                 daily_total_trades += 1
                 state["daily_total_trades"] = daily_total_trades
                 live_trades_this_cycle += 1
@@ -1397,7 +1433,7 @@ class LiveAccountTradingBot:
                 traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
                 last_trade_epoch_ms[bybit_sym] = now_ms
                 pos_opened_map[bybit_sym] = now_ms
-                daily_coin_trades[bybit_sym] = int(daily_coin_trades.get(bybit_sym, 0)) + 1
+                daily_coin_trades[bybit_sym] = _safe_int(daily_coin_trades.get(bybit_sym), 0) + 1
                 daily_total_trades += 1
                 state["daily_total_trades"] = daily_total_trades
                 live_trades_this_cycle += 1
@@ -1413,7 +1449,7 @@ class LiveAccountTradingBot:
                     f"qty={qty_str} @ ~{price:.4f} | SL={sl_str} (MarkPrice) | TP={tp_str} ({tp_rr:.2f}R, Trail@70%={'ON' if native_ok else 'SYNC'})"
                 )
             else:
-                code = int(res.get("retCode", -1))
+                code = _safe_int(res.get("retCode"), -1)
                 raw_msg = str(res.get("retMsg", "Unknown Bybit rejection"))
                 hint = BYBIT_ERROR_HINTS.get(code, raw_msg)
                 if code == 110126:
@@ -1488,16 +1524,16 @@ if __name__ == "__main__":
         print(json.dumps({"ok": True, "closed": bot.emergency_close_all()}))
     elif api_key and api_secret:
         out = bot.run_live_cycle(
-            leverage=int(runtime_cfg.get("leverage", 10)),
-            risk_per_trade_pct=float(runtime_cfg.get("risk_per_trade_pct", 1.5)),
-            max_open_positions=int(runtime_cfg.get("max_open_positions", 2)),
+            leverage=_safe_int(runtime_cfg.get("leverage"), 10),
+            risk_per_trade_pct=_safe_float(runtime_cfg.get("risk_per_trade_pct"), 1.5),
+            max_open_positions=_safe_int(runtime_cfg.get("max_open_positions"), 2),
             crypto_enabled=bool(runtime_cfg.get("crypto_enabled", True)),
             forex_enabled=bool(runtime_cfg.get("forex_enabled", False)),
             live_orders_armed=bool(runtime_cfg.get("live_orders_armed", False)),
             mtf_mode=str(runtime_cfg.get("mtf_mode", "STRICT")),
             btc_macro_guard=bool(runtime_cfg.get("btc_macro_guard", True)),
-            daily_drawdown_pct=float(runtime_cfg.get("daily_drawdown_pct", 0.0)),
-            max_daily_loss_pct=float(runtime_cfg.get("max_daily_loss_pct", 3.0)),
+            daily_drawdown_pct=_safe_float(runtime_cfg.get("daily_drawdown_pct"), 0.0),
+            max_daily_loss_pct=_safe_float(runtime_cfg.get("max_daily_loss_pct"), 3.0),
             bot_logs_enabled=bool(runtime_cfg.get("bot_logs_enabled", True)),
         )
         print(json.dumps(out))
