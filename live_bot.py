@@ -1143,9 +1143,9 @@ class LiveAccountTradingBot:
 
             adx_val = _safe_float(closed_bar.get("ADX"), 0.0)
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
-            high_conv_rev = (raw_prob >= req_thresh + 0.08) and (_safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.25)
+            high_conv_rev = (raw_prob >= req_thresh + 0.06) and (_safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.15)
 
-            decoupled_leader = raw_4h_ok and (adx_val >= 25.0) and (raw_prob >= req_thresh + 0.06)
+            decoupled_leader = raw_4h_ok and (adx_val >= 22.0) and (raw_prob >= req_thresh + 0.04)
             guard_blocked = (
                 btc_macro_bearish
                 and direction == "LONG"
@@ -1161,13 +1161,50 @@ class LiveAccountTradingBot:
             if effective_mtf == "OFF":
                 mtf_aligned = not guard_blocked
             elif effective_mtf == "SOFT":
-                mtf_aligned = (raw_4h_ok or (raw_prob >= (req_thresh + 0.05) and _safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.15)) and not guard_blocked
+                mtf_aligned = (raw_4h_ok or (raw_prob >= (req_thresh + 0.04) and _safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.10)) and not guard_blocked
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
             disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
-            conv_pct = int(min(99, max(45, round((raw_prob / max(req_thresh, 0.16)) * 76 + (10 if raw_4h_ok else -8) + min(adx_val * 0.25, 8)))))
-            aligned_flag = bool(raw_4h_ok and not guard_blocked)
+
+            in_cooldown = (
+                now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0)
+                or now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
+                or now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0)
+                or bybit_sym in open_syms
+            )
+
+            anti_chase_ok, chase_reason = self._passes_anti_chase_guard(closed_bar, live_bar, direction)
+            strat_ok = self._strategy_entry_filter(
+                strat_id,
+                _safe_float(live_bar["Open"], 0.0),
+                closed_bar,
+                direction,
+                relaxed=is_relaxed,
+                custom_rules=custom_rules,
+            )
+
+            learned_score = _safe_float(agentic_coin_scores.get(disp_sym), 0.0)
+            effective_min_prob = max(req_thresh * 0.94, 0.21) + session_prob_penalty
+
+            # Balanced flow: allow 4H-aligned setups OR strong high-conviction setups (ADX >= 14.5)
+            mtf_or_momentum_ok = raw_4h_ok or (raw_prob >= effective_min_prob + 0.05 and adx_val >= 18.0)
+            base_conv = int(min(100, max(45, round((raw_prob / max(req_thresh, 0.16)) * 75 + (10 if raw_4h_ok else -4) + min(adx_val * 0.25, 8)))))
+            grade_ok = (base_conv >= 66) and mtf_or_momentum_ok and (adx_val >= 14.5) and (learned_score >= -10.0)
+
+            all_gates_ready = (
+                (not in_cooldown)
+                and mtf_aligned
+                and strat_ok
+                and anti_chase_ok
+                and grade_ok
+                and (not funding_blocked)
+                and (raw_prob >= effective_min_prob)
+            )
+            # Radar shows 90-100% ONLY when all execution gates pass (so Radar matches bot execution)
+            conv_pct = base_conv if all_gates_ready else min(base_conv, 64)
+            aligned_flag = bool(all_gates_ready)
+
             radar_signals.append({
                 "symbol": disp_sym,
                 "direction": direction,
@@ -1200,27 +1237,14 @@ class LiveAccountTradingBot:
                 trade_blocks.append(f"{bybit_sym}: Already has an open position")
                 continue
 
-            anti_chase_ok, chase_reason = self._passes_anti_chase_guard(closed_bar, live_bar, direction)
-            strat_ok = self._strategy_entry_filter(
-                strat_id,
-                _safe_float(live_bar["Open"], 0.0),
-                closed_bar,
-                direction,
-                relaxed=is_relaxed,
-                custom_rules=custom_rules,
-            )
+            quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 19.0 else 0.0) + (learned_score * 0.002)
 
-            learned_score = _safe_float(agentic_coin_scores.get(disp_sym), 0.0)
-            effective_min_prob = max(req_thresh * 0.96, 0.22) + session_prob_penalty
-            grade_ok = (conv_pct >= 68) and raw_4h_ok and (adx_val >= 16.5) and (learned_score >= -10.0)
-            quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 20.0 else 0.0) + (learned_score * 0.002)
-
-            if mtf_aligned and strat_ok and anti_chase_ok and grade_ok and (not funding_blocked) and raw_prob >= effective_min_prob:
-                if conv_pct >= 88 and raw_4h_ok and adx_val >= 22.0:
+            if all_gates_ready:
+                if conv_pct >= 90 and raw_4h_ok and adx_val >= 22.0:
                     grade_tag = "A+"
-                elif conv_pct >= 80 and raw_4h_ok and adx_val >= 19.0:
+                elif conv_pct >= 80 and adx_val >= 18.5:
                     grade_tag = "A"
-                elif conv_pct >= 74 and adx_val >= 17.5:
+                elif conv_pct >= 72 and adx_val >= 16.0:
                     grade_tag = "B+"
                 else:
                     grade_tag = "B"
@@ -1255,7 +1279,7 @@ class LiveAccountTradingBot:
                 if not strat_ok:
                     reasons.append(f"Waiting for {strat_id}")
                 if not grade_ok:
-                    reasons.append(f"Below B floor (Conv {conv_pct}%<68% or ADX {adx_val:.1f}<16.5 or 4H unaligned)")
+                    reasons.append(f"Below B floor (Conv {base_conv}%<66% or ADX {adx_val:.1f}<14.5)")
                 if raw_prob < effective_min_prob:
                     reasons.append(f"Prob {raw_prob:.2f} < {effective_min_prob:.2f}")
                 block_msg = f"{bybit_sym} {direction} ({conv_pct}%): {', '.join(reasons)} [ADX:{adx_val:.1f}]"
