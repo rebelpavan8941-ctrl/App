@@ -3,18 +3,16 @@ import gc
 import sys
 import json
 import time
-import math
-import hmac
-import hashlib
-import urllib.parse
-import datetime
-from concurrent.futures import ThreadPoolExecutor
+import glob
 import requests
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+BYBIT_TAKER_FEE = 0.00055    # 0.055% per side (0.11% round-trip for Crypto)
+FOREX_HALF_SPREAD = 0.00006  # 0.6 pip per side (1.2 pips = 0.012% round-trip for Forex)
+MAX_LEVERAGE = 20
+DEFAULT_LEVERAGE = 10
 
 TIMEFRAME_TO_BYBIT_INTERVAL = {
     "15m": "15",
@@ -22,6 +20,17 @@ TIMEFRAME_TO_BYBIT_INTERVAL = {
     "1h": "60",
     "4h": "240",
 }
+
+BARS_PER_DAY = {
+    "15m": 96,
+    "30m": 48,
+    "1h": 24,
+    "4h": 6,
+}
+
+DEFAULT_TEST_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
+TRAINING_WINDOW_DAYS = 135   # 4.5 months (~135 days) full multi-regime coverage
+MAX_KEPT_MODEL_VERSIONS = 2  # Retain only latest 2 trained ML models on disk
 
 FEATURES = [
     "NATR", "BB_PctB", "BB_Width",
@@ -31,552 +40,376 @@ FEATURES = [
     "VWAP_Dev"
 ]
 
-BYBIT_ERROR_HINTS = {
-    10001: "Invalid order parameter / quantity step or price precision",
-    10003: "API key invalid or Mainnet/Demo endpoint mismatch",
-    10004: "API signature mismatch — check API Secret",
-    10006: "Bybit API rate limit exceeded",
-    110001: "Order does not exist or already filled",
-    110003: "Order price exceeds allowable range",
-    110004: "Wallet balance is insufficient for margin",
-    110007: "Available USDT balance is insufficient to open position",
-    110012: "Insufficient available balance",
-    110013: "Cannot set leverage due to risk limit tier — lower leverage",
-    110016: "Order quantity exceeds max risk limit tier",
-    110043: "Leverage unchanged or position margin mode conflict",
-    110044: "Available margin is insufficient",
-    110126: "Contract agreement not signed on Bybit (sign in Bybit app or remove stock-perp coin)",
-    110132: "Contract not available in your region",
+STRATEGY_CATALOG_META = {
+    "xgb_mtf_v2": {"name": "XGBoost 1H/4H Momentum Classifier", "timeframes": ["1h", "4h"]},
+    "trendline_retest_pro": {"name": "Swing-Pivot Trendline Retest & Rejection", "timeframes": ["1h", "4h"]},
+    "xrp_donchian_breakout": {"name": "Donchian Breakout + Supertrend", "timeframes": ["1h", "4h"]},
+    "donchian_turtle_v2": {"name": "Donchian Channel Trend Breakout", "timeframes": ["4h"]},
+    "btc_vol_surge_adx": {"name": "Volume Surge & ADX Momentum", "timeframes": ["1h"]},
+    "supertrend_adx_filter": {"name": "Supertrend + ADX Regime Filter", "timeframes": ["1h"]},
+    "bnb_ob_imbalance": {"name": "Orderbook Imbalance & Spread Gate", "timeframes": ["1h"]},
+    "link_bb_expansion": {"name": "Bollinger Band Width Expansion", "timeframes": ["1h"]},
+    "bb_keltner_squeeze": {"name": "TTM Volatility Squeeze Release", "timeframes": ["1h"]},
+    "eth_rsi_stoch_reversal": {"name": "Stoch-RSI Mean Reversion", "timeframes": ["1h"]},
+    "stoch_rsi_trend_dip": {"name": "Stochastic RSI Oversold Trend Dip", "timeframes": ["30m", "4h"]},
+    "sol_ema_ribbon_atr": {"name": "Triple EMA Ribbon & ATR Trail", "timeframes": ["1h"]},
+    "ema_ribbon_pullback": {"name": "EMA 21/55 Dynamic Trend Pullback", "timeframes": ["1h"]},
+    "ada_macd_hist_accel": {"name": "MACD Histogram Acceleration", "timeframes": ["1h"]},
+    "macd_hist_zero_cross": {"name": "MACD Histogram Impulse + Zero Cross", "timeframes": ["1h", "4h"]},
+    "doge_supertrend_scalp": {"name": "Supertrend Volatility Scalp", "timeframes": ["15m"]},
+    "avax_fib_ml_confluence": {"name": "Fibonacci ML Confluence", "timeframes": ["1h"]},
+    "near_vwap_profile": {"name": "Session VWAP Deviation Bounce", "timeframes": ["1h"]},
+    "vwap_reclaim_pro": {"name": "Anchored VWAP Session Reclaim", "timeframes": ["15m", "1h"]},
+    "cvd_orderflow_div": {"name": "CVD Orderflow & Delta Absorption", "timeframes": ["15m", "1h"]},
+    "funding_arb_mom": {"name": "Funding Rate Squeeze & OI Surge", "timeframes": ["1h", "4h"]},
+    "ict_fvg_retest": {"name": "Smart Money FVG + Orderblock Retest", "timeframes": ["1h", "4h"]},
+    "liq_sweep_reversal": {"name": "Swing High/Low Liquidity Sweep", "timeframes": ["30m", "1h"]},
+    "volume_profile_poc": {"name": "Volume Profile POC & VAH/VAL Bounce", "timeframes": ["1h"]},
+    "ichimoku_cloud_mtf": {"name": "Ichimoku Kumo Twist + TK Cross", "timeframes": ["1h", "4h"]},
+    "london_ny_orb": {"name": "London / NY Session Opening Range Breakout", "timeframes": ["15m", "1h"]},
+    "parabolic_sar_trail": {"name": "Parabolic SAR + Chaikin Money Flow", "timeframes": ["1h"]},
+    "anchored_vwap_reclaim_v3": {"name": "Anchored VWAP Session Reclaim Pro", "timeframes": ["1h"]},
+    "ict_liquidity_sweep_ob": {"name": "ICT Liquidity Sweep & Orderblock Retest", "timeframes": ["1h"]},
+    "connors_rsi2_trend_pullback": {"name": "RSI-2 Trend Pullback & EMA200 Filter", "timeframes": ["1h"]},
+    "keltner_ttm_squeeze_pro": {"name": "TTM Bollinger-Keltner Volatility Squeeze", "timeframes": ["1h"]},
+    "cvd_orderflow_absorption": {"name": "CVD Orderflow & Volume Surge Absorption", "timeframes": ["15m"]},
 }
 
 
-def _safe_float(val, default: float = 0.0) -> float:
-    if val is None:
-        return default
-    if isinstance(val, (int, float)) and not isinstance(val, bool):
-        return float(val) if math.isfinite(float(val)) else default
-    s = str(val).strip()
-    if not s:
-        return default
-    try:
-        num = float(s)
-        return num if math.isfinite(num) else default
-    except (ValueError, TypeError):
-        return default
-
-
-def _safe_int(val, default: int = 0) -> int:
-    if val is None:
-        return default
-    if isinstance(val, int) and not isinstance(val, bool):
-        return val
-    s = str(val).strip()
-    if not s:
-        return default
-    try:
-        return int(float(s))
-    except (ValueError, TypeError):
-        return default
-
-
-def get_ist_session_name(dt_ist: datetime.datetime) -> str:
-    hm = dt_ist.hour * 60 + dt_ist.minute
-    if 330 <= hm < 810:      # 05:30 - 13:30 IST
-        return "ASIA"
-    if 810 <= hm < 1110:     # 13:30 - 18:30 IST
-        return "LONDON"
-    return "NEW_YORK"        # 18:30 - 05:30 IST
-
-
-def is_forex_symbol(symbol: str) -> bool:
-    clean = symbol.replace("/", "").upper()
+def classify_market(symbol: str) -> str:
+    clean = symbol.strip().upper()
     forex_bases = {"EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
-    return len(clean) == 6 and clean[:3] in forex_bases and clean[3:] in (forex_bases | {"USD"})
+    parts = clean.replace("-", "/").replace("_", "/").split("/")
+    if len(parts) >= 2 and parts[0] in forex_bases and parts[1] in (forex_bases | {"USD"}):
+        return "FOREX"
+    if len(clean) == 6 and clean[:3] in forex_bases and clean[3:] in (forex_bases | {"USD"}):
+        return "FOREX"
+    return "CRYPTO"
 
 
-def is_valid_xgb_model(model_dict) -> bool:
-    return isinstance(model_dict, dict) and "learner" in model_dict and isinstance(model_dict.get("learner"), dict)
-
-
-def _sanitize_xgb_model_json(model_dict: dict) -> dict:
-    """Repairs XGBoost JSON float arrays where integer tokens cause C++ json.h:82 Invalid cast."""
-    if not isinstance(model_dict, dict):
-        return model_dict
-    learner = model_dict.get("learner")
-    if not isinstance(learner, dict):
-        return model_dict
-
-    lmp = learner.get("learner_model_param")
-    if isinstance(lmp, dict) and "base_score" in lmp:
-        bs = lmp["base_score"]
-        if isinstance(bs, (int, float)) and not isinstance(bs, bool):
-            lmp["base_score"] = str(float(bs))
-
-    gb = learner.get("gradient_booster")
-    if isinstance(gb, dict):
-        model = gb.get("model")
-        if isinstance(model, dict):
-            trees = model.get("trees")
-            if isinstance(trees, list):
-                float_array_keys = ("split_conditions", "base_weights", "loss_changes", "sum_hessian")
-                for tree in trees:
-                    if not isinstance(tree, dict):
-                        continue
-                    for k in float_array_keys:
-                        arr = tree.get(k)
-                        if isinstance(arr, list):
-                            tree[k] = [
-                                float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
-                                for v in arr
-                            ]
-    return model_dict
-
-
-class LiveAccountTradingBot:
-    def __init__(self, api_key: str, api_secret: str, models_dir: str, live_dir: str = None, endpoint: str = "Mainnet"):
-        self.api_key = api_key
-        self.api_secret = api_secret
+class PaperStrategyTrainerAndTester:
+    def __init__(self, paper_dir: str, models_dir: str):
+        self.paper_dir = paper_dir
         self.models_dir = models_dir
-        self.live_dir = live_dir or os.path.join(os.path.dirname(models_dir), "bot_data", "LIVE_ACCOUNT")
-        os.makedirs(self.live_dir, exist_ok=True)
-        self.state_path = os.path.join(self.live_dir, "live_engine_state.json")
-        self.memory_path = os.path.join(self.live_dir, "ai_copilot_memory.json")
-
-        p1 = os.path.join(models_dir, "LIVE", "UNIFIED_PORTFOLIO_MASTER.json")
-        p2 = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
-        self.master_path = p1 if os.path.exists(p1) else p2
-
-        self.is_demo = str(endpoint).lower() in ("testnet", "demo")
-        self.host_candidates = (
-            ["https://api-demo.bybit.com", "https://api.bytick.com"]
-            if self.is_demo
-            else ["https://api.bytick.com", "https://api.bybit.com"]
-        )
-        self.base_url = self.host_candidates[0]
-        self.category = "linear"
+        self.paper_master_path = os.path.join(models_dir, "PAPER", "UNIFIED_PORTFOLIO_MASTER.json")
+        self.paper_history_dir = os.path.join(models_dir, "PAPER", "history")
+        self.live_master_path = os.path.join(models_dir, "LIVE", "UNIFIED_PORTFOLIO_MASTER.json")
+        self.legacy_master_path = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
+        self.paper_results_path = os.path.join(paper_dir, "paper_trained_results.json")
+        self.comparison_path = os.path.join(paper_dir, "paper_vs_live_comparison.json")
+        self.discovered_strats_path = os.path.join(paper_dir, "ai_discovered_strategies.json")
+        self.adopted_strats_path = os.path.join(paper_dir, "ai_adopted_strategies.json")
         self.rate_limit_remaining = 120
         self.rate_limit_cap = 120
-        self._booster_cache = {}
-        self._instrument_cache = {}
-        self._trend_4h_cache = {}
-        self._ticker_cache = (0.0, {}, {})
 
         self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=6, pool_maxsize=6)
         self.session.mount("https://", adapter)
 
-    def _load_state(self) -> dict:
-        if os.path.exists(self.state_path):
+        os.makedirs(paper_dir, exist_ok=True)
+        os.makedirs(os.path.join(models_dir, "PAPER"), exist_ok=True)
+        os.makedirs(self.paper_history_dir, exist_ok=True)
+        os.makedirs(os.path.join(models_dir, "LIVE"), exist_ok=True)
+        self.dynamic_strategies = self._load_dynamic_strategies()
+
+    @staticmethod
+    def _sanitize_xgb_model_json(model_dict: dict) -> dict:
+        """Ensures float arrays in XGBoost JSON never serialize as bare integers (fixes json.h:82 Invalid cast)."""
+        if not isinstance(model_dict, dict):
+            return model_dict
+        learner = model_dict.get("learner")
+        if not isinstance(learner, dict):
+            return model_dict
+
+        lmp = learner.get("learner_model_param")
+        if isinstance(lmp, dict) and "base_score" in lmp:
+            bs = lmp["base_score"]
+            if isinstance(bs, (int, float)) and not isinstance(bs, bool):
+                lmp["base_score"] = str(float(bs))
+
+        gb = learner.get("gradient_booster")
+        if isinstance(gb, dict):
+            model = gb.get("model")
+            if isinstance(model, dict):
+                trees = model.get("trees")
+                if isinstance(trees, list):
+                    float_array_keys = ("split_conditions", "base_weights", "loss_changes", "sum_hessian")
+                    for tree in trees:
+                        if not isinstance(tree, dict):
+                            continue
+                        for k in float_array_keys:
+                            arr = tree.get(k)
+                            if isinstance(arr, list):
+                                tree[k] = [
+                                    float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+                                    for v in arr
+                                ]
+        return model_dict
+
+    def _load_dynamic_strategies(self) -> dict:
+        merged = {}
+        for fpath in (self.adopted_strats_path, self.discovered_strats_path):
+            if os.path.exists(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8-sig") as f:
+                        data = json.load(f)
+                    for sid, sdata in (data.get("strategies", {}) or {}).items():
+                        if isinstance(sdata, dict) and sdata.get("long_rules") and sdata.get("short_rules"):
+                            merged[sid] = sdata
+                except Exception:
+                    pass
+        return merged
+
+    def _adopt_winning_dynamic_strategies(self, trained_coins: dict):
+        if not self.dynamic_strategies:
+            return
+        adopted = {}
+        if os.path.exists(self.adopted_strats_path):
             try:
-                with open(self.state_path, "r", encoding="utf-8-sig") as f:
-                    return json.load(f)
+                with open(self.adopted_strats_path, "r", encoding="utf-8-sig") as f:
+                    adopted = json.load(f).get("strategies", {}) or {}
             except Exception:
-                pass
-        return {
-            "traded_candle_ts": {},
-            "last_trade_epoch_ms": {},
-            "position_opened_ms": {},
-            "loss_cooldown_until_ms": {},
-            "agentic_veto_until_ms": {},
-            "restricted_symbols_until_ms": {},
-            "reflected_closed_ids": [],
-            "daily_coin_trades": {},
-            "daily_total_trades": 0,
-            "tp1_partial_done": {},
-            "native_trail_set": {},
-            "virtual_open_positions": [],
-            "radar_signals": [],
-            "last_bot_logs": [],
-            "last_diagnostics": [],
-            "last_order_rejections": [],
-            "last_trade_blocks": [],
-            "coins_scanned": 0,
-            "top_status_summary": "",
-        }
+                adopted = {}
 
-    def _save_state(self, state: dict):
-        with open(self.state_path, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+        changed = False
+        for sym, cdata in trained_coins.items():
+            if not isinstance(cdata, dict):
+                continue
+            sid = str(cdata.get("strategy_id", ""))
+            if sid in self.dynamic_strategies:
+                pnl = float(cdata.get("net_pnl_usdt", 0.0))
+                pf = float(cdata.get("profit_factor", 0.0))
+                wr = float(cdata.get("win_rate_pct", 0.0))
+                trades = int(cdata.get("trades", 0))
+                if pnl > 0.0 and pf >= 1.15 and trades >= 4:
+                    best_cfg = dict(cdata.get("config", {}))
+                    spec = dict(self.dynamic_strategies[sid])
+                    spec["adopted_at"] = int(time.time())
+                    spec["proven_on_symbol"] = sym
+                    spec["proven_pf"] = pf
+                    spec["proven_win_rate_pct"] = wr
+                    spec["proven_net_pnl_usdt"] = pnl
+                    spec["fixed_config"] = {
+                        "long_thresh": best_cfg.get("long_thresh", 0.28),
+                        "short_thresh": best_cfg.get("short_thresh", 0.28),
+                        "sl_atr": best_cfg.get("sl_atr", 1.30),
+                        "tp1_rr": best_cfg.get("tp1_rr", 1.90),
+                        "tp2_rr": best_cfg.get("tp2_rr", 3.30),
+                        "trail_atr": best_cfg.get("trail_atr", 1.80),
+                        "timeframe": best_cfg.get("timeframe", "1H"),
+                        "mtf_alignment_mode": best_cfg.get("mtf_alignment_mode", "SOFT"),
+                    }
+                    adopted[sid] = spec
+                    changed = True
 
-    def _load_agentic_memory(self) -> dict:
-        if os.path.exists(self.memory_path):
+        if changed:
+            tmp_a = self.adopted_strats_path + ".tmp"
+            with open(tmp_a, "w", encoding="utf-8") as wf:
+                json.dump({"updated_at": int(time.time()), "strategies": adopted}, wf, indent=2)
+            os.replace(tmp_a, self.adopted_strats_path)
+
+    def _prune_underperforming_gemini_strategies(self, trained_coins: dict):
+        """Auto-removes Gemini strategies failing Paper backtest thresholds or Live performance."""
+        try:
+            import ai_regime_copilot
+            live_dir_guess = os.path.join(os.path.dirname(self.paper_dir), "LIVE_ACCOUNT")
+            prune_res = ai_regime_copilot.prune_underperforming_gemini_strategies(
+                paper_dir=self.paper_dir,
+                live_dir=live_dir_guess,
+                models_dir=self.models_dir,
+            )
+            if prune_res.get("removed"):
+                print(f"[AGENTIC PRUNE] Auto-removed underperforming Gemini strategies: {prune_res['removed']}")
+                self.dynamic_strategies = self._load_dynamic_strategies()
+            return
+        except Exception:
+            pass
+
+        for fpath in (self.discovered_strats_path, self.adopted_strats_path):
+            if not os.path.exists(fpath):
+                continue
             try:
-                with open(self.memory_path, "r", encoding="utf-8-sig") as f:
-                    data = json.load(f)
-                    if isinstance(data, dict):
-                        return data
+                with open(fpath, "r", encoding="utf-8-sig") as f:
+                    payload = json.load(f)
+                strats = payload.get("strategies", {}) or {}
+                kept = {}
+                for sid, spec in strats.items():
+                    runs = []
+                    for cdata in trained_coins.values():
+                        if not isinstance(cdata, dict):
+                            continue
+                        if str(cdata.get("strategy_id", "")) == sid:
+                            runs.append(cdata)
+                        for m in (cdata.get("tested_matrix", []) or []):
+                            if isinstance(m, dict) and str(m.get("strategy_id", "")) == sid:
+                                runs.append(m)
+                    if runs:
+                        best_r = max(runs, key=lambda r: (float(r.get("net_pnl_usdt", 0.0)), float(r.get("profit_factor", 0.0))))
+                        if int(best_r.get("trades", 0)) < 4 or float(best_r.get("net_pnl_usdt", 0.0)) <= 0.0 or float(best_r.get("profit_factor", 0.0)) < 1.15:
+                            continue
+                    kept[sid] = spec
+                if len(kept) != len(strats):
+                    payload["strategies"] = kept
+                    payload["updated_at"] = int(time.time())
+                    tmp_f = fpath + ".tmp"
+                    with open(tmp_f, "w", encoding="utf-8") as wf:
+                        json.dump(payload, wf, indent=2)
+                    os.replace(tmp_f, fpath)
             except Exception:
-                pass
-        return {}
+                continue
+        self.dynamic_strategies = self._load_dynamic_strategies()
 
-    def _sign(self, ts: str, recv_window: str, payload: str) -> str:
-        raw = f"{ts}{self.api_key}{recv_window}{payload}"
-        return hmac.new(self.api_secret.encode("utf-8"), raw.encode("utf-8"), hashlib.sha256).hexdigest()
+    def _prune_old_trained_models(self, keep_latest: int = MAX_KEPT_MODEL_VERSIONS):
+        try:
+            snapshots = sorted(
+                glob.glob(os.path.join(self.paper_history_dir, "UNIFIED_PAPER_*.json")),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+            for old_file in snapshots[keep_latest:]:
+                try:
+                    os.remove(old_file)
+                except Exception:
+                    pass
+            for tmp_file in glob.glob(os.path.join(self.paper_dir, "_tmp_*")):
+                try:
+                    os.remove(tmp_file)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    def _update_rate_limits(self, resp: requests.Response):
+    def _public_get(self, url: str, params: dict) -> dict:
+        if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
+            time.sleep(1.0)
+        resp = self.session.get(url, params=params, timeout=7)
         rem = resp.headers.get("X-Bapi-Limit-Status")
         cap = resp.headers.get("X-Bapi-Limit")
         if rem and rem.isdigit():
             self.rate_limit_remaining = int(rem)
         if cap and cap.isdigit() and int(cap) > 0:
             self.rate_limit_cap = int(cap)
+        return resp.json()
 
-    def _public_get(self, path: str, params: dict, timeout: float = 4.0) -> dict:
-        for base in self.host_candidates:
+    def _fetch_forex_yahoo_history(self, symbol: str, timeframe: str = "1h") -> pd.DataFrame:
+        clean_sym = symbol.replace("/", "").upper()
+        tf_key = timeframe.lower()
+        yf_interval = "15m" if tf_key == "15m" else ("30m" if tf_key == "30m" else "1h")
+        yf_range = "60d" if yf_interval in ("15m", "30m") else "6mo"
+
+        for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
             try:
-                resp = self.session.get(f"{base}{path}", params=params, timeout=timeout)
-                self._update_rate_limits(resp)
-                if resp.status_code == 200:
-                    return resp.json()
-            except Exception:
-                continue
-        return {}
-
-    def _fetch_tickers_cached(self) -> tuple:
-        now_s = time.time()
-        c_ts, c_fr, c_px = self._ticker_cache
-        if c_px and (now_s - c_ts) < 45.0:
-            return c_fr, c_px
-        rates = {}
-        prices = {}
-        try:
-            data = self._public_get("/v5/market/tickers", {"category": self.category}, timeout=3.5)
-            for row in data.get("result", {}).get("list", []):
-                sym = str(row.get("symbol", "")).upper()
-                if not sym:
-                    continue
-                fr_raw = row.get("fundingRate", "")
-                if str(fr_raw).strip() != "":
-                    rates[sym] = _safe_float(fr_raw, 0.0)
-                px_val = _safe_float(row.get("markPrice") or row.get("lastPrice"), 0.0)
-                if px_val > 0.0:
-                    prices[sym] = px_val
-            if prices:
-                self._ticker_cache = (now_s, rates, prices)
-        except Exception:
-            pass
-        return (rates or c_fr), (prices or c_px)
-
-    def _bybit_request(self, method: str, path: str, params: dict = None, body: dict = None) -> dict:
-        if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
-            time.sleep(0.4)
-
-        last_err = None
-        for base in self.host_candidates:
-            ts = str(int(time.time() * 1000))
-            recv_window = "5000"
-            try:
-                if method == "GET":
-                    qs = urllib.parse.urlencode(params or {})
-                    sig = self._sign(ts, recv_window, qs)
-                    url = f"{base}{path}?{qs}" if qs else f"{base}{path}"
-                    headers = {
-                        "X-BAPI-API-KEY": self.api_key,
-                        "X-BAPI-SIGN": sig,
-                        "X-BAPI-TIMESTAMP": ts,
-                        "X-BAPI-RECV-WINDOW": recv_window,
-                    }
-                    resp = self.session.get(url, headers=headers, timeout=5.0)
-                    self._update_rate_limits(resp)
-                    if resp.status_code == 200:
-                        return resp.json()
-                else:
-                    raw_body = json.dumps(body or {})
-                    sig = self._sign(ts, recv_window, raw_body)
-                    headers = {
-                        "X-BAPI-API-KEY": self.api_key,
-                        "X-BAPI-SIGN": sig,
-                        "X-BAPI-TIMESTAMP": ts,
-                        "X-BAPI-RECV-WINDOW": recv_window,
-                        "Content-Type": "application/json",
-                    }
-                    resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=5.0)
-                    self._update_rate_limits(resp)
-                    if resp.status_code == 200:
-                        return resp.json()
-            except Exception as e:
-                last_err = e
-                continue
-        if last_err:
-            raise last_err
-        return {}
-
-    def _extract_available_usdt(self, bal_res: dict) -> float:
-        acct_list = bal_res.get("result", {}).get("list", [])
-        if not acct_list or not isinstance(acct_list[0], dict):
-            return 0.0
-        acct = acct_list[0]
-        raw_avail = str(acct.get("totalAvailableBalance", "")).strip()
-        if raw_avail != "":
-            return _safe_float(raw_avail, 0.0)
-        for c_item in acct.get("coin", []) or []:
-            if str(c_item.get("coin", "")).upper() == "USDT":
-                wb = _safe_float(c_item.get("walletBalance"), 0.0)
-                im = _safe_float(c_item.get("totalPositionIM"), 0.0) + _safe_float(c_item.get("totalOrderIM"), 0.0)
-                return max(0.0, wb - im)
-        return _safe_float(acct.get("totalEquity"), 0.0)
-
-    def _get_instrument_filters(self, bybit_symbol: str):
-        if bybit_symbol in self._instrument_cache:
-            return self._instrument_cache[bybit_symbol]
-        data = self._public_get("/v5/market/instruments-info", {"category": self.category, "symbol": bybit_symbol})
-        items = data.get("result", {}).get("list", [])
-        if not items:
-            return None
-        lot = items[0].get("lotSizeFilter", {})
-        pf = items[0].get("priceFilter", {})
-        qty_step = str(lot.get("qtyStep", "")).strip() or "0.001"
-        tick_size = str(pf.get("tickSize", "")).strip() or "0.0001"
-        res = (
-            qty_step,
-            _safe_float(lot.get("minOrderQty"), 0.001),
-            _safe_float(lot.get("minNotionalValue"), 5.0),
-            tick_size,
-        )
-        self._instrument_cache[bybit_symbol] = res
-        return res
-
-    @staticmethod
-    def _format_step(val: float, step_str: str, round_up: bool = False) -> str:
-        step = _safe_float(step_str, 0.001)
-        if step <= 0.0:
-            step = 0.001
-        scaled = math.ceil(val / step) * step if round_up else round(val / step) * step
-        clean_step = step_str.rstrip("0")
-        decimals = len(clean_step.split(".")[1]) if "." in clean_step else 0
-        return f"{scaled:.{decimals}f}"
-
-    @staticmethod
-    def _regime_exit_multipliers(adx_val: float, natr_val: float, btc_bearish: bool) -> tuple:
-        if natr_val >= 2.8 or (adx_val < 15.0 and btc_bearish):
-            return 1.25, 0.92, 0.42
-        if not btc_bearish and adx_val >= 18.0 and natr_val < 2.6:
-            return 1.15, 1.05, 0.45
-        return 1.12, 1.00, 0.45
-
-    @staticmethod
-    def _conviction_risk_scale(raw_prob: float, req_thresh: float) -> float:
-        edge = max(0.0, raw_prob - req_thresh)
-        scale = 0.85 + min(edge * 2.2, 0.35)
-        return round(min(max(scale, 0.85), 1.20), 4)
-
-    @staticmethod
-    def _passes_anti_chase_guard(closed_bar: pd.Series, live_bar: pd.Series, side: str) -> tuple:
-        rsi = _safe_float(closed_bar.get("RSI_14"), 50.0)
-        dist_ema20 = _safe_float(closed_bar.get("Dist_EMA20"), 0.0)
-        ret_1h = _safe_float(closed_bar.get("Ret_1h"), 0.0)
-        di_spread = _safe_float(closed_bar.get("DI_Spread"), 0.0)
-
-        closed_px = _safe_float(closed_bar.get("Close"), 0.0)
-        live_px = _safe_float(live_bar.get("Close"), closed_px)
-        intrabar_move = ((live_px - closed_px) / closed_px) if closed_px > 0 else 0.0
-
-        if side == "SHORT":
-            if dist_ema20 < -2.35:
-                return False, f"Stretched below EMA20 ({dist_ema20:.2f} ATR)"
-            if rsi < 27.0:
-                return False, f"RSI deeply oversold ({rsi:.1f} < 27)"
-            if ret_1h > 0.012 or intrabar_move > 0.009:
-                return False, f"Sharp bounce (+{max(ret_1h, intrabar_move) * 100:.2f}%)"
-            if di_spread > 10.0:
-                return False, f"Strong bullish DI (+{di_spread:.1f})"
-        else:
-            if dist_ema20 > 2.35:
-                return False, f"Stretched above EMA20 (+{dist_ema20:.2f} ATR)"
-            if rsi > 73.0:
-                return False, f"RSI deeply overbought ({rsi:.1f} > 73)"
-            if ret_1h < -0.012 or intrabar_move < -0.009:
-                return False, f"Sharp dump ({min(ret_1h, intrabar_move) * 100:.2f}%)"
-            if di_spread < -10.0:
-                return False, f"Strong bearish DI ({di_spread:.1f})"
-        return True, ""
-
-    def _save_closed_trade_history(self, order_id: str, sym: str, side_label: str, pnl: float, closed_ms: int, is_virtual: bool = False):
-        try:
-            hist_file = os.path.join(self.live_dir, "live_reports_history.json")
-            hist_data = {"trades": []}
-            if os.path.exists(hist_file):
-                with open(hist_file, "r", encoding="utf-8-sig") as hf:
-                    loaded = json.load(hf)
-                    if isinstance(loaded, dict):
-                        hist_data = loaded
-            trades_list = hist_data.setdefault("trades", [])
-            if not any(str(t.get("id")) == order_id for t in trades_list):
-                disp = f"{sym[:-4]}/USDT" if sym.endswith("USDT") else sym
-                trades_list.insert(0, {
-                    "id": order_id,
-                    "symbol": disp,
-                    "side": side_label,
-                    "net_pnl": round(pnl, 4),
-                    "closed_at_ms": closed_ms,
-                    "virtual": bool(is_virtual),
-                })
-                hist_data["trades"] = trades_list[:300]
-                with open(hist_file, "w", encoding="utf-8") as wf:
-                    json.dump(hist_data, wf, indent=2)
-        except Exception:
-            pass
-
-    def _sync_virtual_positions(self, state: dict, mark_prices: dict, trail_ratio: float, now_ms: int, add_bot_log) -> list:
-        v_list = state.get("virtual_open_positions") or []
-        if not v_list:
-            return []
-        remaining = []
-        loss_cd = state.setdefault("loss_cooldown_until_ms", {})
-
-        for vp in v_list:
-            sym = str(vp.get("symbol", "")).upper()
-            side = str(vp.get("side", "LONG")).upper()
-            entry = _safe_float(vp.get("entry_price"), 0.0)
-            qty = _safe_float(vp.get("qty"), 0.0)
-            sl = _safe_float(vp.get("sl"), 0.0)
-            tp = _safe_float(vp.get("tp"), 0.0)
-            opened_ms = _safe_int(vp.get("opened_ms"), now_ms)
-            mark = _safe_float(mark_prices.get(sym), _safe_float(vp.get("mark_price"), entry))
-            if mark <= 0.0:
-                mark = entry
-
-            is_long = side == "LONG"
-            gross_pnl = ((mark - entry) if is_long else (entry - mark)) * qty
-            est_fees = (entry * qty + mark * qty) * 0.00055
-            net_pnl = gross_pnl - est_fees
-
-            tp_dist = abs(tp - entry)
-            profit_dist = (mark - entry) if is_long else (entry - mark)
-
-            if tp_dist > 0.0 and profit_dist >= tp_dist * 0.65:
-                be_sl = (entry + tp_dist * 0.15) if is_long else (entry - tp_dist * 0.15)
-                if (is_long and be_sl > sl) or ((not is_long) and be_sl < sl):
-                    sl = be_sl
-            if tp_dist > 0.0 and profit_dist >= tp_dist * 0.70:
-                trail_sl = (mark - tp_dist * trail_ratio) if is_long else (mark + tp_dist * trail_ratio)
-                if (is_long and trail_sl > sl) or ((not is_long) and trail_sl < sl):
-                    sl = trail_sl
-
-            hit_sl = (mark <= sl) if is_long else (mark >= sl)
-            hit_tp = (mark >= tp) if is_long else (mark <= tp)
-            age_hours = (now_ms - opened_ms) / 3_600_000.0
-            hit_time = (age_hours >= 8.0 and tp_dist > 0.0 and profit_dist >= 0.0 and profit_dist < tp_dist * 0.25)
-
-            if hit_sl or hit_tp or hit_time:
-                reason = "TP HIT" if hit_tp else ("TIME-STOP" if hit_time else "SL HIT")
-                vid = f"DRY_{sym}_{now_ms}"
-                self._save_closed_trade_history(vid, sym, side, net_pnl, now_ms, is_virtual=True)
-                if net_pnl < 0.0:
-                    loss_cd[sym] = now_ms + (4 * 60 * 60 * 1000)
-                try:
-                    import ai_regime_copilot
-                    ref_res = ai_regime_copilot.record_post_trade_reflection(
-                        self.live_dir, sym, side, net_pnl, entry, mark
-                    )
-                    if ref_res.get("lesson"):
-                        add_bot_log(f"[DRY-RUN REFLECTION] {ref_res['lesson']}")
-                except Exception:
-                    pass
-                add_bot_log(f"[DRY-RUN CLOSED • {reason}] {sym} {side} @ {mark:.4f} | Net PnL: {net_pnl:+.4f} USDT")
-            else:
-                vp["mark_price"] = mark
-                vp["sl"] = sl
-                vp["unrealized_pnl"] = round(net_pnl, 4)
-                remaining.append(vp)
-
-        state["virtual_open_positions"] = remaining
-        return remaining
-
-    def _record_recent_stop_losses_and_reflect(self, state: dict, now_ms: int, add_bot_log):
-        loss_cd = state.setdefault("loss_cooldown_until_ms", {})
-        reflected = state.setdefault("reflected_closed_ids", [])
-        try:
-            res = self._bybit_request("GET", "/v5/position/closed-pnl", {"category": self.category, "limit": 10})
-        except Exception:
-            return
-        for row in res.get("result", {}).get("list", []):
-            sym = str(row.get("symbol", "")).upper()
-            pnl = _safe_float(row.get("closedPnl"), 0.0)
-            updated_ms = _safe_int(row.get("updatedTime"), 0)
-            order_id = str(row.get("orderId", f"{sym}_{updated_ms}"))
-            if sym and pnl < 0.0 and updated_ms > 0 and (now_ms - updated_ms) < 4 * 60 * 60 * 1000:
-                target_cd = updated_ms + (4 * 60 * 60 * 1000)
-                if target_cd > _safe_int(loss_cd.get(sym), 0):
-                    loss_cd[sym] = target_cd
-
-            if sym and updated_ms > 0 and order_id not in reflected:
-                reflected.append(order_id)
-                side_label = "SHORT" if str(row.get("side", "")).lower() == "buy" else "LONG"
-                try:
-                    import ai_regime_copilot
-                    ref_res = ai_regime_copilot.record_post_trade_reflection(
-                        self.live_dir,
-                        sym,
-                        side_label,
-                        pnl,
-                        _safe_float(row.get("avgEntryPrice"), 0.0),
-                        _safe_float(row.get("avgExitPrice"), 0.0),
-                    )
-                    if ref_res.get("lesson"):
-                        add_bot_log(f"[AGENTIC REFLECTION] {ref_res['lesson']}")
-                except Exception:
-                    pass
-                self._save_closed_trade_history(order_id, sym, side_label, pnl, updated_ms, is_virtual=False)
-        state["reflected_closed_ids"] = reflected[-40:]
-
-    def fetch_bybit_candles(self, bybit_symbol: str, interval: str = "60", limit: int = 230) -> pd.DataFrame:
-        data = self._public_get(
-            "/v5/market/kline",
-            {"category": self.category, "symbol": bybit_symbol, "interval": interval, "limit": limit},
-            timeout=4.0,
-        )
-        rows = data.get("result", {}).get("list", [])
-        if rows:
-            df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"])
-            df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
-            for col in ["Open", "High", "Low", "Close", "Volume"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
-            return df.sort_values("timestamp").set_index("timestamp")
-
-        if is_forex_symbol(bybit_symbol):
-            yf_interval = "15m" if interval == "15" else ("30m" if interval == "30" else "1h")
-            yf_range = "15d" if yf_interval in ("15m", "30m") else "60d"
-            try:
-                y_resp = self.session.get(
-                    f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
+                url = f"https://{host}/v8/finance/chart/{clean_sym}=X"
+                resp = self.session.get(
+                    url,
                     params={"interval": yf_interval, "range": yf_range},
                     headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=5.0,
+                    timeout=10,
                 )
-                res0 = y_resp.json().get("chart", {}).get("result", [])[0]
+                data = resp.json().get("chart", {}).get("result", [])
+                if not data:
+                    continue
+                res0 = data[0]
                 ts_list = res0.get("timestamp", [])
                 quote = res0.get("indicators", {}).get("quote", [{}])[0]
-                f_rows = []
+                opens = quote.get("open", [])
+                highs = quote.get("high", [])
+                lows = quote.get("low", [])
+                closes = quote.get("close", [])
+
+                rows = []
                 for i, ts_sec in enumerate(ts_list):
-                    c = quote["close"][i]
+                    c = closes[i] if i < len(closes) else None
                     if c is None or c <= 0:
                         continue
-                    o = quote["open"][i] or c
-                    h = quote["high"][i] or c
-                    l = quote["low"][i] or c
-                    f_rows.append([ts_sec * 1000, float(o), float(h), float(l), float(c), 1000.0])
-                if f_rows:
-                    df = pd.DataFrame(f_rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
-                    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-                    df = df.set_index("timestamp").sort_index()
-                    bar_range = (df["High"] - df["Low"]).clip(lower=1e-6)
-                    avg_range = bar_range.rolling(20, min_periods=1).mean().clip(lower=1e-6)
-                    df["Volume"] = ((bar_range / avg_range) * 1000.0).clip(lower=200.0, upper=5000.0)
-                    if interval == "240":
-                        df = df.resample("4h").agg({
-                            "Open": "first",
-                            "High": "max",
-                            "Low": "min",
-                            "Close": "last",
-                            "Volume": "sum",
-                        }).dropna()
-                    return df.tail(limit)
+                    o = opens[i] if (i < len(opens) and opens[i] is not None) else c
+                    h = highs[i] if (i < len(highs) and highs[i] is not None) else c
+                    l = lows[i] if (i < len(lows) and lows[i] is not None) else c
+                    rows.append([ts_sec * 1000, float(o), float(h), float(l), float(c), 1000.0])
+
+                if not rows:
+                    continue
+
+                df = pd.DataFrame(rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+                df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+                df = df.set_index("timestamp").sort_index()
+                for col in ["Open", "High", "Low", "Close", "Volume"]:
+                    df[col] = df[col].astype("float32")
+
+                bar_range = (df["High"] - df["Low"]).clip(lower=1e-6)
+                avg_range = bar_range.rolling(20, min_periods=1).mean().clip(lower=1e-6)
+                df["Volume"] = ((bar_range / avg_range) * 1000.0).clip(lower=200.0, upper=5000.0).astype("float32")
+
+                if tf_key == "4h":
+                    df = df.resample("4h").agg({
+                        "Open": "first",
+                        "High": "max",
+                        "Low": "min",
+                        "Close": "last",
+                        "Volume": "sum",
+                    }).dropna()
+
+                return df
             except Exception:
-                pass
+                continue
         return pd.DataFrame()
 
-    def build_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def fetch_bybit_history(self, symbol: str, timeframe: str = "1h", days: int = TRAINING_WINDOW_DAYS) -> pd.DataFrame:
+        if classify_market(symbol) == "FOREX":
+            return self._fetch_forex_yahoo_history(symbol, timeframe=timeframe)
+
+        bybit_sym = symbol.replace("/", "").upper()
+        tf_key = timeframe.lower()
+        interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_key, "60")
+        target_bars = (days * BARS_PER_DAY.get(tf_key, 24)) + 210
+
+        collected = {}
+        cursor_end = None
+        pages = 0
+
+        while len(collected) < target_bars and pages < 14:
+            params = {"category": "linear", "symbol": bybit_sym, "interval": interval, "limit": 1000}
+            if cursor_end is not None:
+                params["end"] = cursor_end
+
+            rows = []
+            for base in ("https://api.bytick.com", "https://api.bybit.com", "https://api-demo.bybit.com"):
+                try:
+                    resp = self._public_get(f"{base}/v5/market/kline", params)
+                    rows = resp.get("result", {}).get("list", [])
+                    if rows:
+                        break
+                except Exception:
+                    rows = []
+
+            if not rows:
+                break
+
+            oldest_ts = None
+            for r in rows:
+                ts_ms = int(r[0])
+                collected[ts_ms] = r
+                if oldest_ts is None or ts_ms < oldest_ts:
+                    oldest_ts = ts_ms
+
+            if oldest_ts is None or (cursor_end is not None and oldest_ts >= cursor_end):
+                break
+            cursor_end = oldest_ts - 1
+            pages += 1
+            if len(rows) < 950:
+                break
+
+        if not collected:
+            return pd.DataFrame()
+
+        ordered_rows = [collected[k] for k in sorted(collected.keys())][-target_bars:]
+        df = pd.DataFrame(ordered_rows, columns=["timestamp", "Open", "High", "Low", "Close", "Volume", "Turnover"])
+        df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"]), unit="ms", utc=True)
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+        return df.drop(columns=["Turnover"]).set_index("timestamp")
+
+    def build_matrix(self, df: pd.DataFrame, max_dd: float = 0.95, expansion: float = 1.25, horizon: int = 10) -> pd.DataFrame:
         data = df.copy()
         c = data["Close"]
         tr = pd.concat([
@@ -626,7 +459,7 @@ class LiveAccountTradingBot:
         data["Dist_EMA200"] = (c - data["EMA_200"]) / (data["ATR"] + 1e-9)
 
         typical_px = (data["High"] + data["Low"] + c) / 3.0
-        vol_safe = data["Volume"].clip(lower=1.0)
+        vol_safe = data["Volume"].clip(lower=1.0) if "Volume" in data.columns and not (data["Volume"] == 0).all() else pd.Series(1.0, index=data.index)
         session_vwap = (typical_px * vol_safe).rolling(24).sum() / (vol_safe.rolling(24).sum() + 1e-9)
         data["VWAP_Dev"] = (c - session_vwap) / (data["ATR"] + 1e-9)
 
@@ -645,919 +478,1018 @@ class LiveAccountTradingBot:
             st_arr[i] = 1 if uptrend else -1
 
         data["Supertrend"] = st_arr
+        data["Supertrend_Prev"] = data["Supertrend"].shift(1).fillna(data["Supertrend"])
         data["Donchian_High"] = data["High"].rolling(20).max().shift(1)
         data["Donchian_Low"] = data["Low"].rolling(20).min().shift(1)
-        data["Vol_Surge"] = data["Volume"] / (data["Volume"].rolling(20).mean() + 1e-9)
+        data["Vol_Surge"] = data["Volume"] / (data["Volume"].rolling(20).mean() + 1e-9) if "Volume" in data.columns and not (data["Volume"] == 0).all() else 1.0
         data["BB_Width_Med"] = data["BB_Width"].rolling(30).median()
+
+        fwd_max = data["High"].rolling(horizon).max().shift(-horizon)
+        fwd_min = data["Low"].rolling(horizon).min().shift(-horizon)
+        data["Target_Long"] = np.where(((fwd_max - c) >= expansion * data["ATR"]) & ((c - fwd_min) <= max_dd * data["ATR"]), 1, 0)
+        data["Target_Short"] = np.where(((c - fwd_min) >= expansion * data["ATR"]) & ((fwd_max - c) <= max_dd * data["ATR"]), 1, 0)
         return data.dropna()
 
-    def _get_cached_4h_metrics(self, bybit_sym: str) -> tuple:
-        now_s = time.time()
-        cached = self._trend_4h_cache.get(bybit_sym)
-        if cached and (now_s - cached[0]) < 600.0:
-            return cached[1], cached[2], cached[3]
-        raw_4h = self.fetch_bybit_candles(bybit_sym, interval="240", limit=220)
-        if len(raw_4h) >= 210:
-            df_4h = self.build_features(raw_4h)
-            if not df_4h.empty:
-                ref_bar = df_4h.iloc[-2] if len(df_4h) >= 2 else df_4h.iloc[-1]
-                st = int(ref_bar["Supertrend"])
-                adx = _safe_float(ref_bar.get("ADX"), 20.0)
-                natr = _safe_float(ref_bar.get("NATR"), 1.8)
-                self._trend_4h_cache[bybit_sym] = (now_s, st, adx, natr)
-                return st, adx, natr
-        return 0, 20.0, 1.8
+    def _serialize_booster(self, clf: xgb.XGBClassifier) -> dict:
+        try:
+            raw_bytes = bytes(clf.get_booster().save_raw("json"))
+            return self._sanitize_xgb_model_json(json.loads(raw_bytes.decode("utf-8")))
+        except Exception:
+            os.makedirs(self.paper_dir, exist_ok=True)
+            safe_tmp = os.path.join(self.paper_dir, f"_tmp_booster_{os.getpid()}_{int(time.time() * 1000)}.json")
+            try:
+                clf.save_model(safe_tmp)
+                with open(safe_tmp, "r", encoding="utf-8") as f:
+                    return self._sanitize_xgb_model_json(json.load(f))
+            finally:
+                if os.path.exists(safe_tmp):
+                    try:
+                        os.remove(safe_tmp)
+                    except Exception:
+                        pass
 
-    def _eval_custom_rules(self, bar: pd.Series, rules: list) -> bool:
-        if not rules:
-            return False
+    def _fit_xgb_pair(self, train_df: pd.DataFrame):
+        y_l = train_df["Target_Long"].copy()
+        y_s = train_df["Target_Short"].copy()
+        if y_l.sum() < 5:
+            y_l.iloc[-5:] = 1
+        if y_s.sum() < 5:
+            y_s.iloc[-5:] = 1
+
+        params = dict(
+            n_estimators=105,
+            max_depth=3,
+            learning_rate=0.045,
+            subsample=0.80,
+            colsample_bytree=0.80,
+            min_child_weight=5,
+            reg_alpha=0.5,
+            reg_lambda=1.5,
+            n_jobs=2,
+            eval_metric="logloss",
+            random_state=42,
+        )
+        clf_long = xgb.XGBClassifier(**params)
+        clf_short = xgb.XGBClassifier(**params)
+        X_train = train_df[FEATURES].astype("float32")
+        clf_long.fit(X_train, y_l)
+        clf_short.fit(X_train, y_s)
+        return clf_long, clf_short
+
+    def _eval_dynamic_rule_list(self, test_df: pd.DataFrame, rules: list) -> np.ndarray:
+        n = len(test_df)
+        mask = np.ones(n, dtype=bool)
+        mask[0] = False
         for rule in rules:
-            ind = str(rule.get("ind", ""))
-            op = str(rule.get("op", ""))
-            val = _safe_float(rule.get("val"), 0.0)
-            if ind not in bar.index:
-                return False
-            actual = _safe_float(bar[ind], 0.0)
-            if op == ">" and not (actual > val):
-                return False
-            elif op == "<" and not (actual < val):
-                return False
-            elif op == ">=" and not (actual >= val):
-                return False
-            elif op == "<=" and not (actual <= val):
-                return False
-        return True
+            ind = rule.get("ind", "")
+            op = rule.get("op", "")
+            val = float(rule.get("val", 0.0))
+            if ind not in test_df.columns:
+                mask[:] = False
+                return mask
+            arr = test_df[ind].to_numpy()[:-1]
+            if op == ">":
+                mask[1:] &= (arr > val)
+            elif op == "<":
+                mask[1:] &= (arr < val)
+            elif op == ">=":
+                mask[1:] &= (arr >= val)
+            elif op == "<=":
+                mask[1:] &= (arr <= val)
+        return mask
 
-    def _strategy_entry_filter(
-        self,
-        strategy_id: str,
-        curr_open: float,
-        closed_bar: pd.Series,
-        side: str,
-        relaxed: bool = False,
-        custom_rules: dict = None,
-    ) -> bool:
-        if isinstance(custom_rules, dict):
-            rule_key = "long_rules" if side == "LONG" else "short_rules"
-            if custom_rules.get(rule_key):
-                return self._eval_custom_rules(closed_bar, custom_rules[rule_key])
+    def _compute_vectorized_filter_masks(self, test_df: pd.DataFrame, strategy_id: str, relaxed: bool = False):
+        n = len(test_df)
+        long_ok = np.zeros(n, dtype=bool)
+        short_ok = np.zeros(n, dtype=bool)
+        if n < 2:
+            return long_ok, short_ok
+
+        if strategy_id in self.dynamic_strategies:
+            spec = self.dynamic_strategies[strategy_id]
+            return (
+                self._eval_dynamic_rule_list(test_df, spec.get("long_rules", [])),
+                self._eval_dynamic_rule_list(test_df, spec.get("short_rules", [])),
+            )
+
+        curr_open = test_df["Open"].to_numpy()[1:]
+        prev_close = test_df["Close"].to_numpy()[:-1]
+        prev_open = test_df["Open"].to_numpy()[:-1]
+        prev_ema50_d = test_df["Dist_EMA50"].to_numpy()[:-1]
+
+        if relaxed:
+            long_ok[1:] = prev_ema50_d > -1.5
+            short_ok[1:] = prev_ema50_d < 1.5
+            return long_ok, short_ok
 
         sid = strategy_id.lower()
-        if relaxed or "adaptive_quantile" in sid or "high_sensitivity" in sid:
-            return bool((closed_bar["Dist_EMA50"] > -1.5) if side == "LONG" else (closed_bar["Dist_EMA50"] < 1.5))
+        p_don_h = test_df["Donchian_High"].to_numpy()[:-1]
+        p_don_l = test_df["Donchian_Low"].to_numpy()[:-1]
+        p_st = test_df["Supertrend"].to_numpy()[:-1]
+        p_vol = test_df["Vol_Surge"].to_numpy()[:-1]
+        p_adx = test_df["ADX"].to_numpy()[:-1]
+        p_di = test_df["DI_Spread"].to_numpy()[:-1]
+        p_bbw = test_df["BB_Width"].to_numpy()[:-1]
+        p_bbwm = test_df["BB_Width_Med"].to_numpy()[:-1]
+        p_bbp = test_df["BB_PctB"].to_numpy()[:-1]
+        p_rsi = test_df["RSI_14"].to_numpy()[:-1]
+        p_sk = test_df["Stoch_K"].to_numpy()[:-1]
+        p_sd = test_df["Stoch_D"].to_numpy()[:-1]
+        p_e20 = test_df["EMA_20"].to_numpy()[:-1]
+        p_e50 = test_df["EMA_50"].to_numpy()[:-1]
+        p_macd = test_df["MACD_Hist"].to_numpy()[:-1]
+        p_d20 = test_df["Dist_EMA20"].to_numpy()[:-1]
+        p_d200 = test_df["Dist_EMA200"].to_numpy()[:-1]
+        p_vwap = test_df["VWAP_Dev"].to_numpy()[:-1]
 
-        if "donchian" in sid:
-            if side == "LONG":
-                return bool(
-                    closed_bar["Supertrend"] == 1
-                    and (
-                        curr_open >= closed_bar["Donchian_High"] * 0.996
-                        or (closed_bar["Close"] > closed_bar["EMA_20"] and closed_bar["DI_Spread"] > 0)
-                    )
-                )
-            else:
-                return bool(
-                    closed_bar["Supertrend"] == -1
-                    and (
-                        curr_open <= closed_bar["Donchian_Low"] * 1.004
-                        or (closed_bar["Close"] < closed_bar["EMA_20"] and closed_bar["DI_Spread"] < 0)
-                    )
-                )
-        if "vol_surge" in sid or "ob_imbalance" in sid or "supertrend_adx" in sid:
-            return bool(closed_bar["Vol_Surge"] >= 1.25 and closed_bar["ADX"] >= 20 and (
-                (closed_bar["DI_Spread"] > 0) if side == "LONG" else (closed_bar["DI_Spread"] < 0)
-            ))
-        if "bb_" in sid or "squeeze" in sid:
-            return bool(closed_bar["BB_Width"] > closed_bar["BB_Width_Med"] and (
-                (closed_bar["BB_PctB"] > 0.72) if side == "LONG" else (closed_bar["BB_PctB"] < 0.28)
-            ))
-        if "stoch" in sid or "rsi" in sid:
-            return bool((closed_bar["RSI_14"] < 44 and closed_bar["Stoch_K"] > closed_bar["Stoch_D"]) if side == "LONG" else (
-                closed_bar["RSI_14"] > 56 and closed_bar["Stoch_K"] < closed_bar["Stoch_D"]
-            ))
-        if "ema_ribbon" in sid:
-            return bool((closed_bar["EMA_20"] > closed_bar["EMA_50"] and curr_open > closed_bar["EMA_20"]) if side == "LONG" else (
-                closed_bar["EMA_20"] < closed_bar["EMA_50"] and curr_open < closed_bar["EMA_20"]
-            ))
-        if "macd" in sid:
-            return bool((closed_bar["MACD_Hist"] > 0 and closed_bar["Dist_EMA200"] > 0) if side == "LONG" else (
-                closed_bar["MACD_Hist"] < 0 and closed_bar["Dist_EMA200"] < 0
-            ))
-        if "supertrend" in sid or "sar" in sid:
-            return bool((closed_bar["Supertrend"] == 1) if side == "LONG" else (closed_bar["Supertrend"] == -1))
-        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid or "orb" in sid:
-            return bool((closed_bar["VWAP_Dev"] < -0.45 and closed_bar["Vol_Surge"] >= 1.15) if side == "LONG" else (
-                closed_bar["VWAP_Dev"] > 0.45 and closed_bar["Vol_Surge"] >= 1.15
-            ))
-        return bool((closed_bar["DI_Spread"] > 0 and closed_bar["Vol_Surge"] >= 1.05) if side == "LONG" else (
-            closed_bar["DI_Spread"] < 0 and closed_bar["Vol_Surge"] >= 1.05
-        ))
+        if "trendline" in sid:
+            highs_all = test_df["High"].to_numpy(dtype=float)
+            lows_all = test_df["Low"].to_numpy(dtype=float)
+            closes_all = test_df["Close"].to_numpy(dtype=float)
+            opens_all = test_df["Open"].to_numpy(dtype=float)
+            atrs_all = test_df["ATR"].to_numpy(dtype=float)
+            adx_all = test_df["ADX"].to_numpy(dtype=float)
 
-    def _load_booster(self, cache_key: str, model_dict: dict) -> xgb.Booster:
-        if not is_valid_xgb_model(model_dict):
-            raise ValueError(f"Invalid XGBoost booster format for {cache_key} (missing 'learner'). Retrain Paper model.")
-        if cache_key in self._booster_cache:
-            return self._booster_cache[cache_key]
-        if len(self._booster_cache) >= 32:
-            oldest_key = next(iter(self._booster_cache))
-            self._booster_cache.pop(oldest_key, None)
+            swing_lows = []
+            swing_highs = []
+            for j in range(3, n - 4):
+                if lows_all[j] == np.min(lows_all[j - 3:j + 4]):
+                    swing_lows.append((j, lows_all[j]))
+                if highs_all[j] == np.max(highs_all[j - 3:j + 4]):
+                    swing_highs.append((j, highs_all[j]))
 
-        sanitized_dict = _sanitize_xgb_model_json(model_dict)
-        booster = xgb.Booster()
-        os.makedirs(self.live_dir, exist_ok=True)
-        tmp_path = os.path.join(self.live_dir, f"_tmp_live_{cache_key}_{os.getpid()}.json")
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(sanitized_dict, f)
-            booster.load_model(tmp_path)
-            self._booster_cache[cache_key] = booster
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    pass
-        return booster
+            sl_ptr = 0
+            sh_ptr = 0
+            for idx in range(1, n):
+                c_bar = idx - 1
+                atr_v = atrs_all[c_bar]
+                if atr_v <= 0 or adx_all[c_bar] < 17.0:
+                    continue
+                while sl_ptr < len(swing_lows) and swing_lows[sl_ptr][0] <= c_bar - 3:
+                    sl_ptr += 1
+                while sh_ptr < len(swing_highs) and swing_highs[sh_ptr][0] <= c_bar - 3:
+                    sh_ptr += 1
 
-    def _arm_native_trailing_stop(self, bybit_sym: str, side: str, entry: float, tp_dist: float, tick_size: str, trail_ratio: float) -> bool:
-        if entry <= 0.0 or tp_dist <= 0.0:
-            return False
-        act_px = (entry + tp_dist * 0.70) if side == "LONG" else (entry - tp_dist * 0.70)
-        trail_dist = max(tp_dist * min(max(trail_ratio, 0.40), 0.50), _safe_float(tick_size, 0.0001) * 2.0)
-        try:
-            t_res = self._bybit_request("POST", "/v5/position/trading-stop", body={
-                "category": self.category,
-                "symbol": bybit_sym,
-                "trailingStop": self._format_step(trail_dist, tick_size),
-                "activePrice": self._format_step(act_px, tick_size),
-                "positionIdx": 0,
-            })
-            return t_res.get("retCode") == 0
-        except Exception:
-            return False
+                if sl_ptr >= 2:
+                    (i1, p1), (i2, p2) = swing_lows[sl_ptr - 2], swing_lows[sl_ptr - 1]
+                    if i2 > i1 and p2 > p1:
+                        tl_px = p2 + ((p2 - p1) / float(i2 - i1)) * float(c_bar - i2)
+                        dist_a = (closes_all[c_bar] - tl_px) / atr_v
+                        if -0.25 <= dist_a <= 0.65 and closes_all[c_bar] > opens_all[c_bar]:
+                            long_ok[idx] = True
 
-    def sync_positions_and_trail_stops(self, state: dict, trail_ratio: float = 0.45, add_bot_log=None) -> list:
-        res = self._bybit_request("GET", "/v5/position/list", {"category": self.category, "settleCoin": "USDT"})
-        tp1_done_map = state.setdefault("tp1_partial_done", {})
-        native_trail_map = state.setdefault("native_trail_set", {})
-        pos_opened_map = state.setdefault("position_opened_ms", {})
-        now_ms = int(time.time() * 1000)
-        active_list = []
+                if sh_ptr >= 2:
+                    (i1, p1), (i2, p2) = swing_highs[sh_ptr - 2], swing_highs[sh_ptr - 1]
+                    if i2 > i1 and p2 < p1:
+                        tl_px = p2 + ((p2 - p1) / float(i2 - i1)) * float(c_bar - i2)
+                        dist_a = (tl_px - closes_all[c_bar]) / atr_v
+                        if -0.25 <= dist_a <= 0.65 and closes_all[c_bar] < opens_all[c_bar]:
+                            short_ok[idx] = True
+        elif "donchian" in sid:
+            long_ok[1:] = (p_st == 1) & (curr_open >= p_don_h * 0.998) & (p_vol >= 1.05)
+            short_ok[1:] = (p_st == -1) & (curr_open <= p_don_l * 1.002) & (p_vol >= 1.05)
+        elif "vol_surge" in sid or "ob_imbalance" in sid or "supertrend_adx" in sid:
+            long_ok[1:] = (p_vol >= 1.25) & (p_adx >= 20) & (p_di > 0)
+            short_ok[1:] = (p_vol >= 1.25) & (p_adx >= 20) & (p_di < 0)
+        elif "bb_" in sid or "squeeze" in sid:
+            long_ok[1:] = (p_bbw > p_bbwm) & (p_bbp > 0.72)
+            short_ok[1:] = (p_bbw > p_bbwm) & (p_bbp < 0.28)
+        elif "stoch" in sid or "rsi" in sid:
+            long_ok[1:] = (p_rsi < 44) & (p_sk > p_sd)
+            short_ok[1:] = (p_rsi > 56) & (p_sk < p_sd)
+        elif "ema_ribbon" in sid:
+            long_ok[1:] = (p_e20 > p_e50) & (curr_open > p_e20)
+            short_ok[1:] = (p_e20 < p_e50) & (curr_open < p_e20)
+        elif "macd" in sid:
+            long_ok[1:] = (p_macd > 0) & (p_d200 > 0)
+            short_ok[1:] = (p_macd < 0) & (p_d200 < 0)
+        elif "supertrend" in sid or "sar" in sid:
+            long_ok[1:] = (p_st == 1)
+            short_ok[1:] = (p_st == -1)
+        elif "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid or "orb" in sid:
+            long_ok[1:] = (p_vwap < -0.45) & (p_vol >= 1.15)
+            short_ok[1:] = (p_vwap > 0.45) & (p_vol >= 1.15)
+        else:
+            long_ok[1:] = (p_di > 0) & (p_vol >= 1.05)
+            short_ok[1:] = (p_di < 0) & (p_vol >= 1.05)
 
-        for item in res.get("result", {}).get("list", []):
-            size = _safe_float(item.get("size"), 0.0)
-            if size <= 0.0:
-                continue
+        return long_ok, short_ok
 
-            bybit_sym = str(item.get("symbol", "")).upper()
-            side = "LONG" if str(item.get("side", "")).lower() == "buy" else "SHORT"
-            entry = _safe_float(item.get("avgPrice"), 0.0)
-            mark = _safe_float(item.get("markPrice"), entry)
-            cur_sl = _safe_float(item.get("stopLoss"), 0.0)
-            cur_tp = _safe_float(item.get("takeProfit"), 0.0)
-            cur_trail = _safe_float(item.get("trailingStop"), 0.0)
-            created_ms = _safe_int(item.get("createdTime"), 0)
-            opened_ms = _safe_int(pos_opened_map.get(bybit_sym), created_ms or now_ms)
-            pos_opened_map[bybit_sym] = opened_ms
-
-            if entry > 0.0 and mark > 0.0 and cur_tp > 0.0:
-                tp_dist = abs(cur_tp - entry)
-                profit_dist = (mark - entry) if side == "LONG" else (entry - mark)
-                filters = self._get_instrument_filters(bybit_sym)
-                pos_key = f"{bybit_sym}_{entry:.6f}"
-
-                if filters and cur_trail <= 0.0 and not native_trail_map.get(pos_key, False):
-                    _, _, _, tick_size = filters
-                    if self._arm_native_trailing_stop(bybit_sym, side, entry, tp_dist, tick_size, trail_ratio):
-                        native_trail_map[pos_key] = True
-
-                age_hours = (now_ms - opened_ms) / 3_600_000.0
-                if filters and age_hours >= 8.0 and tp_dist > 0.0 and profit_dist < (tp_dist * 0.25):
-                    qty_step, _, _, tick_size = filters
-                    if profit_dist >= 0.0:
-                        close_side = "Sell" if side == "LONG" else "Buy"
-                        c_res = self._bybit_request("POST", "/v5/order/create", body={
-                            "category": self.category,
-                            "symbol": bybit_sym,
-                            "side": close_side,
-                            "orderType": "Market",
-                            "qty": self._format_step(size, qty_step),
-                            "timeInForce": "IOC",
-                            "reduceOnly": True,
-                            "positionIdx": 0,
-                        })
-                        if c_res.get("retCode") == 0:
-                            if add_bot_log:
-                                add_bot_log(f"TIME-STOP EXIT ({age_hours:.1f}h stagnant): Closed {bybit_sym} {side} near breakeven/profit to free capital.")
-                            continue
-                    else:
-                        tight_sl = (entry - tp_dist * 0.25) if side == "LONG" else (entry + tp_dist * 0.25)
-                        valid_vs_mark = (tight_sl < mark * 0.9985) if side == "LONG" else (tight_sl > mark * 1.0015)
-                        better_than_cur = (cur_sl == 0.0 or tight_sl > cur_sl * 1.0005) if side == "LONG" else (cur_sl == 0.0 or tight_sl < cur_sl * 0.9995)
-                        if valid_vs_mark and better_than_cur:
-                            self._bybit_request("POST", "/v5/position/trading-stop", body={
-                                "category": self.category,
-                                "symbol": bybit_sym,
-                                "stopLoss": self._format_step(tight_sl, tick_size),
-                                "slTriggerBy": "MarkPrice",
-                                "positionIdx": 0,
-                            })
-                            cur_sl = tight_sl
-                            if add_bot_log:
-                                add_bot_log(f"TIME-STOP GUARD ({age_hours:.1f}h stagnant): Tightened {bybit_sym} {side} SL to {self._format_step(tight_sl, tick_size)}")
-
-                if filters and tp_dist > 0.0 and profit_dist >= tp_dist * 0.65:
-                    qty_step, min_qty, min_notional, tick_size = filters
-                    be_sl = (entry + tp_dist * 0.15) if side == "LONG" else (entry - tp_dist * 0.15)
-                    need_be = (cur_sl == 0.0 or be_sl > cur_sl * 1.0005) if side == "LONG" else (
-                        cur_sl == 0.0 or be_sl < cur_sl * 0.9995
-                    )
-                    if need_be:
-                        self._bybit_request("POST", "/v5/position/trading-stop", body={
-                            "category": self.category,
-                            "symbol": bybit_sym,
-                            "stopLoss": self._format_step(be_sl, tick_size),
-                            "slTriggerBy": "MarkPrice",
-                            "positionIdx": 0,
-                        })
-                        cur_sl = be_sl
-
-                if filters and tp_dist > 0.0 and profit_dist >= tp_dist * 0.85:
-                    qty_step, min_qty, min_notional, tick_size = filters
-                    if not tp1_done_map.get(pos_key, False):
-                        half_qty = size * 0.5
-                        if half_qty >= min_qty and (half_qty * mark) >= min_notional:
-                            close_side = "Sell" if side == "LONG" else "Buy"
-                            p_res = self._bybit_request("POST", "/v5/order/create", body={
-                                "category": self.category,
-                                "symbol": bybit_sym,
-                                "side": close_side,
-                                "orderType": "Market",
-                                "qty": self._format_step(half_qty, qty_step),
-                                "timeInForce": "IOC",
-                                "reduceOnly": True,
-                                "positionIdx": 0,
-                            })
-                            if p_res.get("retCode") == 0:
-                                tp1_done_map[pos_key] = True
-
-                    trail_offset = tp_dist * trail_ratio
-                    cand_sl = max(entry + tp_dist * 0.55, mark - trail_offset) if side == "LONG" else min(
-                        entry - tp_dist * 0.55, mark + trail_offset
-                    )
-                    should_tighten = (cur_sl == 0.0 or cand_sl > cur_sl * 1.0005) if side == "LONG" else (
-                        cur_sl == 0.0 or cand_sl < cur_sl * 0.9995
-                    )
-                    if should_tighten:
-                        self._bybit_request("POST", "/v5/position/trading-stop", body={
-                            "category": self.category,
-                            "symbol": bybit_sym,
-                            "stopLoss": self._format_step(cand_sl, tick_size),
-                            "slTriggerBy": "MarkPrice",
-                            "positionIdx": 0,
-                        })
-
-            active_list.append({
-                "symbol": bybit_sym,
-                "side": side,
-                "qty": str(item.get("size", "0")),
-                "entry_price": entry,
-                "mark_price": mark,
-                "unrealized_pnl": _safe_float(item.get("unrealisedPnl"), 0.0),
-            })
-        return active_list
-
-    def emergency_close_all(self) -> list:
-        state = self._load_state()
-        open_positions = self.sync_positions_and_trail_stops(state)
-        closed = []
-        for pos in open_positions:
-            close_side = "Sell" if pos["side"] == "LONG" else "Buy"
-            res = self._bybit_request("POST", "/v5/order/create", body={
-                "category": self.category,
-                "symbol": pos["symbol"],
-                "side": close_side,
-                "orderType": "Market",
-                "qty": str(pos["qty"]),
-                "timeInForce": "IOC",
-                "reduceOnly": True,
-                "positionIdx": 0,
-            })
-            closed.append({"symbol": pos["symbol"], "ok": res.get("retCode") == 0})
-        state["virtual_open_positions"] = []
-        self._save_state(state)
-        return closed
-
-    def run_live_cycle(
+    def _simulate_strategy_on_tf(
         self,
-        leverage: int = 10,
-        risk_per_trade_pct: float = 1.5,
-        max_open_positions: int = 2,
+        test_df: pd.DataFrame,
+        p_long: np.ndarray,
+        p_short: np.ndarray,
+        strategy_id: str,
+        timeframe: str,
+        leverage: int,
+        initial_capital: float,
+        is_forex: bool = False,
+        htf_dir_aligned: np.ndarray = None,
+        relaxed_filter: bool = False,
+        extra_quantile_thresholds: list = None,
+        extended_param_sweep: bool = False,
+    ) -> dict:
+        round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (BYBIT_TAKER_FEE * 2.0)
+        dyn_spec = self.dynamic_strategies.get(strategy_id)
+
+        param_configs = [
+            (0.18, 1.05, 1.60, False, 1.8),
+            (0.24, 1.15, 1.75, False, 1.8),
+            (0.30, 1.30, 1.90, True, 1.8),
+            (0.36, 1.45, 2.05, True, 1.8),
+            (0.42, 1.65, 2.20, True, 1.8),
+        ] if is_forex else [
+            (0.22, 1.15, 1.70, False, 1.8),
+            (0.28, 1.25, 1.85, False, 1.8),
+            (0.34, 1.35, 2.00, True, 1.8),
+            (0.40, 1.50, 2.15, True, 1.8),
+            (0.46, 1.70, 2.35, True, 1.8),
+        ]
+
+        if extended_param_sweep or dyn_spec is not None:
+            param_configs.extend([
+                (0.20, 1.60, 2.40, False, 2.2),
+                (0.26, 1.80, 2.60, False, 2.4),
+                (0.32, 0.95, 1.55, False, 1.4),
+                (0.38, 1.95, 2.80, True, 2.5),
+            ])
+
+        if dyn_spec and isinstance(dyn_spec.get("fixed_config"), dict):
+            fc = dyn_spec["fixed_config"]
+            param_configs.insert(0, (
+                float(fc.get("long_thresh", 0.28)),
+                float(fc.get("sl_atr", 1.30)),
+                float(fc.get("tp1_rr", 1.90)),
+                str(fc.get("mtf_alignment_mode", "SOFT")).upper() == "STRICT",
+                float(fc.get("trail_atr", 1.80)),
+            ))
+
+        if extra_quantile_thresholds:
+            for qt in extra_quantile_thresholds:
+                param_configs.append((round(float(qt), 4), 1.25, 1.85, False, 1.9))
+
+        opens = test_df["Open"].to_numpy()
+        highs = test_df["High"].to_numpy()
+        lows = test_df["Low"].to_numpy()
+        atrs = test_df["ATR"].to_numpy()
+        vols = test_df["Vol_Surge"].to_numpy()
+        n_bars = len(test_df)
+
+        f_long, f_short = self._compute_vectorized_filter_masks(test_df, strategy_id, relaxed=relaxed_filter)
+
+        min_req_trades = 4 if is_forex else 8
+        best_eval = None
+        best_score = -9999999.0
+
+        mtf_modes_to_test = ["OFF", "SOFT", "STRICT"] if htf_dir_aligned is not None else ["OFF"]
+
+        for thresh, sl_atr, tp1_rr, require_htf, trail_mult in param_configs:
+            for mtf_mode_label in mtf_modes_to_test:
+                if mtf_mode_label == "OFF" and require_htf:
+                    continue
+
+                tp2_rr = tp1_rr * 1.75
+                cfg = {
+                    "long_thresh": thresh,
+                    "short_thresh": thresh,
+                    "sl_atr": sl_atr,
+                    "tp1_rr": tp1_rr,
+                    "tp2_rr": tp2_rr,
+                    "trail_atr": trail_mult,
+                    "strategy_id": strategy_id,
+                    "timeframe": timeframe,
+                    "mtf_alignment_mode": mtf_mode_label,
+                    "relaxed_filter": relaxed_filter,
+                }
+                if dyn_spec:
+                    cfg["custom_rules"] = dyn_spec
+
+                le_arr = np.zeros(n_bars, dtype=bool)
+                se_arr = np.zeros(n_bars, dtype=bool)
+                le_arr[1:] = (p_long[:-1] >= thresh) & f_long[1:]
+                se_arr[1:] = (p_short[:-1] >= thresh) & f_short[1:]
+
+                if mtf_mode_label != "OFF" and htf_dir_aligned is not None:
+                    conv_boost = 0.05 if mtf_mode_label == "SOFT" else 0.08
+                    vol_req = 1.10 if mtf_mode_label == "SOFT" else 1.25
+                    hc_l = np.zeros(n_bars, dtype=bool)
+                    hc_s = np.zeros(n_bars, dtype=bool)
+                    hc_l[1:] = (p_long[:-1] >= thresh + conv_boost) & (vols[:-1] >= vol_req)
+                    hc_s[1:] = (p_short[:-1] >= thresh + conv_boost) & (vols[:-1] >= vol_req)
+                    le_arr = le_arr & ((htf_dir_aligned == 1) | hc_l)
+                    se_arr = se_arr & ((htf_dir_aligned == -1) | hc_s)
+
+                trades_pnl = []
+                equity = initial_capital
+                in_pos = False
+                side_long = True
+                entry = sl = tp1 = tp2 = high_w = low_w = 0.0
+                tp1_hit = False
+
+                for i in range(1, n_bars):
+                    h = highs[i]
+                    l = lows[i]
+                    atr = atrs[i - 1]
+
+                    if not in_pos:
+                        le = le_arr[i]
+                        se = se_arr[i]
+                        if le and se:
+                            if p_long[i - 1] >= p_short[i - 1]:
+                                se = False
+                            else:
+                                le = False
+                        if le != se:
+                            in_pos = True
+                            side_long = le
+                            entry = opens[i]
+                            high_w = low_w = entry
+                            tp1_hit = False
+                            min_sl_floor = entry * (0.0020 if is_forex else 0.0155)
+                            risk = max(sl_atr * atr, min_sl_floor)
+                            if side_long:
+                                sl = entry - risk
+                                tp1 = entry + risk * tp1_rr
+                                tp2 = entry + risk * tp2_rr
+                            else:
+                                sl = entry + risk
+                                tp1 = entry - risk * tp1_rr
+                                tp2 = entry - risk * tp2_rr
+                    else:
+                        if side_long:
+                            if h > high_w:
+                                high_w = h
+                            if h >= tp1 and not tp1_hit:
+                                tp1_hit = True
+                                sl = entry + 0.20 * (tp1 - entry)
+                            if tp1_hit:
+                                tr_sl = high_w - trail_mult * atr
+                                if tr_sl > sl:
+                                    sl = tr_sl
+                            if l <= sl or h >= tp2:
+                                ex = sl if l <= sl else tp2
+                                raw_ret = (0.5 * ((tp1 - entry) / entry) + 0.5 * ((ex - entry) / entry)) if tp1_hit else ((ex - entry) / entry)
+                                pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
+                                equity += pnl_usdt
+                                trades_pnl.append(pnl_usdt)
+                                in_pos = False
+                        else:
+                            if l < low_w:
+                                low_w = l
+                            if l <= tp1 and not tp1_hit:
+                                tp1_hit = True
+                                sl = entry - 0.20 * (entry - tp1)
+                            if tp1_hit:
+                                tr_sl = low_w + trail_mult * atr
+                                if tr_sl < sl:
+                                    sl = tr_sl
+                            if h >= sl or l <= tp2:
+                                ex = sl if h >= sl else tp2
+                                raw_ret = (0.5 * ((entry - tp1) / entry) + 0.5 * ((entry - ex) / entry)) if tp1_hit else ((entry - ex) / entry)
+                                pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
+                                equity += pnl_usdt
+                                trades_pnl.append(pnl_usdt)
+                                in_pos = False
+
+                arr = np.array(trades_pnl)
+                wins = arr[arr > 0]
+                losses = arr[arr < 0]
+                total_trades = int(len(arr))
+                wr = round((len(wins) / total_trades * 100.0), 2) if total_trades > 0 else 0.0
+                pf = round(float(wins.sum() / abs(losses.sum())), 2) if len(losses) > 0 else round(float(wins.sum()), 2)
+                net_usdt = round(float(equity - initial_capital), 2)
+                net_pct = round((net_usdt / initial_capital) * 100.0, 2)
+                sample_conf = min(np.sqrt(max(total_trades, 1)), 8.0)
+
+                # Walk-forward two-half stability check against single-spike overfitting
+                half_idx = max(1, total_trades // 2)
+                first_half_pnl = float(arr[:half_idx].sum()) if total_trades >= 4 else net_usdt
+                second_half_pnl = float(arr[half_idx:].sum()) if total_trades >= 4 else net_usdt
+                walk_forward_mult = 1.15 if (first_half_pnl > 0.0 and second_half_pnl > 0.0) else 0.72
+
+                if total_trades == 0:
+                    score = -100000.0
+                elif total_trades >= (4 if dyn_spec is not None else min_req_trades) and pf >= 1.20 and wr >= 48.0 and net_usdt > 0:
+                    score = ((net_usdt * (sample_conf / 3.5)) + (pf * 30.0) + (wr * 0.5)) * walk_forward_mult
+                elif total_trades >= min_req_trades and pf >= 1.10 and net_usdt > 0:
+                    score = ((net_usdt * 0.6) + (pf * 20.0) + (wr * 0.3)) * walk_forward_mult
+                elif total_trades >= min_req_trades:
+                    score = -5000.0 + net_usdt + (pf * 15.0) + (wr * 0.2)
+                else:
+                    score = -25000.0 + (total_trades * 150.0) + net_usdt
+
+                if best_eval is None or score > best_score:
+                    best_score = score
+                    best_eval = {
+                        "score": score,
+                        "cfg": cfg,
+                        "stats": {
+                            "trades": total_trades,
+                            "win_rate_pct": wr,
+                            "profit_factor": pf,
+                            "leverage": leverage,
+                            "net_pnl_pct": net_pct,
+                            "net_pnl_usdt": net_usdt,
+                            "net_pnl": net_usdt,
+                        },
+                    }
+        return best_eval
+
+    def _filter_archetype_key(self, strategy_id: str) -> str:
+        if strategy_id in self.dynamic_strategies:
+            return strategy_id
+        sid = strategy_id.lower()
+        if "trendline" in sid:
+            return "trendline"
+        if "donchian" in sid:
+            return "donchian"
+        if "vol_surge" in sid or "ob_imbalance" in sid or "supertrend_adx" in sid:
+            return "vol_adx"
+        if "bb_" in sid or "squeeze" in sid:
+            return "bb_squeeze"
+        if "stoch" in sid or "rsi" in sid:
+            return "rsi_stoch"
+        if "ema_ribbon" in sid:
+            return "ema_ribbon"
+        if "macd" in sid:
+            return "macd"
+        if "supertrend" in sid or "sar" in sid:
+            return "supertrend"
+        if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid or "orb" in sid:
+            return "vwap_smc"
+        return "default"
+
+    def train_and_evaluate_paper_coins(
+        self,
+        added_coins: list,
+        active_strategies: list,
+        timeframes: list = None,
+        leverage: int = DEFAULT_LEVERAGE,
+        initial_capital: float = 10000.0,
         crypto_enabled: bool = True,
         forex_enabled: bool = False,
-        live_orders_armed: bool = False,
-        mtf_mode: str = "STRICT",
-        btc_macro_guard: bool = True,
-        daily_drawdown_pct: float = 0.0,
-        max_daily_loss_pct: float = 3.0,
-        bot_logs_enabled: bool = True,
     ) -> dict:
-        if not os.path.exists(self.master_path):
-            raise FileNotFoundError(f"Master ML Model not found at {self.master_path}")
+        self.dynamic_strategies = self._load_dynamic_strategies()
+        leverage = min(max(int(leverage), 1), MAX_LEVERAGE)
+        test_tfs = [tf.lower() for tf in (timeframes or DEFAULT_TEST_TIMEFRAMES) if tf.lower() in TIMEFRAME_TO_BYBIT_INTERVAL]
+        if not test_tfs:
+            test_tfs = ["1h", "4h"]
 
-        leverage = min(max(int(leverage), 1), 20)
-        with open(self.master_path, "r", encoding="utf-8-sig") as f:
-            master = json.load(f)
+        diverse_defaults = [
+            "xgb_mtf_v2",
+            "trendline_retest_pro",
+            "xrp_donchian_breakout",
+            "btc_vol_surge_adx",
+            "bb_keltner_squeeze",
+            "eth_rsi_stoch_reversal",
+            "ema_ribbon_pullback",
+            "macd_hist_zero_cross",
+            "near_vwap_profile",
+        ]
+        base_strats = list(dict.fromkeys((list(active_strategies) if active_strategies else []) + diverse_defaults))
 
-        features = master.get("features", FEATURES)
-        portfolio = master.get("portfolio", {})
-        if not portfolio:
-            raise ValueError("No coins found in Live ML Model. Promote trained coins from Paper to Live first.")
+        raw_strats = list(dict.fromkeys(list(self.dynamic_strategies.keys()) + base_strats))
+        seen_archetypes = set()
+        strategies_to_test = []
+        for s in raw_strats:
+            arch = self._filter_archetype_key(s)
+            if arch not in seen_archetypes:
+                seen_archetypes.add(arch)
+                strategies_to_test.append(s)
 
-        state = self._load_state()
-        traded_candle_ts = state.setdefault("traded_candle_ts", {})
-        last_trade_epoch_ms = state.setdefault("last_trade_epoch_ms", {})
-        pos_opened_map = state.setdefault("position_opened_ms", {})
-        loss_cooldown_until_ms = state.setdefault("loss_cooldown_until_ms", {})
-        agentic_veto_until_ms = state.setdefault("agentic_veto_until_ms", {})
-        restricted_until_ms = state.setdefault("restricted_symbols_until_ms", {})
-        daily_coin_trades = state.setdefault("daily_coin_trades", {})
-        native_trail_map = state.setdefault("native_trail_set", {})
-        bot_logs = state.setdefault("last_bot_logs", [])
+        # Load existing Paper champions so already-present coins only upgrade when retrain beats them
+        existing_paper_portfolio = {}
+        if os.path.exists(self.paper_master_path):
+            try:
+                with open(self.paper_master_path, "r", encoding="utf-8-sig") as ef:
+                    existing_paper_portfolio = json.load(ef).get("portfolio", {}) or {}
+            except Exception:
+                existing_paper_portfolio = {}
 
-        agentic_mem = self._load_agentic_memory()
-        agentic_coin_scores = agentic_mem.get("coin_scores", {}) or {}
-        session_stats = agentic_mem.get("session_stats", {}) or {}
+        filtered_coins = []
+        for sym in added_coins:
+            mkt = classify_market(sym)
+            if (mkt == "CRYPTO" and crypto_enabled) or (mkt == "FOREX" and forex_enabled):
+                filtered_coins.append(sym)
 
-        diagnostics = []
-        order_rejections = []
-        trade_blocks = []
-        radar_signals = []
+        trained_coins = {}
+        paper_portfolio = {}
+        total_net_pnl = 0.0
+        win_rates = []
 
-        now_ist = datetime.datetime.now(IST_TZ)
-        today_ist_str = now_ist.strftime("%Y-%m-%d")
-        clock_str = now_ist.strftime("%H:%M:%S IST")
-        curr_session = get_ist_session_name(now_ist)
+        for symbol in filtered_coins:
+            is_fx = (classify_market(symbol) == "FOREX")
+            exp_atr = 0.90 if is_fx else 1.15
+            dd_atr = 0.85 if is_fx else 0.95
+            hor_bars = 12 if is_fx else 10
+            min_req_trades = 4 if is_fx else 8
 
-        sess_data = session_stats.get(curr_session, {}) if isinstance(session_stats, dict) else {}
-        sess_wins = _safe_int(sess_data.get("wins"), 0)
-        sess_losses = _safe_int(sess_data.get("losses"), 0)
-        sess_total = sess_wins + sess_losses
-        session_prob_penalty = 0.03 if (sess_total >= 4 and (sess_wins / max(sess_total, 1)) < 0.35) else 0.0
-
-        def add_bot_log(msg: str):
-            if bot_logs_enabled:
-                bot_logs.append(f"[{clock_str}] {msg}")
-
-        if daily_coin_trades.get("_date_ist") != today_ist_str:
-            daily_coin_trades.clear()
-            daily_coin_trades["_date_ist"] = today_ist_str
-            state["daily_total_trades"] = 0
-            add_bot_log(f"Daily Counter Auto-Renewed for {today_ist_str} (12:00 AM IST).")
-
-        daily_total_trades = _safe_int(state.get("daily_total_trades"), 0)
-        now_ms = int(time.time() * 1000)
-
-        self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log)
-        funding_rates, mark_prices = self._fetch_tickers_cached() if crypto_enabled else ({}, {})
-
-        bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
-        bal_ret_code = _safe_int(bal_res.get("retCode"), -1) if bal_res else -1
-        if bal_ret_code != 0:
-            bal_msg = bal_res.get("retMsg", "Unable to fetch Unified USDT balance")
-            err_str = f"Bybit Wallet API Error [{bal_ret_code}]: {BYBIT_ERROR_HINTS.get(bal_ret_code, bal_msg)}"
-            order_rejections.append(err_str)
-            add_bot_log(err_str)
-        avail_usdt = self._extract_available_usdt(bal_res) if bal_ret_code == 0 else 0.0
-
-        btc_macro_bearish = False
-        btc_adx = 20.0
-        btc_natr = 1.8
-        if btc_macro_guard:
-            btc_st, btc_adx, btc_natr = self._get_cached_4h_metrics("BTCUSDT")
-            btc_macro_bearish = bool(btc_st == -1)
-
-        sl_mult, tp_mult, trail_ratio = self._regime_exit_multipliers(btc_adx, btc_natr, btc_macro_bearish)
-        open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio, add_bot_log=add_bot_log)
-        virtual_positions = self._sync_virtual_positions(state, mark_prices, trail_ratio, now_ms, add_bot_log)
-        open_syms = {p["symbol"] for p in open_positions} | {vp["symbol"] for vp in virtual_positions}
-
-        active_items = []
-        fetch_tasks = {}
-        for symbol, entry in portfolio.items():
-            if not isinstance(entry, dict):
-                continue
-            market_type = entry.get("market", "FOREX" if is_forex_symbol(symbol) else "CRYPTO").upper()
-            if (market_type == "CRYPTO" and not crypto_enabled) or (market_type == "FOREX" and not forex_enabled):
-                continue
-            cfg = entry.get("config", {})
-            bybit_sym = (cfg.get("bybit_symbol") or symbol.replace("/", "")).upper()
-            tf_str = (cfg.get("timeframe") or entry.get("timeframe") or "1h").lower()
-            interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_str, "60")
-            active_items.append((symbol, entry, market_type, cfg, bybit_sym, interval))
-            fetch_tasks[(bybit_sym, interval)] = (bybit_sym, interval, 230)
-            if interval != "240":
-                cached = self._trend_4h_cache.get(bybit_sym)
-                if not cached or (time.time() - cached[0]) >= 600.0:
-                    fetch_tasks[(bybit_sym, "240")] = (bybit_sym, "240", 220)
-
-        fetched_candles = {}
-        if fetch_tasks:
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                futures = {
-                    k: pool.submit(self.fetch_bybit_candles, v[0], v[1], v[2])
-                    for k, v in fetch_tasks.items()
-                }
-                for k, fut in futures.items():
-                    try:
-                        fetched_candles[k] = fut.result()
-                    except Exception:
-                        fetched_candles[k] = pd.DataFrame()
-
-        now_s = time.time()
-        for (sym_k, int_k), df_4h_raw in fetched_candles.items():
-            if int_k == "240" and len(df_4h_raw) >= 210:
-                df_4h = self.build_features(df_4h_raw)
+            htf_trend = None
+            raw_4h = self.fetch_bybit_history(symbol, timeframe="4h", days=TRAINING_WINDOW_DAYS)
+            if len(raw_4h) >= 210:
+                df_4h = self.build_matrix(raw_4h, max_dd=dd_atr, expansion=exp_atr, horizon=hor_bars)
                 if not df_4h.empty:
-                    ref_bar = df_4h.iloc[-2] if len(df_4h) >= 2 else df_4h.iloc[-1]
-                    self._trend_4h_cache[sym_k] = (
-                        now_s,
-                        int(ref_bar["Supertrend"]),
-                        _safe_float(ref_bar.get("ADX"), 20.0),
-                        _safe_float(ref_bar.get("NATR"), 1.8),
-                    )
+                    htf_trend = df_4h["Supertrend"]
+                del df_4h
 
-        candidates = []
-        top_wait_tuple = None
-        coins_scanned_count = 0
+            best_candidate = None
+            all_tf_runs = []
+            cached_tf_bundles = []
 
-        for symbol, entry, market_type, cfg, bybit_sym, interval in active_items:
-            coins_scanned_count += 1
-            models_map = entry.get("models", {})
-            long_data = models_map.get("long") or models_map.get("long_model")
-            short_data = models_map.get("short") or models_map.get("short_model")
-            if not is_valid_xgb_model(long_data) or not is_valid_xgb_model(short_data):
-                err_msg = f"{bybit_sym}: Missing valid XGBoost booster weights"
-                diagnostics.append(err_msg)
-                order_rejections.append(err_msg)
-                continue
-
-            strat_id = cfg.get("strategy_id") or entry.get("strategy_id") or "xgb_mtf_v2"
-            is_relaxed = bool(cfg.get("relaxed_filter", False))
-            custom_rules = cfg.get("custom_rules")
-
-            df_raw = fetched_candles.get((bybit_sym, interval), pd.DataFrame())
-            if len(df_raw) < 210:
-                diagnostics.append(f"{bybit_sym}: Insufficient candles ({len(df_raw)}/210)")
-                continue
-
-            df = self.build_features(df_raw)
-            if len(df) < 3:
-                continue
-
-            closed_bar = df.iloc[-2]
-            live_bar = df.iloc[-1]
-            latest_bar_ms = int(df.index[-1].timestamp() * 1000)
-
-            try:
-                x_row = df.iloc[[-2]][features].to_numpy(dtype="float32")
-                dmat = xgb.DMatrix(x_row, feature_names=features)
-                p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
-                p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
-            except Exception as e:
-                err_msg = f"{bybit_sym}: Booster error - {e}"
-                diagnostics.append(err_msg)
-                order_rejections.append(err_msg)
-                continue
-
-            direction = "LONG" if p_long >= p_short else "SHORT"
-            raw_prob = p_long if direction == "LONG" else p_short
-            default_th = 0.24 if market_type == "FOREX" else 0.28
-            req_thresh = _safe_float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh"), default_th)
-
-            if interval == "240":
-                trend_4h = int(closed_bar["Supertrend"])
-            else:
-                cached_4h = self._trend_4h_cache.get(bybit_sym)
-                trend_4h = cached_4h[1] if cached_4h else 0
-
-            adx_val = _safe_float(closed_bar.get("ADX"), 0.0)
-            raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
-            high_conv_rev = (raw_prob >= req_thresh + 0.06) and (_safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.15)
-
-            decoupled_leader = raw_4h_ok and (adx_val >= 22.0) and (raw_prob >= req_thresh + 0.04)
-            guard_blocked = (
-                btc_macro_bearish
-                and direction == "LONG"
-                and market_type == "CRYPTO"
-                and not bybit_sym.startswith("BTC")
-                and not decoupled_leader
-            )
-
-            fr_val = _safe_float(funding_rates.get(bybit_sym), 0.0) if market_type == "CRYPTO" else 0.0
-            funding_blocked = (direction == "LONG" and fr_val > 0.0004) or (direction == "SHORT" and fr_val < -0.0004)
-
-            effective_mtf = str(cfg.get("mtf_alignment_mode") or entry.get("mtf_alignment_mode") or mtf_mode).upper()
-            if effective_mtf == "OFF":
-                mtf_aligned = not guard_blocked
-            elif effective_mtf == "SOFT":
-                mtf_aligned = (raw_4h_ok or (raw_prob >= (req_thresh + 0.04) and _safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.10)) and not guard_blocked
-            else:
-                mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
-
-            disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
-
-            in_cooldown = (
-                now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0)
-                or now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
-                or now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0)
-                or bybit_sym in open_syms
-            )
-
-            anti_chase_ok, chase_reason = self._passes_anti_chase_guard(closed_bar, live_bar, direction)
-            strat_ok = self._strategy_entry_filter(
-                strat_id,
-                _safe_float(live_bar["Open"], 0.0),
-                closed_bar,
-                direction,
-                relaxed=is_relaxed,
-                custom_rules=custom_rules,
-            )
-
-            learned_score = _safe_float(agentic_coin_scores.get(disp_sym), 0.0)
-            effective_min_prob = max(req_thresh * 0.94, 0.21) + session_prob_penalty
-
-            # Balanced flow: allow 4H-aligned setups OR strong high-conviction setups (ADX >= 14.5)
-            mtf_or_momentum_ok = raw_4h_ok or (raw_prob >= effective_min_prob + 0.05 and adx_val >= 18.0)
-            base_conv = int(min(100, max(45, round((raw_prob / max(req_thresh, 0.16)) * 75 + (10 if raw_4h_ok else -4) + min(adx_val * 0.25, 8)))))
-            grade_ok = (base_conv >= 66) and mtf_or_momentum_ok and (adx_val >= 14.5) and (learned_score >= -10.0)
-
-            all_gates_ready = (
-                (not in_cooldown)
-                and mtf_aligned
-                and strat_ok
-                and anti_chase_ok
-                and grade_ok
-                and (not funding_blocked)
-                and (raw_prob >= effective_min_prob)
-            )
-            # Radar shows 90-100% ONLY when all execution gates pass (so Radar matches bot execution)
-            conv_pct = base_conv if all_gates_ready else min(base_conv, 64)
-            aligned_flag = bool(all_gates_ready)
-
-            radar_signals.append({
-                "symbol": disp_sym,
-                "direction": direction,
-                "confidence_pct": conv_pct,
-                "mtf_aligned": aligned_flag,
-                "side": direction,
-                "conviction_pct": conv_pct,
-                "aligned_4h": aligned_flag,
-                "raw_prob": round(raw_prob, 4),
-            })
-
-            if now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0):
-                trade_blocks.append(f"{bybit_sym}: Contract agreement unsigned on Bybit [110126]")
-                continue
-
-            if now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0):
-                rem_min = max(1, int((_safe_int(loss_cooldown_until_ms.get(bybit_sym), 0) - now_ms) / 60000))
-                cd_msg = f"{bybit_sym} {direction} ({conv_pct}%): 4h post-loss cooldown active ({rem_min}m left)"
-                trade_blocks.append(cd_msg)
-                diagnostics.append(cd_msg)
-                if top_wait_tuple is None or conv_pct > top_wait_tuple[0]:
-                    top_wait_tuple = (conv_pct, cd_msg)
-                continue
-
-            if now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0):
-                trade_blocks.append(f"{bybit_sym}: Vetoed by Agentic AI Supervisor")
-                continue
-
-            if bybit_sym in open_syms:
-                trade_blocks.append(f"{bybit_sym}: Already has an open position")
-                continue
-
-            quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 19.0 else 0.0) + (learned_score * 0.002)
-
-            if all_gates_ready:
-                if conv_pct >= 90 and raw_4h_ok and adx_val >= 22.0:
-                    grade_tag = "A+"
-                elif conv_pct >= 80 and adx_val >= 18.5:
-                    grade_tag = "A"
-                elif conv_pct >= 72 and adx_val >= 16.0:
-                    grade_tag = "B+"
-                else:
-                    grade_tag = "B"
-
-                candidates.append({
-                    "edge": quality_edge,
-                    "conv_pct": conv_pct,
-                    "grade": grade_tag,
-                    "raw_prob": raw_prob,
-                    "req_thresh": effective_min_prob,
-                    "bybit_sym": bybit_sym,
-                    "market_type": market_type,
-                    "direction": direction,
-                    "cfg": cfg,
-                    "closed_bar": closed_bar.copy(),
-                    "live_bar": live_bar.copy(),
-                    "latest_bar_ms": latest_bar_ms,
-                    "candles_df": df.iloc[:-1].tail(72).copy(),
-                    "adx_val": adx_val,
-                    "fr_val": fr_val,
-                })
-            else:
-                reasons = []
-                if guard_blocked:
-                    reasons.append("BTC 4H Guard")
-                elif not mtf_aligned:
-                    reasons.append(f"4H MTF ({effective_mtf})")
-                if funding_blocked:
-                    reasons.append(f"Crowded funding ({fr_val * 100:+.3f}%)")
-                if not anti_chase_ok:
-                    reasons.append(chase_reason)
-                if not strat_ok:
-                    reasons.append(f"Waiting for {strat_id}")
-                if not grade_ok:
-                    reasons.append(f"Below B floor (Conv {base_conv}%<66% or ADX {adx_val:.1f}<14.5)")
-                if raw_prob < effective_min_prob:
-                    reasons.append(f"Prob {raw_prob:.2f} < {effective_min_prob:.2f}")
-                block_msg = f"{bybit_sym} {direction} ({conv_pct}%): {', '.join(reasons)} [ADX:{adx_val:.1f}]"
-                diagnostics.append(block_msg)
-                trade_blocks.append(block_msg)
-                if top_wait_tuple is None or conv_pct > top_wait_tuple[0]:
-                    top_wait_tuple = (conv_pct, block_msg)
-
-        radar_signals.sort(key=lambda x: (x["mtf_aligned"], x["confidence_pct"]), reverse=True)
-        candidates.sort(key=lambda x: x["edge"], reverse=True)
-
-        live_trades_this_cycle = 0
-
-        for cand in candidates:
-            bybit_sym = cand["bybit_sym"]
-            if daily_drawdown_pct >= max_daily_loss_pct and max_daily_loss_pct > 0.0:
-                msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
-                diagnostics.append(msg)
-                trade_blocks.append(msg)
-                order_rejections.append(msg)
-                add_bot_log(msg)
-                break
-            if len(open_syms) >= 1:
-                msg = f"{bybit_sym} {cand['direction']} skipped: Focus mode (1 open position max)"
-                diagnostics.append(msg)
-                trade_blocks.append(msg)
-                break
-            if live_orders_armed and avail_usdt < 2.0:
-                msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT too low (${avail_usdt:.2f} < $2.00)"
-                diagnostics.append(msg)
-                trade_blocks.append(msg)
-                order_rejections.append(msg)
-                add_bot_log(msg)
-                break
-            if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
-                msg = f"{bybit_sym} {cand['direction']} ({cand['conv_pct']}%) skipped: Already traded this candle"
-                diagnostics.append(msg)
-                add_bot_log(msg)
-                continue
-            if (now_ms - _safe_int(last_trade_epoch_ms.get(bybit_sym), 0)) < 30 * 60 * 1000:
-                rem_m = max(1, int((30 * 60 * 1000 - (now_ms - _safe_int(last_trade_epoch_ms.get(bybit_sym), 0))) / 60000))
-                msg = f"{bybit_sym} {cand['direction']} ({cand['conv_pct']}%) skipped: 30m trade cooldown ({rem_m}m left)"
-                diagnostics.append(msg)
-                add_bot_log(msg)
-                continue
-
-            filters = self._get_instrument_filters(bybit_sym)
-            if filters is None:
-                msg = f"{bybit_sym} skipped: Not tradable on Bybit Linear"
-                diagnostics.append(msg)
-                add_bot_log(msg)
-                continue
-            qty_step, min_qty, min_notional, tick_size = filters
-
-            live_bar = cand["live_bar"]
-            closed_bar = cand["closed_bar"]
-            cfg = cand["cfg"]
-            price = _safe_float(live_bar["Close"], 0.0)
-            atr = _safe_float(closed_bar["ATR"], 0.0)
-            if price <= 0.0 or atr <= 0.0:
-                continue
-
-            sl_atr = max(_safe_float(cfg.get("sl_atr"), 1.55) * sl_mult, 1.50)
-            tp_rr = min(max(_safe_float(cfg.get("tp1_rr"), 1.65) * tp_mult, 1.50), 1.85)
-
-            min_sl_floor = price * (0.0020 if cand["market_type"] == "FOREX" else 0.0155)
-            risk_dist = max(sl_atr * atr, min_sl_floor)
-
-            sim_equity = avail_usdt if avail_usdt >= 2.0 else 10.0
-            max_buying_power = sim_equity * leverage * 0.85
-            min_required_notional = max(min_notional * 1.05, min_qty * price)
-            if live_orders_armed and max_buying_power < min_required_notional:
-                msg = f"{bybit_sym} {cand['direction']} skipped: Min order ${min_required_notional:.2f} > buying power ${max_buying_power:.2f} (Avail ${avail_usdt:.2f})"
-                diagnostics.append(msg)
-                add_bot_log(msg)
-                continue
-
-            conv_scale = self._conviction_risk_scale(_safe_float(cand.get("raw_prob"), 0.3), _safe_float(cand.get("req_thresh"), 0.3))
-            max_risk_cap = max(risk_per_trade_pct * 1.20, 2.50)
-            scaled_risk_pct = min(max(risk_per_trade_pct * conv_scale, 0.50), max_risk_cap)
-            risk_usdt = max(sim_equity * (scaled_risk_pct / 100.0), 0.15)
-            notional = min(max(risk_usdt / (risk_dist / price), min_required_notional, 5.5), max(max_buying_power, min_required_notional))
-            qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)
-
-            is_long = cand["direction"] == "LONG"
-            sl_raw = (price - risk_dist) if is_long else (price + risk_dist)
-            tp_raw = (price + risk_dist * tp_rr) if is_long else (price - risk_dist * tp_rr)
-            sl_str = self._format_step(sl_raw, tick_size)
-            tp_str = self._format_step(tp_raw, tick_size)
-
-            try:
-                import ai_regime_copilot
-                shadow_cfg_path = os.path.join(self.live_dir, "ai_shadow_config.json")
-                gem_shadow_on = False
-                gem_shadow_key = ""
-                if os.path.exists(shadow_cfg_path):
-                    with open(shadow_cfg_path, "r", encoding="utf-8-sig") as scf:
-                        sc_data = json.load(scf)
-                        gem_shadow_on = bool(sc_data.get("gemini_shadow_enabled", False))
-                        gem_shadow_key = str(sc_data.get("gemini_api_key", "")).strip()
-
-                pa_res = ai_regime_copilot.evaluate_pre_trade_human_brain(
-                    live_dir=self.live_dir,
-                    symbol=bybit_sym,
-                    side=cand["direction"],
-                    candles_df=cand.get("candles_df"),
-                    adx_val=_safe_float(cand.get("adx_val"), 20.0),
-                    funding_rate=_safe_float(cand.get("fr_val"), 0.0),
-                    session_name=curr_session,
-                    gemini_enabled=gem_shadow_on,
-                    gemini_api_key=gem_shadow_key,
-                )
-                if pa_res.get("shadow_log"):
-                    add_bot_log(pa_res["shadow_log"])
-
-                if pa_res.get("decision") == "REJECT":
-                    l1_why = "; ".join(pa_res.get("reasons", [])[:2])
-                    msg = f"{bybit_sym} {cand['direction']} blocked by Layer 1 Human Brain ({pa_res.get('score', 0)}/100): {l1_why}"
-                    diagnostics.append(msg)
-                    trade_blocks.append(msg)
-                    add_bot_log(msg)
+            for tf in test_tfs:
+                raw = raw_4h if (tf == "4h" and not raw_4h.empty) else self.fetch_bybit_history(symbol, timeframe=tf, days=TRAINING_WINDOW_DAYS)
+                if len(raw) < 300:
                     continue
-                else:
-                    add_bot_log(f"[LAYER 1 APPROVED] {bybit_sym} {cand['direction']} ({pa_res.get('score', 75)}/100): {'; '.join(pa_res.get('reasons', [])[:1])}")
-            except Exception as l1_err:
-                add_bot_log(f"[LAYER 1 ERROR] {bybit_sym} {cand['direction']} skipped: {l1_err}")
+
+                df = self.build_matrix(raw, max_dd=dd_atr, expansion=exp_atr, horizon=hor_bars)
+                if len(df) < 180:
+                    continue
+
+                split = int(len(df) * 0.65)
+                train_end = max(120, split - hor_bars)
+                train_df = df.iloc[:train_end]
+                test_df = df.iloc[split:]
+                if len(test_df) < 60:
+                    continue
+
+                f_means = train_df[FEATURES].mean().tolist()
+                f_stds = train_df[FEATURES].std().replace(0, 1.0).fillna(1.0).tolist()
+                clf_long, clf_short = self._fit_xgb_pair(train_df)
+
+                X_test = test_df[FEATURES].astype("float32")
+                p_long = clf_long.predict_proba(X_test)[:, 1]
+                p_short = clf_short.predict_proba(X_test)[:, 1]
+
+                htf_dir_aligned = None
+                if tf != "4h" and htf_trend is not None and not htf_trend.empty:
+                    aligned_series = htf_trend.reindex(test_df.index, method="ffill").fillna(0)
+                    htf_dir_aligned = aligned_series.to_numpy(dtype=np.int8)
+
+                cached_tf_bundles.append((tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds, htf_dir_aligned))
+
+                for strat_id in strategies_to_test:
+                    eval_res = self._simulate_strategy_on_tf(
+                        test_df=test_df,
+                        p_long=p_long,
+                        p_short=p_short,
+                        strategy_id=strat_id,
+                        timeframe=tf.upper(),
+                        leverage=leverage,
+                        initial_capital=initial_capital,
+                        is_forex=is_fx,
+                        htf_dir_aligned=htf_dir_aligned,
+                    )
+                    st = eval_res["stats"]
+                    best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "STRICT")
+                    dyn_meta = self.dynamic_strategies.get(strat_id)
+                    strat_meta = dyn_meta if dyn_meta else STRATEGY_CATALOG_META.get(strat_id, {"name": strat_id.replace("_", " ").title()})
+                    strat_name = strat_meta.get("name", strat_id)
+
+                    all_tf_runs.append({
+                        "strategy_id": strat_id,
+                        "strategy_name": strat_name,
+                        "timeframe": tf.upper(),
+                        "mtf_mode": best_mtf,
+                        "trades": st["trades"],
+                        "win_rate_pct": st["win_rate_pct"],
+                        "profit_factor": st["profit_factor"],
+                        "net_pnl_usdt": st["net_pnl_usdt"],
+                    })
+
+                    if best_candidate is None or eval_res["score"] > best_candidate["score"]:
+                        cfg = dict(eval_res["cfg"])
+                        cfg["bybit_symbol"] = symbol.replace("/", "").upper()
+                        cfg["strategy"] = f"{strat_name} ({tf.upper()} • MTF:{best_mtf})"
+                        best_candidate = {
+                            "score": eval_res["score"],
+                            "strategy_id": strat_id,
+                            "strategy_name": strat_name,
+                            "timeframe": tf.upper(),
+                            "stats": st,
+                            "cfg": cfg,
+                            "models": {
+                                "long": self._serialize_booster(clf_long),
+                                "short": self._serialize_booster(clf_short),
+                                "feature_means": f_means,
+                                "feature_stds": f_stds,
+                            },
+                        }
+
+            cur_trades = best_candidate["stats"]["trades"] if best_candidate else 0
+            cur_pnl = best_candidate["stats"]["net_pnl_usdt"] if best_candidate else -999.0
+            cur_pf = best_candidate["stats"]["profit_factor"] if best_candidate else 0.0
+
+            if (cur_trades < min_req_trades or cur_pnl <= 0.0 or cur_pf < 1.15) and cached_tf_bundles:
+                for tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds, htf_dir_aligned in cached_tf_bundles:
+                    q_thresholds = sorted(set([
+                        float(np.quantile(np.maximum(p_long, p_short), 0.72)),
+                        float(np.quantile(np.maximum(p_long, p_short), 0.80)),
+                        float(np.quantile(np.maximum(p_long, p_short), 0.88)),
+                    ]))
+                    eval_res = self._simulate_strategy_on_tf(
+                        test_df=test_df,
+                        p_long=p_long,
+                        p_short=p_short,
+                        strategy_id="xgb_adaptive_quantile",
+                        timeframe=tf.upper(),
+                        leverage=leverage,
+                        initial_capital=initial_capital,
+                        is_forex=is_fx,
+                        htf_dir_aligned=htf_dir_aligned,
+                        relaxed_filter=True,
+                        extra_quantile_thresholds=q_thresholds,
+                        extended_param_sweep=True,
+                    )
+                    st = eval_res["stats"]
+                    best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "OFF")
+                    if best_candidate is None or eval_res["score"] > best_candidate["score"]:
+                        cur_trades = st["trades"]
+                        cur_pnl = st["net_pnl_usdt"]
+                        cfg = dict(eval_res["cfg"])
+                        cfg["bybit_symbol"] = symbol.replace("/", "").upper()
+                        cfg["strategy"] = f"Adaptive Tuned XGBoost ({tf.upper()} • MTF:{best_mtf})"
+                        best_candidate = {
+                            "score": eval_res["score"],
+                            "strategy_id": "xgb_adaptive_quantile",
+                            "strategy_name": "Adaptive Tuned XGBoost",
+                            "timeframe": tf.upper(),
+                            "stats": st,
+                            "cfg": cfg,
+                            "models": {
+                                "long": self._serialize_booster(clf_long),
+                                "short": self._serialize_booster(clf_short),
+                                "feature_means": f_means,
+                                "feature_stds": f_stds,
+                            },
+                        }
+
+            if (cur_trades < min_req_trades or cur_pnl <= 0.0) and cached_tf_bundles:
+                for tf, raw, _, _, _, _, _, _, _, htf_dir_aligned in [b for b in cached_tf_bundles if b[0] in ("1h", "4h")]:
+                    df_sens = self.build_matrix(raw, max_dd=1.15, expansion=0.75, horizon=14)
+                    if len(df_sens) < 180:
+                        continue
+                    split = int(len(df_sens) * 0.65)
+                    train_s = df_sens.iloc[:max(120, split - 14)]
+                    test_s = df_sens.iloc[split:]
+                    f_means = train_s[FEATURES].mean().tolist()
+                    f_stds = train_s[FEATURES].std().replace(0, 1.0).fillna(1.0).tolist()
+                    clf_l2, clf_s2 = self._fit_xgb_pair(train_s)
+                    X_test_s = test_s[FEATURES].astype("float32")
+                    pl2 = clf_l2.predict_proba(X_test_s)[:, 1]
+                    ps2 = clf_s2.predict_proba(X_test_s)[:, 1]
+                    q_sens = sorted(set([
+                        float(np.quantile(np.maximum(pl2, ps2), 0.72)),
+                        float(np.quantile(np.maximum(pl2, ps2), 0.82)),
+                    ]))
+                    htf_sens = None
+                    if tf != "4h" and htf_trend is not None and not htf_trend.empty:
+                        htf_sens = htf_trend.reindex(test_s.index, method="ffill").fillna(0).to_numpy(dtype=np.int8)
+
+                    eval_res = self._simulate_strategy_on_tf(
+                        test_df=test_s,
+                        p_long=pl2,
+                        p_short=ps2,
+                        strategy_id="xgb_high_sensitivity",
+                        timeframe=tf.upper(),
+                        leverage=leverage,
+                        initial_capital=initial_capital,
+                        is_forex=is_fx,
+                        htf_dir_aligned=htf_sens,
+                        relaxed_filter=True,
+                        extra_quantile_thresholds=q_sens,
+                        extended_param_sweep=True,
+                    )
+                    st = eval_res["stats"]
+                    best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "OFF")
+                    if best_candidate is None or eval_res["score"] > best_candidate["score"]:
+                        cfg = dict(eval_res["cfg"])
+                        cfg["bybit_symbol"] = symbol.replace("/", "").upper()
+                        cfg["strategy"] = f"High-Sensitivity XGBoost ({tf.upper()} • MTF:{best_mtf})"
+                        best_candidate = {
+                            "score": eval_res["score"],
+                            "strategy_id": "xgb_high_sensitivity",
+                            "strategy_name": "High-Sensitivity XGBoost",
+                            "timeframe": tf.upper(),
+                            "stats": st,
+                            "cfg": cfg,
+                            "models": {
+                                "long": self._serialize_booster(clf_l2),
+                                "short": self._serialize_booster(clf_s2),
+                                "feature_means": f_means,
+                                "feature_stds": f_stds,
+                            },
+                        }
+                    del df_sens, train_s, test_s, clf_l2, clf_s2
+
+            del cached_tf_bundles, raw_4h
+            gc.collect()
+
+            if best_candidate is None:
                 continue
 
-            if not live_orders_armed:
-                v_list = state.setdefault("virtual_open_positions", [])
-                v_list.append({
-                    "symbol": bybit_sym,
-                    "side": cand["direction"],
-                    "qty": _safe_float(qty_str, 0.0),
-                    "entry_price": price,
-                    "mark_price": price,
-                    "sl": _safe_float(sl_str, 0.0),
-                    "tp": _safe_float(tp_str, 0.0),
-                    "unrealized_pnl": 0.0,
-                    "opened_ms": now_ms,
-                })
-                open_syms.add(bybit_sym)
-                traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
-                last_trade_epoch_ms[bybit_sym] = now_ms
-                daily_coin_trades[bybit_sym] = _safe_int(daily_coin_trades.get(bybit_sym), 0) + 1
-                daily_total_trades += 1
-                state["daily_total_trades"] = daily_total_trades
-                live_trades_this_cycle += 1
-                add_bot_log(
-                    f"[DRY-RUN SIMULATED] (Grade {cand['grade']} • {cand['conv_pct']}% • {curr_session}): {bybit_sym} {cand['direction']} "
-                    f"qty={qty_str} @ ~{price:.4f} | SL={sl_str} | TP={tp_str} ({tp_rr:.2f}R • No Exchange Order)"
+            st = best_candidate["stats"]
+            best_mtf_mode = best_candidate["cfg"].get("mtf_alignment_mode", "STRICT")
+            coin_entry = {
+                "market": classify_market(symbol),
+                "strategy": f"{best_candidate['strategy_name']} ({best_candidate['timeframe']} • MTF:{best_mtf_mode})",
+                "strategy_id": best_candidate["strategy_id"],
+                "timeframe": best_candidate["timeframe"],
+                "mtf_alignment_mode": best_mtf_mode,
+                "win_rate_pct": st["win_rate_pct"],
+                "profit_factor": st["profit_factor"],
+                "net_pnl_pct": st["net_pnl_pct"],
+                "net_pnl_usdt": st["net_pnl_usdt"],
+                "net_pnl": st["net_pnl_usdt"],
+                "trades": st["trades"],
+                "stats": st,
+                "tested_matrix": all_tf_runs,
+                "config": best_candidate["cfg"],
+                "models": best_candidate["models"],
+            }
+
+            # Champion vs Challenger: only replace existing Paper coin if new retrain beats it
+            prev_champ = existing_paper_portfolio.get(symbol)
+            if isinstance(prev_champ, dict) and isinstance(prev_champ.get("models"), dict):
+                old_pf = float(prev_champ.get("profit_factor", 0.0))
+                old_pnl = float(prev_champ.get("net_pnl_usdt", prev_champ.get("net_pnl", 0.0)))
+                old_wr = float(prev_champ.get("win_rate_pct", 0.0))
+                new_pf = float(st["profit_factor"])
+                new_pnl = float(st["net_pnl_usdt"])
+                new_wr = float(st["win_rate_pct"])
+
+                improved = (
+                    new_pnl > 0.0
+                    and (
+                        (new_pf > old_pf and new_pnl >= old_pnl * 0.95)
+                        or (new_pnl > old_pnl and new_pf >= old_pf * 0.95)
+                        or (new_wr > old_wr + 3.0 and new_pf >= old_pf and new_pnl > 0.0)
+                    )
                 )
-                break
+                if not improved and old_pnl > 0.0 and old_pf >= 1.15:
+                    coin_entry = dict(prev_champ)
+                    coin_entry["tested_matrix"] = all_tf_runs
 
-            self._bybit_request("POST", "/v5/position/set-leverage", body={
-                "category": self.category,
-                "symbol": bybit_sym,
-                "buyLeverage": str(leverage),
-                "sellLeverage": str(leverage),
-            })
-            res = self._bybit_request("POST", "/v5/order/create", body={
-                "category": self.category,
-                "symbol": bybit_sym,
-                "side": "Buy" if is_long else "Sell",
-                "orderType": "Market",
-                "qty": qty_str,
-                "timeInForce": "IOC",
-                "stopLoss": sl_str,
-                "takeProfit": tp_str,
-                "slTriggerBy": "MarkPrice",
-                "positionIdx": 0,
-            })
-            if res.get("retCode") == 0:
-                open_syms.add(bybit_sym)
-                traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
-                last_trade_epoch_ms[bybit_sym] = now_ms
-                pos_opened_map[bybit_sym] = now_ms
-                daily_coin_trades[bybit_sym] = _safe_int(daily_coin_trades.get(bybit_sym), 0) + 1
-                daily_total_trades += 1
-                state["daily_total_trades"] = daily_total_trades
-                live_trades_this_cycle += 1
-                avail_usdt = max(0.0, avail_usdt - (notional / leverage))
+            total_net_pnl += float(coin_entry.get("net_pnl_usdt", 0.0))
+            win_rates.append(float(coin_entry.get("win_rate_pct", 0.0)))
+            trained_coins[symbol] = coin_entry
+            paper_portfolio[symbol] = coin_entry
 
-                tp_dist = abs(tp_raw - price)
-                native_ok = self._arm_native_trailing_stop(bybit_sym, cand["direction"], price, tp_dist, tick_size, trail_ratio)
-                if native_ok:
-                    native_trail_map[f"{bybit_sym}_{price:.6f}"] = True
+        self._adopt_winning_dynamic_strategies(trained_coins)
 
-                add_bot_log(
-                    f"ORDER EXECUTED SUCCESS (Grade {cand['grade']} • {cand['conv_pct']}% • {curr_session}): {bybit_sym} {cand['direction']} "
-                    f"qty={qty_str} @ ~{price:.4f} | SL={sl_str} (MarkPrice) | TP={tp_str} ({tp_rr:.2f}R, Trail@70%={'ON' if native_ok else 'SYNC'})"
-                )
-            else:
-                code = _safe_int(res.get("retCode"), -1)
-                raw_msg = str(res.get("retMsg", "Unknown Bybit rejection"))
-                hint = BYBIT_ERROR_HINTS.get(code, raw_msg)
-                if code == 110126:
-                    restricted_until_ms[bybit_sym] = now_ms + (24 * 60 * 60 * 1000)
-                rej_msg = f"{bybit_sym} {cand['direction']} (qty {qty_str}) rejected by Bybit [{code}]: {hint}"
-                diagnostics.append(rej_msg)
-                order_rejections.append(rej_msg)
-                add_bot_log(f"ORDER REJECTED: {rej_msg}")
+        with open(self.paper_results_path, "w", encoding="utf-8") as f:
+            json.dump({"leverage": leverage, "training_days": TRAINING_WINDOW_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
 
-        summary_detail = top_wait_tuple[1] if top_wait_tuple else (diagnostics[0] if diagnostics else "All pairs scanned")
-        dry_tag = " [DRY-RUN]" if not live_orders_armed else ""
-        mode_tag = f"Active ({daily_total_trades} today • A+/A/B+/B){dry_tag}"
-        sess_note = f"{curr_session}{' (Tight)' if session_prob_penalty > 0 else ''}"
-        state["top_status_summary"] = f"{mode_tag} | {sess_note} | {summary_detail}"
+        self._prune_underperforming_gemini_strategies(trained_coins)
 
-        if live_trades_this_cycle == 0:
-            add_bot_log(f"Scanning {coins_scanned_count} coins ({daily_total_trades} today • {sess_note}{dry_tag}, Avail ${avail_usdt:.2f}) | Top: {summary_detail}")
-
-        if not bot_logs_enabled:
-            state["last_bot_logs"] = []
-        else:
-            state["last_bot_logs"] = bot_logs[-60:]
-
-        state["coins_scanned"] = coins_scanned_count
-        state["radar_signals"] = radar_signals
-        state["last_diagnostics"] = diagnostics[-25:]
-        state["last_order_rejections"] = order_rejections[-10:]
-        state["last_trade_blocks"] = trade_blocks[-15:]
-        self._save_state(state)
-        gc.collect()
-
-        return {
-            "ok": True,
-            "coins_scanned": coins_scanned_count,
-            "daily_total_trades": daily_total_trades,
-            "open_positions_count": len(open_syms),
-            "radar_signals": radar_signals,
-            "ml_model_version": master.get("version", f"LIVE_PORTFOLIO_{len(portfolio)}C"),
-            "order_rejections": order_rejections,
-            "trade_blocks": trade_blocks,
-            "diagnostics": diagnostics[-10:],
+        now_ts = int(time.time())
+        avg_accuracy = round(sum(win_rates) / len(win_rates), 2) if win_rates else 0.0
+        paper_master = {
+            "version": f"UNIFIED_PAPER_{len(paper_portfolio)}C_135D",
+            "exported_at": now_ts,
+            "training_days": TRAINING_WINDOW_DAYS,
+            "model_accuracy_pct": avg_accuracy,
+            "total_net_pnl": round(total_net_pnl, 2),
+            "features": FEATURES,
+            "portfolio": paper_portfolio,
         }
+        with open(self.paper_master_path, "w", encoding="utf-8") as f:
+            json.dump(paper_master, f, indent=2)
+
+        hist_snapshot = os.path.join(self.paper_history_dir, f"UNIFIED_PAPER_{now_ts}.json")
+        with open(hist_snapshot, "w", encoding="utf-8") as hf:
+            json.dump(paper_master, hf, indent=2)
+        self._prune_old_trained_models(keep_latest=MAX_KEPT_MODEL_VERSIONS)
+
+        self.auto_compare_with_live(trained_coins)
+        gc.collect()
+        return trained_coins
+
+    def auto_compare_with_live(self, paper_coins_dict: dict) -> list:
+        live_portfolio = {}
+        if os.path.exists(self.live_master_path):
+            try:
+                with open(self.live_master_path, "r", encoding="utf-8-sig") as f:
+                    live_portfolio = json.load(f).get("portfolio", {})
+            except Exception:
+                live_portfolio = {}
+
+        comparisons = []
+        for sym, p_data in paper_coins_dict.items():
+            p_stats = p_data.get("stats", {})
+            p_wr = float(p_stats.get("win_rate_pct", 0.0))
+            p_pf = float(p_stats.get("profit_factor", 0.0))
+            p_pnl = float(p_stats.get("net_pnl_usdt", 0.0))
+
+            l_data = live_portfolio.get(sym, {})
+            l_stats = l_data.get("stats", {}) if isinstance(l_data, dict) else {}
+            l_wr = float(l_data.get("win_rate_pct", l_stats.get("win_rate_pct", 0.0))) if isinstance(l_data, dict) else 0.0
+            l_pf = float(l_data.get("profit_factor", l_stats.get("profit_factor", 0.0))) if isinstance(l_data, dict) else 0.0
+            l_pnl = float(l_data.get("net_pnl_usdt", l_stats.get("net_pnl_usdt", 0.0))) if isinstance(l_data, dict) else 0.0
+
+            is_new_coin = sym not in live_portfolio
+            is_better = (p_wr > l_wr and p_pf >= l_pf and p_pnl > 0) or (is_new_coin and p_wr >= 52.0 and p_pf >= 1.25 and p_pnl > 0)
+
+            comparisons.append({
+                "symbol": sym,
+                "market": p_data.get("market", classify_market(sym)),
+                "best_strategy": p_data.get("strategy", ""),
+                "best_timeframe": p_data.get("timeframe", "1H"),
+                "paper_win_rate_pct": p_wr,
+                "live_win_rate_pct": l_wr,
+                "paper_profit_factor": p_pf,
+                "live_profit_factor": l_pf,
+                "paper_net_pnl": p_pnl,
+                "live_net_pnl": l_pnl,
+                "is_new_coin": is_new_coin,
+                "is_paper_better": is_better,
+            })
+
+        with open(self.comparison_path, "w", encoding="utf-8") as f:
+            json.dump({"generated_at": int(time.time()), "comparisons": comparisons}, f, indent=2)
+        return comparisons
+
+    def _save_live_master(self, live_master: dict):
+        portfolio = live_master.get("portfolio", {})
+        all_wrs = [v.get("win_rate_pct", 0.0) for v in portfolio.values() if isinstance(v, dict)]
+        all_pnls = [v.get("net_pnl_usdt", v.get("net_pnl", 0.0)) for v in portfolio.values() if isinstance(v, dict)]
+        count = len(portfolio)
+        live_master["version"] = f"LIVE_PORTFOLIO_{count}C"
+        live_master["features"] = FEATURES
+        live_master["model_accuracy_pct"] = round(sum(all_wrs) / len(all_wrs), 2) if all_wrs else 0.0
+        live_master["total_net_pnl"] = round(sum(all_pnls), 2)
+        live_master["exported_at"] = int(time.time())
+
+        with open(self.live_master_path, "w", encoding="utf-8") as f:
+            json.dump(live_master, f, indent=2)
+        with open(self.legacy_master_path, "w", encoding="utf-8") as f:
+            json.dump(live_master, f, indent=2)
+
+    def move_coin_to_live_model(self, symbol: str) -> bool:
+        if not os.path.exists(self.paper_results_path):
+            return False
+
+        with open(self.paper_results_path, "r", encoding="utf-8-sig") as f:
+            paper_data = json.load(f)
+
+        norm_sym = symbol.strip().upper()
+        if "/" not in norm_sym and norm_sym.endswith("USDT"):
+            norm_sym = f"{norm_sym[:-4]}/USDT"
+
+        coin_bundle = paper_data.get("coins", {}).get(norm_sym) or paper_data.get("coins", {}).get(symbol)
+        if not coin_bundle:
+            return False
+
+        if os.path.exists(self.live_master_path):
+            with open(self.live_master_path, "r", encoding="utf-8-sig") as f:
+                live_master = json.load(f)
+        else:
+            live_master = {"version": "LIVE_PORTFOLIO_0C", "exported_at": int(time.time()), "features": FEATURES, "portfolio": {}}
+
+        portfolio = live_master.setdefault("portfolio", {})
+        portfolio.pop(norm_sym.replace("/", ""), None)
+        stats = coin_bundle.get("stats", {})
+        best_mtf_mode = coin_bundle.get("mtf_alignment_mode") or coin_bundle.get("config", {}).get("mtf_alignment_mode", "STRICT")
+
+        models_copy = dict(coin_bundle.get("models", {}))
+        if isinstance(models_copy.get("long"), dict):
+            models_copy["long"] = self._sanitize_xgb_model_json(models_copy["long"])
+        if isinstance(models_copy.get("short"), dict):
+            models_copy["short"] = self._sanitize_xgb_model_json(models_copy["short"])
+
+        portfolio[norm_sym] = {
+            "market": coin_bundle.get("market", classify_market(norm_sym)),
+            "strategy": coin_bundle.get("strategy", "XGBoost 1H/4H Momentum"),
+            "strategy_id": coin_bundle.get("strategy_id", "xgb_mtf_v2"),
+            "timeframe": coin_bundle.get("timeframe", "1H"),
+            "mtf_alignment_mode": best_mtf_mode,
+            "win_rate_pct": stats.get("win_rate_pct", 0.0),
+            "profit_factor": stats.get("profit_factor", 0.0),
+            "net_pnl_pct": stats.get("net_pnl_pct", 0.0),
+            "net_pnl_usdt": stats.get("net_pnl_usdt", 0.0),
+            "net_pnl": stats.get("net_pnl_usdt", 0.0),
+            "trades": stats.get("trades", 0),
+            "stats": stats,
+            "config": coin_bundle["config"],
+            "models": models_copy,
+        }
+
+        self._save_live_master(live_master)
+        return True
+
+    def remove_coin_from_paper_model(self, symbol: str) -> bool:
+        norm_sym = symbol.strip().upper()
+        if "/" not in norm_sym and norm_sym.endswith("USDT"):
+            norm_sym = f"{norm_sym[:-4]}/USDT"
+
+        removed_any = False
+
+        if os.path.exists(self.paper_master_path):
+            try:
+                with open(self.paper_master_path, "r", encoding="utf-8-sig") as f:
+                    master = json.load(f)
+                portfolio = master.setdefault("portfolio", {})
+                if norm_sym in portfolio or norm_sym.replace("/", "") in portfolio:
+                    portfolio.pop(norm_sym, None)
+                    portfolio.pop(norm_sym.replace("/", ""), None)
+                    removed_any = True
+                    wrs = [v.get("win_rate_pct", 0.0) for v in portfolio.values() if isinstance(v, dict)]
+                    pnls = [v.get("net_pnl_usdt", 0.0) for v in portfolio.values() if isinstance(v, dict)]
+                    master["version"] = f"UNIFIED_PAPER_{len(portfolio)}C_135D"
+                    master["model_accuracy_pct"] = round(sum(wrs) / len(wrs), 2) if wrs else 0.0
+                    master["total_net_pnl"] = round(sum(pnls), 2)
+                    with open(self.paper_master_path, "w", encoding="utf-8") as wf:
+                        json.dump(master, wf, indent=2)
+            except Exception:
+                pass
+
+        if os.path.exists(self.paper_results_path):
+            try:
+                with open(self.paper_results_path, "r", encoding="utf-8-sig") as f:
+                    res_data = json.load(f)
+                coins_map = res_data.setdefault("coins", {})
+                if norm_sym in coins_map or norm_sym.replace("/", "") in coins_map:
+                    coins_map.pop(norm_sym, None)
+                    coins_map.pop(norm_sym.replace("/", ""), None)
+                    removed_any = True
+                    with open(self.paper_results_path, "w", encoding="utf-8") as wf:
+                        json.dump(res_data, wf, indent=2)
+            except Exception:
+                pass
+
+        config_file = os.path.join(self.paper_dir, "paper_runtime_config.json")
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, "r", encoding="utf-8-sig") as f:
+                    cfg = json.load(f)
+                coins_list = cfg.get("coins", [])
+                new_coins = [c for c in coins_list if c.strip().upper() not in (norm_sym, norm_sym.replace("/", ""))]
+                if len(new_coins) != len(coins_list):
+                    cfg["coins"] = new_coins
+                    removed_any = True
+                    with open(config_file, "w", encoding="utf-8") as wf:
+                        json.dump(cfg, wf, indent=2)
+            except Exception:
+                pass
+
+        return removed_any
+
+    def remove_coin_from_live_model(self, symbol: str) -> bool:
+        if not os.path.exists(self.live_master_path):
+            return False
+        with open(self.live_master_path, "r", encoding="utf-8-sig") as f:
+            live_master = json.load(f)
+
+        norm_sym = symbol.strip().upper()
+        if "/" not in norm_sym and norm_sym.endswith("USDT"):
+            norm_sym = f"{norm_sym[:-4]}/USDT"
+
+        portfolio = live_master.setdefault("portfolio", {})
+        portfolio.pop(norm_sym, None)
+        portfolio.pop(norm_sym.replace("/", ""), None)
+        self._save_live_master(live_master)
+        return True
 
 
 if __name__ == "__main__":
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    live_dir = os.environ.get("LIVE_DATA_DIR", os.path.join(base_dir, "bot_data", "LIVE_ACCOUNT"))
+    paper_dir = os.environ.get("PAPER_DATA_DIR", os.path.join(base_dir, "bot_data", "PAPER"))
     models_dir = os.environ.get("MODELS_DIR", os.path.join(base_dir, "ml_models"))
 
-    cfg_file = os.path.join(live_dir, "live_runtime_config.json")
+    config_file = os.path.join(paper_dir, "paper_runtime_config.json")
     runtime_cfg = {}
-    if os.path.exists(cfg_file):
+    if os.path.exists(config_file):
         try:
-            with open(cfg_file, "r", encoding="utf-8-sig") as f:
+            with open(config_file, "r", encoding="utf-8-sig") as f:
                 runtime_cfg = json.load(f)
         except Exception:
             runtime_cfg = {}
 
-    api_key = os.environ.get("BYBIT_API_KEY", runtime_cfg.get("api_key", ""))
-    api_secret = os.environ.get("BYBIT_API_SECRET", runtime_cfg.get("api_secret", ""))
-    endpoint = runtime_cfg.get("endpoint", "Mainnet")
+    coins = runtime_cfg.get("coins", ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "LINK/USDT"])
+    strategies = runtime_cfg.get("strategies", ["xgb_mtf_v2", "trendline_retest_pro", "xrp_donchian_breakout"])
+    timeframes = runtime_cfg.get("timeframes", DEFAULT_TEST_TIMEFRAMES)
+    leverage = int(runtime_cfg.get("leverage", DEFAULT_LEVERAGE))
+    crypto_enabled = bool(runtime_cfg.get("crypto_enabled", True))
+    forex_enabled = bool(runtime_cfg.get("forex_enabled", False))
 
-    bot = LiveAccountTradingBot(
-        api_key=api_key,
-        api_secret=api_secret,
-        models_dir=models_dir,
-        live_dir=live_dir,
-        endpoint=endpoint,
-    )
+    trainer = PaperStrategyTrainerAndTester(paper_dir=paper_dir, models_dir=models_dir)
 
-    if len(sys.argv) >= 2 and sys.argv[1] == "--kill":
-        print(json.dumps({"ok": True, "closed": bot.emergency_close_all()}))
-    elif api_key and api_secret:
-        out = bot.run_live_cycle(
-            leverage=_safe_int(runtime_cfg.get("leverage"), 10),
-            risk_per_trade_pct=_safe_float(runtime_cfg.get("risk_per_trade_pct"), 1.5),
-            max_open_positions=_safe_int(runtime_cfg.get("max_open_positions"), 2),
-            crypto_enabled=bool(runtime_cfg.get("crypto_enabled", True)),
-            forex_enabled=bool(runtime_cfg.get("forex_enabled", False)),
-            live_orders_armed=bool(runtime_cfg.get("live_orders_armed", False)),
-            mtf_mode=str(runtime_cfg.get("mtf_mode", "STRICT")),
-            btc_macro_guard=bool(runtime_cfg.get("btc_macro_guard", True)),
-            daily_drawdown_pct=_safe_float(runtime_cfg.get("daily_drawdown_pct"), 0.0),
-            max_daily_loss_pct=_safe_float(runtime_cfg.get("max_daily_loss_pct"), 3.0),
-            bot_logs_enabled=bool(runtime_cfg.get("bot_logs_enabled", True)),
+    if len(sys.argv) >= 3 and sys.argv[1] == "--promote":
+        ok = trainer.move_coin_to_live_model(sys.argv[2].upper())
+        print(json.dumps({"ok": ok, "promoted": sys.argv[2].upper()}))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--remove":
+        ok = trainer.remove_coin_from_live_model(sys.argv[2].upper())
+        print(json.dumps({"ok": ok, "removed": sys.argv[2].upper()}))
+    elif len(sys.argv) >= 3 and sys.argv[1] == "--remove-paper":
+        ok = trainer.remove_coin_from_paper_model(sys.argv[2].upper())
+        print(json.dumps({"ok": ok, "removed": sys.argv[2].upper()}))
+    else:
+        results = trainer.train_and_evaluate_paper_coins(
+            added_coins=coins,
+            active_strategies=strategies,
+            timeframes=timeframes,
+            leverage=leverage,
+            crypto_enabled=crypto_enabled,
+            forex_enabled=forex_enabled,
         )
-        print(json.dumps(out))
+        print(f"Trained & evaluated {len(results)} Paper coins across 4.5 months (135 days) & OFF/SOFT/STRICT 4H MTF modes.")
