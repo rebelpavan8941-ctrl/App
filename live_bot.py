@@ -1053,6 +1053,8 @@ class LiveAccountTradingBot:
         order_rejections = []
         trade_blocks = []
         radar_signals = []
+        radar_by_disp = {}
+        per_coin_summaries = []
 
         now_ist = datetime.datetime.now(IST_TZ)
         today_ist_str = now_ist.strftime("%Y-%m-%d")
@@ -1154,6 +1156,7 @@ class LiveAccountTradingBot:
 
         for symbol, entry, market_type, cfg, bybit_sym, interval in active_items:
             coins_scanned_count += 1
+            disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
             models_map = entry.get("models", {})
             long_data = models_map.get("long") or models_map.get("long_model")
             short_data = models_map.get("short") or models_map.get("short_model")
@@ -1161,6 +1164,19 @@ class LiveAccountTradingBot:
                 err_msg = f"{bybit_sym}: Missing valid XGBoost booster weights"
                 diagnostics.append(err_msg)
                 order_rejections.append(err_msg)
+                per_coin_summaries.append(f"{bybit_sym}: No ML weights")
+                sig_entry = {
+                    "symbol": disp_sym,
+                    "direction": "WAIT",
+                    "confidence_pct": 25,
+                    "mtf_aligned": False,
+                    "side": "WAIT",
+                    "conviction_pct": 25,
+                    "aligned_4h": False,
+                    "raw_prob": 0.0,
+                }
+                radar_signals.append(sig_entry)
+                radar_by_disp[disp_sym] = sig_entry
                 continue
 
             strat_id = cfg.get("strategy_id") or entry.get("strategy_id") or "xgb_mtf_v2"
@@ -1169,7 +1185,21 @@ class LiveAccountTradingBot:
 
             df_raw = fetched_candles.get((bybit_sym, interval), pd.DataFrame())
             if len(df_raw) < 210:
-                diagnostics.append(f"{bybit_sym}: Insufficient candles ({len(df_raw)}/210)")
+                skip_msg = f"{bybit_sym}: Insufficient candles ({len(df_raw)}/210 — newly listed or delisted on Bybit)"
+                diagnostics.append(skip_msg)
+                per_coin_summaries.append(f"{bybit_sym}: {len(df_raw)}/210 bars")
+                sig_entry = {
+                    "symbol": disp_sym,
+                    "direction": "WAIT",
+                    "confidence_pct": 30,
+                    "mtf_aligned": False,
+                    "side": "WAIT",
+                    "conviction_pct": 30,
+                    "aligned_4h": False,
+                    "raw_prob": 0.0,
+                }
+                radar_signals.append(sig_entry)
+                radar_by_disp[disp_sym] = sig_entry
                 continue
 
             df = self.build_features(df_raw)
@@ -1189,6 +1219,7 @@ class LiveAccountTradingBot:
                 err_msg = f"{bybit_sym}: Booster error - {e}"
                 diagnostics.append(err_msg)
                 order_rejections.append(err_msg)
+                per_coin_summaries.append(f"{bybit_sym}: Booster err")
                 continue
 
             direction = "LONG" if p_long >= p_short else "SHORT"
@@ -1226,8 +1257,6 @@ class LiveAccountTradingBot:
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
-            disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
-
             in_cooldown = (
                 now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0)
                 or now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
@@ -1248,9 +1277,8 @@ class LiveAccountTradingBot:
             learned_score = _safe_float(agentic_coin_scores.get(disp_sym), 0.0)
             effective_min_prob = max(req_thresh * 0.94, 0.21) + session_prob_penalty
 
-            # Balanced flow: allow 4H-aligned setups OR strong high-conviction setups (ADX >= 14.5)
             mtf_or_momentum_ok = raw_4h_ok or (raw_prob >= effective_min_prob + 0.05 and adx_val >= 18.0)
-            base_conv = int(min(100, max(45, round((raw_prob / max(req_thresh, 0.16)) * 75 + (10 if raw_4h_ok else -4) + min(adx_val * 0.25, 8)))))
+            base_conv = int(min(96, max(45, round((raw_prob / max(req_thresh, 0.16)) * 75 + (10 if raw_4h_ok else -4) + min(adx_val * 0.25, 8)))))
             grade_ok = (base_conv >= 66) and mtf_or_momentum_ok and (adx_val >= 14.5) and (learned_score >= -10.0)
 
             all_gates_ready = (
@@ -1262,11 +1290,11 @@ class LiveAccountTradingBot:
                 and (not funding_blocked)
                 and (raw_prob >= effective_min_prob)
             )
-            # Radar shows 90-100% ONLY when all execution gates pass (so Radar matches bot execution)
-            conv_pct = base_conv if all_gates_ready else min(base_conv, 64)
+            # Radar is >= 98% (Green) ONLY when all execution gates pass; otherwise capped <= 74% (Amber/Red)
+            conv_pct = max(98, min(100, base_conv + 6)) if all_gates_ready else min(base_conv, 74)
             aligned_flag = bool(all_gates_ready)
 
-            radar_signals.append({
+            sig_entry = {
                 "symbol": disp_sym,
                 "direction": direction,
                 "confidence_pct": conv_pct,
@@ -1275,41 +1303,46 @@ class LiveAccountTradingBot:
                 "conviction_pct": conv_pct,
                 "aligned_4h": aligned_flag,
                 "raw_prob": round(raw_prob, 4),
-            })
+            }
+            radar_signals.append(sig_entry)
+            radar_by_disp[disp_sym] = sig_entry
 
             if now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0):
                 trade_blocks.append(f"{bybit_sym}: Contract agreement unsigned on Bybit [110126]")
+                per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): Unsigned [110126]")
                 continue
 
             if now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0):
                 rem_min = max(1, int((_safe_int(loss_cooldown_until_ms.get(bybit_sym), 0) - now_ms) / 60000))
-                cd_msg = f"{bybit_sym} {direction} ({conv_pct}%): 4h post-loss cooldown active ({rem_min}m left)"
+                cd_msg = f"{bybit_sym} {direction} ({conv_pct}%): 4h post-loss cooldown ({rem_min}m left)"
                 trade_blocks.append(cd_msg)
                 diagnostics.append(cd_msg)
+                per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): Cooldown {rem_min}m")
                 if top_wait_tuple is None or conv_pct > top_wait_tuple[0]:
                     top_wait_tuple = (conv_pct, cd_msg)
                 continue
 
             if now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0):
                 trade_blocks.append(f"{bybit_sym}: Vetoed by Agentic AI Supervisor")
+                per_coin_summaries.append(f"{bybit_sym}: AI Veto")
                 continue
 
             if bybit_sym in open_syms:
                 trade_blocks.append(f"{bybit_sym}: Already has an open position")
+                per_coin_summaries.append(f"{bybit_sym}: Position Open")
                 continue
 
             quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 19.0 else 0.0) + (learned_score * 0.002)
 
             if all_gates_ready:
-                if conv_pct >= 90 and raw_4h_ok and adx_val >= 22.0:
+                if conv_pct >= 99 and raw_4h_ok and adx_val >= 22.0:
                     grade_tag = "A+"
-                elif conv_pct >= 80 and adx_val >= 18.5:
+                elif conv_pct >= 98 and adx_val >= 18.5:
                     grade_tag = "A"
-                elif conv_pct >= 72 and adx_val >= 16.0:
-                    grade_tag = "B+"
                 else:
-                    grade_tag = "B"
+                    grade_tag = "B+"
 
+                per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}% READY)")
                 candidates.append({
                     "edge": quality_edge,
                     "conv_pct": conv_pct,
@@ -1317,6 +1350,7 @@ class LiveAccountTradingBot:
                     "raw_prob": raw_prob,
                     "req_thresh": effective_min_prob,
                     "bybit_sym": bybit_sym,
+                    "disp_sym": disp_sym,
                     "market_type": market_type,
                     "direction": direction,
                     "cfg": cfg,
@@ -1338,25 +1372,36 @@ class LiveAccountTradingBot:
                 if not anti_chase_ok:
                     reasons.append(chase_reason)
                 if not strat_ok:
-                    reasons.append(f"Waiting for {strat_id}")
+                    reasons.append(f"Waiting {strat_id}")
                 if not grade_ok:
                     reasons.append(f"Below B floor (Conv {base_conv}%<66% or ADX {adx_val:.1f}<14.5)")
                 if raw_prob < effective_min_prob:
-                    reasons.append(f"Prob {raw_prob:.2f} < {effective_min_prob:.2f}")
+                    reasons.append(f"Prob {raw_prob:.2f}<{effective_min_prob:.2f}")
+                short_why = reasons[0] if reasons else "Waiting"
+                per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): {short_why}")
                 block_msg = f"{bybit_sym} {direction} ({conv_pct}%): {', '.join(reasons)} [ADX:{adx_val:.1f}]"
                 diagnostics.append(block_msg)
                 trade_blocks.append(block_msg)
                 if top_wait_tuple is None or conv_pct > top_wait_tuple[0]:
                     top_wait_tuple = (conv_pct, block_msg)
 
-        radar_signals.sort(key=lambda x: (x["mtf_aligned"], x["confidence_pct"]), reverse=True)
         candidates.sort(key=lambda x: x["edge"], reverse=True)
+
+        def _downgrade_radar(disp_key: str, cap_pct: int = 72):
+            entry_r = radar_by_disp.get(disp_key)
+            if entry_r:
+                entry_r["confidence_pct"] = min(int(entry_r["confidence_pct"]), cap_pct)
+                entry_r["conviction_pct"] = entry_r["confidence_pct"]
+                entry_r["mtf_aligned"] = False
+                entry_r["aligned_4h"] = False
 
         live_trades_this_cycle = 0
 
         for cand in candidates:
             bybit_sym = cand["bybit_sym"]
+            disp_sym = cand["disp_sym"]
             if daily_drawdown_pct >= max_daily_loss_pct and max_daily_loss_pct > 0.0:
+                _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
@@ -1364,6 +1409,7 @@ class LiveAccountTradingBot:
                 add_bot_log(msg)
                 break
             if len(open_syms) >= effective_max_positions:
+                _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} skipped: Max open positions reached ({len(open_syms)}/{effective_max_positions})"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
@@ -1373,6 +1419,7 @@ class LiveAccountTradingBot:
                 bybit_sym, cand["direction"], active_pos_records
             )
             if not sector_ok:
+                _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} skipped: {sector_reason}"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
@@ -1380,6 +1427,7 @@ class LiveAccountTradingBot:
                 continue
 
             if live_orders_armed and avail_usdt < 2.0:
+                _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT too low (${avail_usdt:.2f} < $2.00)"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
@@ -1387,19 +1435,22 @@ class LiveAccountTradingBot:
                 add_bot_log(msg)
                 break
             if traded_candle_ts.get(bybit_sym) == cand["latest_bar_ms"]:
-                msg = f"{bybit_sym} {cand['direction']} ({cand['conv_pct']}%) skipped: Already traded this candle"
+                _downgrade_radar(disp_sym)
+                msg = f"{bybit_sym} {cand['direction']} skipped: Already traded this candle"
                 diagnostics.append(msg)
                 add_bot_log(msg)
                 continue
             if (now_ms - _safe_int(last_trade_epoch_ms.get(bybit_sym), 0)) < 30 * 60 * 1000:
+                _downgrade_radar(disp_sym)
                 rem_m = max(1, int((30 * 60 * 1000 - (now_ms - _safe_int(last_trade_epoch_ms.get(bybit_sym), 0))) / 60000))
-                msg = f"{bybit_sym} {cand['direction']} ({cand['conv_pct']}%) skipped: 30m trade cooldown ({rem_m}m left)"
+                msg = f"{bybit_sym} {cand['direction']} skipped: 30m trade cooldown ({rem_m}m left)"
                 diagnostics.append(msg)
                 add_bot_log(msg)
                 continue
 
             filters = self._get_instrument_filters(bybit_sym)
             if filters is None:
+                _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} skipped: Not tradable on Bybit Linear"
                 diagnostics.append(msg)
                 add_bot_log(msg)
@@ -1412,6 +1463,7 @@ class LiveAccountTradingBot:
             price = _safe_float(live_bar["Close"], 0.0)
             atr = _safe_float(closed_bar["ATR"], 0.0)
             if price <= 0.0 or atr <= 0.0:
+                _downgrade_radar(disp_sym)
                 continue
 
             sl_atr = max(_safe_float(cfg.get("sl_atr"), 1.55) * sl_mult, 1.50)
@@ -1424,6 +1476,7 @@ class LiveAccountTradingBot:
             max_buying_power = sim_equity * leverage * 0.85
             min_required_notional = max(min_notional * 1.05, min_qty * price)
             if live_orders_armed and max_buying_power < min_required_notional:
+                _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} skipped: Min order ${min_required_notional:.2f} > buying power ${max_buying_power:.2f} (Avail ${avail_usdt:.2f})"
                 diagnostics.append(msg)
                 add_bot_log(msg)
@@ -1468,6 +1521,7 @@ class LiveAccountTradingBot:
                     add_bot_log(pa_res["shadow_log"])
 
                 if pa_res.get("decision") == "REJECT":
+                    _downgrade_radar(disp_sym)
                     l1_why = "; ".join(pa_res.get("reasons", [])[:2])
                     msg = f"{bybit_sym} {cand['direction']} blocked by Layer 1 Human Brain ({pa_res.get('score', 0)}/100): {l1_why}"
                     diagnostics.append(msg)
@@ -1477,12 +1531,14 @@ class LiveAccountTradingBot:
                 else:
                     add_bot_log(f"[LAYER 1 APPROVED] {bybit_sym} {cand['direction']} ({pa_res.get('score', 75)}/100): {'; '.join(pa_res.get('reasons', [])[:1])}")
             except Exception as l1_err:
+                _downgrade_radar(disp_sym)
                 add_bot_log(f"[LAYER 1 ERROR] {bybit_sym} {cand['direction']} skipped: {l1_err}")
                 continue
 
             if cand["market_type"] == "CRYPTO":
                 ob_ok, ob_reason = self._check_orderbook_spread_and_depth(bybit_sym, notional)
                 if not ob_ok:
+                    _downgrade_radar(disp_sym)
                     msg = f"{bybit_sym} {cand['direction']} blocked by Spread/Depth Guard: {ob_reason}"
                     diagnostics.append(msg)
                     trade_blocks.append(msg)
@@ -1564,6 +1620,7 @@ class LiveAccountTradingBot:
                     f"qty={qty_str} @ ~{price:.4f} | SL={sl_str} (MarkPrice) | TP={tp_str} ({tp_rr:.2f}R, Trail@70%={'ON' if native_ok else 'SYNC'})"
                 )
             else:
+                _downgrade_radar(disp_sym)
                 code = _safe_int(res.get("retCode"), -1)
                 raw_msg = str(res.get("retMsg", "Unknown Bybit rejection"))
                 hint = BYBIT_ERROR_HINTS.get(code, raw_msg)
@@ -1574,6 +1631,7 @@ class LiveAccountTradingBot:
                 order_rejections.append(rej_msg)
                 add_bot_log(f"ORDER REJECTED: {rej_msg}")
 
+        radar_signals.sort(key=lambda x: (x["mtf_aligned"], x["confidence_pct"]), reverse=True)
         summary_detail = top_wait_tuple[1] if top_wait_tuple else (diagnostics[0] if diagnostics else "All pairs scanned")
         dry_tag = " [DRY-RUN]" if not live_orders_armed else ""
         mode_tag = f"Active ({daily_total_trades} today • A+/A/B+/B){dry_tag}"
@@ -1581,7 +1639,8 @@ class LiveAccountTradingBot:
         state["top_status_summary"] = f"{mode_tag} | {sess_note} | {summary_detail}"
 
         if live_trades_this_cycle == 0:
-            add_bot_log(f"Scanning {coins_scanned_count} coins ({daily_total_trades} today • {sess_note}{dry_tag}, Avail ${avail_usdt:.2f}) | Top: {summary_detail}")
+            all_coins_line = " | ".join(per_coin_summaries) if per_coin_summaries else summary_detail
+            add_bot_log(f"Scanning {coins_scanned_count} coins ({daily_total_trades} today • {sess_note}{dry_tag}, Avail ${avail_usdt:.2f}): {all_coins_line}")
 
         if not bot_logs_enabled:
             state["last_bot_logs"] = []
