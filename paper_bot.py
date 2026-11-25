@@ -208,6 +208,58 @@ class PaperStrategyTrainerAndTester:
                 json.dump({"updated_at": int(time.time()), "strategies": adopted}, wf, indent=2)
             os.replace(tmp_a, self.adopted_strats_path)
 
+    def _prune_underperforming_gemini_strategies(self, trained_coins: dict):
+        """Auto-removes Gemini strategies failing Paper backtest thresholds or Live performance."""
+        try:
+            import ai_regime_copilot
+            live_dir_guess = os.path.join(os.path.dirname(self.paper_dir), "LIVE_ACCOUNT")
+            prune_res = ai_regime_copilot.prune_underperforming_gemini_strategies(
+                paper_dir=self.paper_dir,
+                live_dir=live_dir_guess,
+                models_dir=self.models_dir,
+            )
+            if prune_res.get("removed"):
+                print(f"[AGENTIC PRUNE] Auto-removed underperforming Gemini strategies: {prune_res['removed']}")
+                self.dynamic_strategies = self._load_dynamic_strategies()
+            return
+        except Exception:
+            pass
+
+        # Built-in fallback pruning if ai_regime_copilot is unavailable
+        for fpath in (self.discovered_strats_path, self.adopted_strats_path):
+            if not os.path.exists(fpath):
+                continue
+            try:
+                with open(fpath, "r", encoding="utf-8-sig") as f:
+                    payload = json.load(f)
+                strats = payload.get("strategies", {}) or {}
+                kept = {}
+                for sid, spec in strats.items():
+                    runs = []
+                    for cdata in trained_coins.values():
+                        if not isinstance(cdata, dict):
+                            continue
+                        if str(cdata.get("strategy_id", "")) == sid:
+                            runs.append(cdata)
+                        for m in (cdata.get("tested_matrix", []) or []):
+                            if isinstance(m, dict) and str(m.get("strategy_id", "")) == sid:
+                                runs.append(m)
+                    if runs:
+                        best_r = max(runs, key=lambda r: (float(r.get("net_pnl_usdt", 0.0)), float(r.get("profit_factor", 0.0))))
+                        if int(best_r.get("trades", 0)) < 4 or float(best_r.get("net_pnl_usdt", 0.0)) <= 0.0 or float(best_r.get("profit_factor", 0.0)) < 1.15:
+                            continue
+                    kept[sid] = spec
+                if len(kept) != len(strats):
+                    payload["strategies"] = kept
+                    payload["updated_at"] = int(time.time())
+                    tmp_f = fpath + ".tmp"
+                    with open(tmp_f, "w", encoding="utf-8") as wf:
+                        json.dump(payload, wf, indent=2)
+                    os.replace(tmp_f, fpath)
+            except Exception:
+                continue
+        self.dynamic_strategies = self._load_dynamic_strategies()
+
     def _prune_old_trained_models(self, keep_latest: int = MAX_KEPT_MODEL_VERSIONS):
         try:
             snapshots = sorted(
@@ -552,8 +604,50 @@ class PaperStrategyTrainerAndTester:
         p_vwap = test_df["VWAP_Dev"].to_numpy()[:-1]
 
         if "trendline" in sid:
-            long_ok[1:] = (p_st == 1) & (p_adx >= 17.0) & (p_d20 >= -0.60) & (p_d20 <= 0.85) & (prev_close > prev_open)
-            short_ok[1:] = (p_st == -1) & (p_adx >= 17.0) & (p_d20 <= 0.60) & (p_d20 >= -0.85) & (prev_close < prev_open)
+            # Non-repainting confirmed swing-pivot trendline bounce/rejection on closed bars
+            highs_all = test_df["High"].to_numpy(dtype=float)
+            lows_all = test_df["Low"].to_numpy(dtype=float)
+            closes_all = test_df["Close"].to_numpy(dtype=float)
+            opens_all = test_df["Open"].to_numpy(dtype=float)
+            atrs_all = test_df["ATR"].to_numpy(dtype=float)
+            adx_all = test_df["ADX"].to_numpy(dtype=float)
+
+            swing_lows = []
+            swing_highs = []
+            for j in range(3, n - 4):
+                if lows_all[j] == np.min(lows_all[j - 3:j + 4]):
+                    swing_lows.append((j, lows_all[j]))
+                if highs_all[j] == np.max(highs_all[j - 3:j + 4]):
+                    swing_highs.append((j, highs_all[j]))
+
+            sl_ptr = 0
+            sh_ptr = 0
+            for idx in range(1, n):
+                c_bar = idx - 1  # Last closed candle before entry
+                atr_v = atrs_all[c_bar]
+                if atr_v <= 0 or adx_all[c_bar] < 17.0:
+                    continue
+                # Only use pivots whose 3 right confirmation bars have fully closed (j <= c_bar - 3)
+                while sl_ptr < len(swing_lows) and swing_lows[sl_ptr][0] <= c_bar - 3:
+                    sl_ptr += 1
+                while sh_ptr < len(swing_highs) and swing_highs[sh_ptr][0] <= c_bar - 3:
+                    sh_ptr += 1
+
+                if sl_ptr >= 2:
+                    (i1, p1), (i2, p2) = swing_lows[sl_ptr - 2], swing_lows[sl_ptr - 1]
+                    if i2 > i1 and p2 > p1:
+                        tl_px = p2 + ((p2 - p1) / float(i2 - i1)) * float(c_bar - i2)
+                        dist_a = (closes_all[c_bar] - tl_px) / atr_v
+                        if -0.25 <= dist_a <= 0.65 and closes_all[c_bar] > opens_all[c_bar]:
+                            long_ok[idx] = True
+
+                if sh_ptr >= 2:
+                    (i1, p1), (i2, p2) = swing_highs[sh_ptr - 2], swing_highs[sh_ptr - 1]
+                    if i2 > i1 and p2 < p1:
+                        tl_px = p2 + ((p2 - p1) / float(i2 - i1)) * float(c_bar - i2)
+                        dist_a = (tl_px - closes_all[c_bar]) / atr_v
+                        if -0.25 <= dist_a <= 0.65 and closes_all[c_bar] < opens_all[c_bar]:
+                            short_ok[idx] = True
         elif "donchian" in sid:
             long_ok[1:] = (p_st == 1) & (curr_open >= p_don_h * 0.998) & (p_vol >= 1.05)
             short_ok[1:] = (p_st == -1) & (curr_open <= p_don_l * 1.002) & (p_vol >= 1.05)
@@ -1111,6 +1205,8 @@ class PaperStrategyTrainerAndTester:
 
         with open(self.paper_results_path, "w", encoding="utf-8") as f:
             json.dump({"leverage": leverage, "training_days": TRAINING_WINDOW_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
+
+        self._prune_underperforming_gemini_strategies(trained_coins)
 
         now_ts = int(time.time())
         avg_accuracy = round(sum(win_rates) / len(win_rates), 2) if win_rates else 0.0
