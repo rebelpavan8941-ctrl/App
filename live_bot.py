@@ -172,9 +172,9 @@ class LiveAccountTradingBot:
 
         self.is_demo = str(endpoint).lower() in ("testnet", "demo")
         self.host_candidates = (
-            ["https://api-demo.bybit.com", "https://api.bytick.com"]
+            ["[https://api-demo.bybit.com](https://api-demo.bybit.com)", "[https://api.bytick.com](https://api.bytick.com)"]
             if self.is_demo
-            else ["https://api.bytick.com", "https://api.bybit.com"]
+            else ["[https://api.bytick.com](https://api.bytick.com)", "[https://api.bybit.com](https://api.bybit.com)"]
         )
         self.base_url = self.host_candidates[0]
         self.category = "linear"
@@ -207,6 +207,8 @@ class LiveAccountTradingBot:
             "loss_cooldown_until_ms": {},
             "agentic_veto_until_ms": {},
             "restricted_symbols_until_ms": {},
+            "last_notified_block_layer": {},
+            "last_shadow_eval_ms": {},
             "reflected_closed_ids": [],
             "daily_coin_trades": {},
             "daily_total_trades": 0,
@@ -261,6 +263,24 @@ class LiveAccountTradingBot:
             except Exception:
                 pass
         return {}
+
+    def _resolve_gemini_shadow_settings(self) -> tuple:
+        """Reads Gemini Shadow toggle & API key across shadow config, copilot config, and runtime config."""
+        enabled = False
+        key = ""
+        for fname in ("ai_shadow_config.json", "ai_copilot_config.json", "live_runtime_config.json"):
+            fpath = os.path.join(self.live_dir, fname)
+            if os.path.exists(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8-sig") as f:
+                        d = json.load(f)
+                    if fname == "ai_shadow_config.json":
+                        enabled = bool(d.get("gemini_shadow_enabled", False))
+                    if not key:
+                        key = str(d.get("gemini_api_key") or d.get("api_key_gemini") or "").strip()
+                except Exception:
+                    pass
+        return enabled, key
 
     def _sign(self, ts: str, recv_window: str, payload: str) -> str:
         raw = f"{ts}{self.api_key}{recv_window}{payload}"
@@ -795,7 +815,7 @@ class LiveAccountTradingBot:
             yf_range = "15d" if yf_interval in ("15m", "30m") else "60d"
             try:
                 y_resp = self.session.get(
-                    f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
+                    f"[https://query1.finance.yahoo.com/v8/finance/chart/](https://query1.finance.yahoo.com/v8/finance/chart/){bybit_symbol}=X",
                     params={"interval": yf_interval, "range": yf_range},
                     headers={"User-Agent": "Mozilla/5.0"},
                     timeout=5.0,
@@ -1241,6 +1261,8 @@ class LiveAccountTradingBot:
         loss_cooldown_until_ms = state.setdefault("loss_cooldown_until_ms", {})
         agentic_veto_until_ms = state.setdefault("agentic_veto_until_ms", {})
         restricted_until_ms = state.setdefault("restricted_symbols_until_ms", {})
+        notified_block_layers = state.setdefault("last_notified_block_layer", {})
+        last_shadow_eval_ms = state.setdefault("last_shadow_eval_ms", {})
         daily_coin_trades = state.setdefault("daily_coin_trades", {})
         native_trail_map = state.setdefault("native_trail_set", {})
         bot_logs = state.setdefault("last_bot_logs", [])
@@ -1249,6 +1271,8 @@ class LiveAccountTradingBot:
         agentic_coin_scores = agentic_mem.get("coin_scores", {}) or {}
         session_stats = agentic_mem.get("session_stats", {}) or {}
         quarantine_mem = agentic_mem.get("auto_quarantine", {}) or {}
+
+        gem_shadow_on, gem_shadow_key = self._resolve_gemini_shadow_settings()
 
         diagnostics = []
         order_rejections = []
@@ -1272,6 +1296,14 @@ class LiveAccountTradingBot:
         def add_bot_log(msg: str):
             if bot_logs_enabled:
                 bot_logs.append(f"[{clock_str}] {msg}")
+
+        def emit_layer_block_alert(bybit_sym: str, side: str, layer_key: str, alert_msg: str):
+            """Sends ONLY ONE notification per (coin, side, blocking_layer); re-alerts only if a new layer blocks."""
+            coin_side_key = f"{bybit_sym}_{side}"
+            prev_layer = str(notified_block_layers.get(coin_side_key, ""))
+            if prev_layer != layer_key:
+                notified_block_layers[coin_side_key] = layer_key
+                trade_blocks.append(alert_msg)
 
         if daily_coin_trades.get("_date_ist") != today_ist_str:
             daily_coin_trades.clear()
@@ -1435,7 +1467,6 @@ class LiveAccountTradingBot:
             if len(df) < 3:
                 continue
 
-            # Cache rolling 72-bar returns for cross-asset correlation guard
             returns_72h_map[bybit_sym] = df["Ret_1h"].iloc[-73:-1].to_numpy(dtype=np.float64)
 
             closed_bar = df.iloc[-2]
@@ -1485,7 +1516,6 @@ class LiveAccountTradingBot:
                 or bybit_sym in open_syms
             )
 
-            # Institutional Positioning (Open Interest 4H Delta & Long/Short Skew) for active crypto candidates
             oi_delta_4h = 0.0
             ls_skew = 0.0
             if market_type == "CRYPTO" and (not in_cooldown) and raw_prob >= (req_thresh * 0.85):
@@ -1538,7 +1568,6 @@ class LiveAccountTradingBot:
                 custom_rules=custom_rules,
             )
 
-            # Secondary Meta-Labeling Filter ("Should we take this signal?")
             trained_meta_ok, trained_meta_prob = self._evaluate_meta_labeler(
                 models_map.get("meta"),
                 raw_prob,
@@ -1568,7 +1597,6 @@ class LiveAccountTradingBot:
             gate_prob_delta = _safe_float(gate_adjustments.get("PROB_THRESH"), 0.0)
             base_min_prob = max((req_thresh * 0.94) + gate_prob_delta, 0.19) + session_prob_penalty
 
-            # Regime-Aware Conformal Abstention & Fractional-Kelly Multiplier
             est_tp_rr = min(max(_safe_float(cfg.get("tp1_rr"), 1.65) * tp_mult, 1.50), 1.85)
             conformal_abstain = False
             effective_min_prob = base_min_prob
@@ -1628,14 +1656,14 @@ class LiveAccountTradingBot:
             radar_by_disp[disp_sym] = sig_entry
 
             if is_quarantined:
-                trade_blocks.append(f"{bybit_sym}: Auto-quarantined on Bybit [110126]")
+                emit_layer_block_alert(bybit_sym, direction, "QUARANTINE_110126", f"{bybit_sym}: Auto-quarantined on Bybit [110126]")
                 per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): Quarantined")
                 continue
 
             if now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0):
                 rem_min = max(1, int((_safe_int(loss_cooldown_until_ms.get(bybit_sym), 0) - now_ms) / 60000))
                 cd_msg = f"{bybit_sym} {direction} ({conv_pct}%): 4h post-loss cooldown ({rem_min}m left)"
-                trade_blocks.append(cd_msg)
+                emit_layer_block_alert(bybit_sym, direction, "LOSS_COOLDOWN", cd_msg)
                 diagnostics.append(cd_msg)
                 per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): Cooldown {rem_min}m")
                 if top_wait_tuple is None or conv_pct > top_wait_tuple[0]:
@@ -1643,12 +1671,11 @@ class LiveAccountTradingBot:
                 continue
 
             if now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0):
-                trade_blocks.append(f"{bybit_sym}: Vetoed by Agentic AI Supervisor")
+                emit_layer_block_alert(bybit_sym, direction, "AGENTIC_VETO", f"{bybit_sym}: Vetoed by Agentic AI Supervisor")
                 per_coin_summaries.append(f"{bybit_sym}: AI Veto")
                 continue
 
             if bybit_sym in open_syms:
-                trade_blocks.append(f"{bybit_sym}: Already has an open position")
                 per_coin_summaries.append(f"{bybit_sym}: Position Open")
                 continue
 
@@ -1700,6 +1727,7 @@ class LiveAccountTradingBot:
                     primary_gate = "MTF_4H"
                 if funding_blocked:
                     reasons.append(f"Crowded positioning (FR {fr_val * 100:+.3f}%, LS {ls_skew:+.0f})")
+                    primary_gate = "FUNDING_OI_CROWDED"
                 if not anti_chase_ok:
                     reasons.append(chase_reason)
                     primary_gate = "ANTI_CHASE"
@@ -1708,13 +1736,38 @@ class LiveAccountTradingBot:
                     primary_gate = "META_LABEL"
                 if not strat_ok:
                     reasons.append(f"Waiting {strat_id}")
-                    primary_gate = "STRATEGY_WAIT"
+                    primary_gate = f"STRATEGY_{strat_id}"
                 if not grade_ok:
                     reasons.append(f"Below B floor (Setup {setup_score}%<66% or ADX {adx_val:.1f}<14.5)")
+                    if primary_gate == "GENERAL":
+                        primary_gate = "GRADE_FLOOR"
                 if conformal_abstain or raw_prob < effective_min_prob:
                     tag_p = "Conformal Prob" if conformal_abstain else "Prob"
                     reasons.append(f"{tag_p} {raw_prob:.2f}<{effective_min_prob:.2f}")
                     primary_gate = "PROB_THRESH"
+
+                # Run Layer 1 vs Gemini Shadow-Compare on high-setup candidates (setup_score >= 78, max once/10m per coin)
+                if gem_shadow_on and gem_shadow_key and setup_score >= 78:
+                    last_sh = _safe_int(last_shadow_eval_ms.get(bybit_sym), 0)
+                    if (now_ms - last_sh) >= 10 * 60 * 1000:
+                        last_shadow_eval_ms[bybit_sym] = now_ms
+                        try:
+                            import ai_regime_copilot
+                            sh_res = ai_regime_copilot.evaluate_pre_trade_human_brain(
+                                live_dir=self.live_dir,
+                                symbol=bybit_sym,
+                                side=direction,
+                                candles_df=df.iloc[:-1].tail(72).copy(),
+                                adx_val=adx_val,
+                                funding_rate=fr_val,
+                                session_name=curr_session,
+                                gemini_enabled=True,
+                                gemini_api_key=gem_shadow_key,
+                            )
+                            if sh_res.get("shadow_log"):
+                                add_bot_log(sh_res["shadow_log"])
+                        except Exception:
+                            pass
 
                 if setup_score >= 75:
                     try:
@@ -1736,7 +1789,7 @@ class LiveAccountTradingBot:
                 per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): {short_why}")
                 block_msg = f"{bybit_sym} {direction} ({conv_pct}%): {', '.join(reasons)} [ADX:{adx_val:.1f}]"
                 diagnostics.append(block_msg)
-                trade_blocks.append(block_msg)
+                emit_layer_block_alert(bybit_sym, direction, primary_gate, block_msg)
                 if top_wait_tuple is None or conv_pct > top_wait_tuple[0]:
                     top_wait_tuple = (conv_pct, block_msg)
 
@@ -1760,7 +1813,7 @@ class LiveAccountTradingBot:
                 _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} blocked: Daily loss limit ({daily_drawdown_pct:.2f}% >= {max_daily_loss_pct:.2f}%)"
                 diagnostics.append(msg)
-                trade_blocks.append(msg)
+                emit_layer_block_alert(bybit_sym, cand["direction"], "DAILY_LOSS_CAP", msg)
                 order_rejections.append(msg)
                 add_bot_log(msg)
                 break
@@ -1768,7 +1821,7 @@ class LiveAccountTradingBot:
                 _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} skipped: Max open positions reached ({len(open_syms)}/{effective_max_positions})"
                 diagnostics.append(msg)
-                trade_blocks.append(msg)
+                emit_layer_block_alert(bybit_sym, cand["direction"], "MAX_POSITIONS", msg)
                 break
 
             sector_ok, sector_reason = self._passes_sector_correlation_cap(
@@ -1778,7 +1831,7 @@ class LiveAccountTradingBot:
                 _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} skipped: {sector_reason}"
                 diagnostics.append(msg)
-                trade_blocks.append(msg)
+                emit_layer_block_alert(bybit_sym, cand["direction"], "SECTOR_CAP", msg)
                 add_bot_log(msg)
                 continue
 
@@ -1801,7 +1854,7 @@ class LiveAccountTradingBot:
                 _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} skipped: {corr_reason}"
                 diagnostics.append(msg)
-                trade_blocks.append(msg)
+                emit_layer_block_alert(bybit_sym, cand["direction"], "CORRELATION_72H", msg)
                 add_bot_log(msg)
                 continue
 
@@ -1809,7 +1862,7 @@ class LiveAccountTradingBot:
                 _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT too low (${avail_usdt:.2f} < $2.00)"
                 diagnostics.append(msg)
-                trade_blocks.append(msg)
+                emit_layer_block_alert(bybit_sym, cand["direction"], "LOW_BALANCE", msg)
                 order_rejections.append(msg)
                 add_bot_log(msg)
                 break
@@ -1887,15 +1940,7 @@ class LiveAccountTradingBot:
 
             try:
                 import ai_regime_copilot
-                shadow_cfg_path = os.path.join(self.live_dir, "ai_shadow_config.json")
-                gem_shadow_on = False
-                gem_shadow_key = ""
-                if os.path.exists(shadow_cfg_path):
-                    with open(shadow_cfg_path, "r", encoding="utf-8-sig") as scf:
-                        sc_data = json.load(scf)
-                        gem_shadow_on = bool(sc_data.get("gemini_shadow_enabled", False))
-                        gem_shadow_key = str(sc_data.get("gemini_api_key", "")).strip()
-
+                last_shadow_eval_ms[bybit_sym] = now_ms
                 pa_res = ai_regime_copilot.evaluate_pre_trade_human_brain(
                     live_dir=self.live_dir,
                     symbol=bybit_sym,
@@ -1919,7 +1964,7 @@ class LiveAccountTradingBot:
                     l1_why = "; ".join(pa_res.get("reasons", [])[:2])
                     msg = f"{bybit_sym} {cand['direction']} blocked by Layer 1 Human Brain ({pa_res.get('score', 0)}/100): {l1_why}"
                     diagnostics.append(msg)
-                    trade_blocks.append(msg)
+                    emit_layer_block_alert(bybit_sym, cand["direction"], "LAYER1_BRAIN", msg)
                     add_bot_log(msg)
                     continue
                 else:
@@ -1938,9 +1983,12 @@ class LiveAccountTradingBot:
                 _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} blocked by Spread/Depth Guard: {ob_reason}"
                 diagnostics.append(msg)
-                trade_blocks.append(msg)
+                emit_layer_block_alert(bybit_sym, cand["direction"], "SPREAD_DEPTH_GUARD", msg)
                 add_bot_log(msg)
                 continue
+
+            # Clear any previous block-layer state since trade is executing cleanly
+            notified_block_layers.pop(f"{bybit_sym}_{cand['direction']}", None)
 
             if not live_orders_armed:
                 v_list = state.setdefault("virtual_open_positions", [])
