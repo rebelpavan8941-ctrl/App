@@ -522,7 +522,7 @@ class LiveAccountTradingBot:
         except Exception:
             pass
 
-    def _sync_virtual_positions(self, state: dict, mark_prices: dict, trail_ratio: float, now_ms: int, add_bot_log) -> list:
+    def _sync_virtual_positions(self, state: dict, mark_prices: dict, trail_ratio: float, now_ms: int, add_bot_log, curr_session: str = "NEW_YORK") -> list:
         v_list = state.get("virtual_open_positions") or []
         if not v_list:
             return []
@@ -574,6 +574,8 @@ class LiveAccountTradingBot:
                     ref_res = ai_regime_copilot.record_post_trade_reflection(
                         self.live_dir, sym, side, net_pnl, entry, mark
                     )
+                    if hasattr(ai_regime_copilot, "update_bayesian_bucket"):
+                        ai_regime_copilot.update_bayesian_bucket(self.live_dir, sym, curr_session, net_pnl)
                     if ref_res.get("lesson"):
                         add_bot_log(f"[DRY-RUN REFLECTION] {ref_res['lesson']}")
                 except Exception:
@@ -588,7 +590,7 @@ class LiveAccountTradingBot:
         state["virtual_open_positions"] = remaining
         return remaining
 
-    def _record_recent_stop_losses_and_reflect(self, state: dict, now_ms: int, add_bot_log):
+    def _record_recent_stop_losses_and_reflect(self, state: dict, now_ms: int, add_bot_log, curr_session: str = "NEW_YORK"):
         loss_cd = state.setdefault("loss_cooldown_until_ms", {})
         reflected = state.setdefault("reflected_closed_ids", [])
         try:
@@ -618,6 +620,8 @@ class LiveAccountTradingBot:
                         _safe_float(row.get("avgEntryPrice"), 0.0),
                         _safe_float(row.get("avgExitPrice"), 0.0),
                     )
+                    if hasattr(ai_regime_copilot, "update_bayesian_bucket"):
+                        ai_regime_copilot.update_bayesian_bucket(self.live_dir, sym, curr_session, pnl)
                     if ref_res.get("lesson"):
                         add_bot_log(f"[AGENTIC REFLECTION] {ref_res['lesson']}")
                 except Exception:
@@ -1095,6 +1099,7 @@ class LiveAccountTradingBot:
         agentic_mem = self._load_agentic_memory()
         agentic_coin_scores = agentic_mem.get("coin_scores", {}) or {}
         session_stats = agentic_mem.get("session_stats", {}) or {}
+        quarantine_mem = agentic_mem.get("auto_quarantine", {}) or {}
 
         diagnostics = []
         order_rejections = []
@@ -1127,8 +1132,17 @@ class LiveAccountTradingBot:
         daily_total_trades = _safe_int(state.get("daily_total_trades"), 0)
         now_ms = int(time.time() * 1000)
 
-        self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log)
+        self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log, curr_session=curr_session)
         funding_rates, mark_prices = self._fetch_tickers_cached() if (crypto_enabled or forex_enabled) else ({}, {})
+
+        # Evaluate Shadow Counterfactuals against latest live mark prices to self-tune gates
+        gate_adjustments = {}
+        try:
+            import ai_regime_copilot
+            if hasattr(ai_regime_copilot, "evaluate_shadow_counterfactuals"):
+                gate_adjustments = ai_regime_copilot.evaluate_shadow_counterfactuals(self.live_dir, mark_prices) or {}
+        except Exception:
+            gate_adjustments = {}
 
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         bal_ret_code = _safe_int(bal_res.get("retCode"), -1) if bal_res else -1
@@ -1157,7 +1171,7 @@ class LiveAccountTradingBot:
 
         sl_mult, tp_mult, trail_ratio = self._regime_exit_multipliers(btc_adx, btc_natr, btc_macro_bearish)
         open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio, add_bot_log=add_bot_log)
-        virtual_positions = self._sync_virtual_positions(state, mark_prices, trail_ratio, now_ms, add_bot_log)
+        virtual_positions = self._sync_virtual_positions(state, mark_prices, trail_ratio, now_ms, add_bot_log, curr_session=curr_session)
         active_pos_records = list(open_positions) + list(virtual_positions)
         open_syms = {p["symbol"] for p in active_pos_records}
 
@@ -1268,6 +1282,21 @@ class LiveAccountTradingBot:
             live_bar = df.iloc[-1]
             latest_bar_ms = int(df.index[-1].timestamp() * 1000)
 
+            # Check Feature Drift against stored training baselines
+            try:
+                import ai_regime_copilot
+                if hasattr(ai_regime_copilot, "check_coin_feature_drift"):
+                    ai_regime_copilot.check_coin_feature_drift(
+                        self.live_dir,
+                        bybit_sym,
+                        closed_bar.to_dict(),
+                        features,
+                        models_map.get("feature_means", []),
+                        models_map.get("feature_stds", []),
+                    )
+            except Exception:
+                pass
+
             try:
                 x_row = df.iloc[[-2]][features].to_numpy(dtype="float32")
                 dmat = xgb.DMatrix(x_row, feature_names=features)
@@ -1315,8 +1344,12 @@ class LiveAccountTradingBot:
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
-            in_cooldown = (
+            is_quarantined = (
                 now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0)
+                or now_ms < _safe_int(quarantine_mem.get(bybit_sym), 0)
+            )
+            in_cooldown = (
+                is_quarantined
                 or now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
                 or now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0)
                 or bybit_sym in open_syms
@@ -1333,7 +1366,8 @@ class LiveAccountTradingBot:
             )
 
             learned_score = _safe_float(agentic_coin_scores.get(disp_sym), 0.0)
-            effective_min_prob = max(req_thresh * 0.94, 0.21) + session_prob_penalty
+            gate_prob_delta = _safe_float(gate_adjustments.get("PROB_THRESH"), 0.0)
+            effective_min_prob = max((req_thresh * 0.94) + gate_prob_delta, 0.19) + session_prob_penalty
 
             # 4-Pillar Setup & Confidence Score (12%-97% while scanning; 98%-100% ONLY when all gates pass)
             prob_ratio = raw_prob / max(effective_min_prob, 0.16)
@@ -1374,9 +1408,9 @@ class LiveAccountTradingBot:
             radar_signals.append(sig_entry)
             radar_by_disp[disp_sym] = sig_entry
 
-            if now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0):
-                trade_blocks.append(f"{bybit_sym}: Contract agreement unsigned on Bybit [110126]")
-                per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): Unsigned [110126]")
+            if is_quarantined:
+                trade_blocks.append(f"{bybit_sym}: Auto-quarantined on Bybit [110126]")
+                per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): Quarantined")
                 continue
 
             if now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0):
@@ -1416,6 +1450,7 @@ class LiveAccountTradingBot:
                     "grade": grade_tag,
                     "raw_prob": raw_prob,
                     "req_thresh": effective_min_prob,
+                    "prior_wr_pct": _safe_float(entry.get("win_rate_pct"), 55.0),
                     "bybit_sym": bybit_sym,
                     "disp_sym": disp_sym,
                     "market_type": market_type,
@@ -1430,22 +1465,47 @@ class LiveAccountTradingBot:
                 })
             else:
                 reasons = []
+                primary_gate = "GENERAL"
                 if peak_dd_paused:
                     reasons.append(f"Peak DD Guard ({peak_dd_pct:.1f}%>=10%)")
+                    primary_gate = "PEAK_DD"
                 if guard_blocked:
                     reasons.append("BTC 4H Guard")
+                    primary_gate = "BTC_4H_GUARD"
                 elif not mtf_aligned:
                     reasons.append(f"4H MTF ({effective_mtf})")
+                    primary_gate = "MTF_4H"
                 if funding_blocked:
                     reasons.append(f"Crowded funding ({fr_val * 100:+.3f}%)")
                 if not anti_chase_ok:
                     reasons.append(chase_reason)
+                    primary_gate = "ANTI_CHASE"
                 if not strat_ok:
                     reasons.append(f"Waiting {strat_id}")
+                    primary_gate = "STRATEGY_WAIT"
                 if not grade_ok:
                     reasons.append(f"Below B floor (Setup {setup_score}%<66% or ADX {adx_val:.1f}<14.5)")
                 if raw_prob < effective_min_prob:
                     reasons.append(f"Prob {raw_prob:.2f}<{effective_min_prob:.2f}")
+                    primary_gate = "PROB_THRESH"
+
+                # Record Shadow Counterfactual for high-setup blocked trades (75%-97%)
+                if setup_score >= 75:
+                    try:
+                        import ai_regime_copilot
+                        if hasattr(ai_regime_copilot, "record_shadow_counterfactual"):
+                            px_s = _safe_float(live_bar["Close"], 0.0)
+                            atr_s = _safe_float(closed_bar["ATR"], 0.0)
+                            if px_s > 0.0 and atr_s > 0.0:
+                                r_dist = max(_safe_float(cfg.get("sl_atr"), 1.35) * atr_s, px_s * (0.0020 if market_type == "FOREX" else 0.0155))
+                                sl_s = (px_s - r_dist) if direction == "LONG" else (px_s + r_dist)
+                                tp_s = (px_s + r_dist * 1.75) if direction == "LONG" else (px_s - r_dist * 1.75)
+                                ai_regime_copilot.record_shadow_counterfactual(
+                                    self.live_dir, bybit_sym, direction, px_s, sl_s, tp_s, primary_gate, setup_score
+                                )
+                    except Exception:
+                        pass
+
                 short_why = reasons[0] if reasons else "Waiting"
                 per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): {short_why}")
                 block_msg = f"{bybit_sym} {direction} ({conv_pct}%): {', '.join(reasons)} [ADX:{adx_val:.1f}]"
@@ -1552,9 +1612,19 @@ class LiveAccountTradingBot:
                 add_bot_log(msg)
                 continue
 
+            bayes_mult = 1.0
+            try:
+                import ai_regime_copilot
+                if hasattr(ai_regime_copilot, "get_bayesian_risk_multiplier"):
+                    bayes_mult = ai_regime_copilot.get_bayesian_risk_multiplier(
+                        self.live_dir, bybit_sym, curr_session, _safe_float(cand.get("prior_wr_pct"), 55.0)
+                    )
+            except Exception:
+                bayes_mult = 1.0
+
             conv_scale = self._conviction_risk_scale(_safe_float(cand.get("raw_prob"), 0.3), _safe_float(cand.get("req_thresh"), 0.3))
-            max_risk_cap = max(effective_risk_pct * 1.20, 2.50)
-            scaled_risk_pct = min(max(effective_risk_pct * conv_scale, 0.50), max_risk_cap)
+            max_risk_cap = max(effective_risk_pct * 1.25, 2.50)
+            scaled_risk_pct = min(max(effective_risk_pct * conv_scale * bayes_mult, 0.50), max_risk_cap)
             risk_usdt = max(sim_equity * (scaled_risk_pct / 100.0), 0.15)
             notional = min(max(risk_usdt / (risk_dist / price), min_required_notional, 5.5), max(max_buying_power, min_required_notional))
             qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)
@@ -1592,6 +1662,10 @@ class LiveAccountTradingBot:
 
                 if pa_res.get("decision") == "REJECT":
                     _downgrade_radar(disp_sym)
+                    if hasattr(ai_regime_copilot, "record_shadow_counterfactual"):
+                        ai_regime_copilot.record_shadow_counterfactual(
+                            self.live_dir, bybit_sym, cand["direction"], price, sl_raw, tp_raw, "LAYER1_BRAIN", cand["conv_pct"]
+                        )
                     l1_why = "; ".join(pa_res.get("reasons", [])[:2])
                     msg = f"{bybit_sym} {cand['direction']} blocked by Layer 1 Human Brain ({pa_res.get('score', 0)}/100): {l1_why}"
                     diagnostics.append(msg)
@@ -1599,7 +1673,7 @@ class LiveAccountTradingBot:
                     add_bot_log(msg)
                     continue
                 else:
-                    add_bot_log(f"[LAYER 1 APPROVED] {bybit_sym} {cand['direction']} ({pa_res.get('score', 75)}/100): {'; '.join(pa_res.get('reasons', [])[:1])}")
+                    add_bot_log(f"[LAYER 1 APPROVED] {bybit_sym} {cand['direction']} ({pa_res.get('score', 75)}/100 • Bayes {bayes_mult:.2f}x): {'; '.join(pa_res.get('reasons', [])[:1])}")
             except Exception as l1_err:
                 _downgrade_radar(disp_sym)
                 add_bot_log(f"[LAYER 1 ERROR] {bybit_sym} {cand['direction']} skipped: {l1_err}")
@@ -1694,8 +1768,14 @@ class LiveAccountTradingBot:
                 code = _safe_int(res.get("retCode"), -1)
                 raw_msg = str(res.get("retMsg", "Unknown Bybit rejection"))
                 hint = BYBIT_ERROR_HINTS.get(code, raw_msg)
-                if code == 110126:
-                    restricted_until_ms[bybit_sym] = now_ms + (24 * 60 * 60 * 1000)
+                if code in (110126, 110132):
+                    restricted_until_ms[bybit_sym] = now_ms + (30 * 24 * 60 * 60 * 1000)
+                    try:
+                        import ai_regime_copilot
+                        if hasattr(ai_regime_copilot, "quarantine_symbol_in_memory"):
+                            ai_regime_copilot.quarantine_symbol_in_memory(self.live_dir, bybit_sym, hint, days=30)
+                    except Exception:
+                        pass
                 rej_msg = f"{bybit_sym} {cand['direction']} (qty {qty_str}) rejected by Bybit [{code}]: {hint}"
                 diagnostics.append(rej_msg)
                 order_rejections.append(rej_msg)

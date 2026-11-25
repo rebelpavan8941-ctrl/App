@@ -185,7 +185,34 @@ class PaperStrategyTrainerAndTester:
                     pass
         return merged
 
-    def _adopt_winning_dynamic_strategies(self, trained_coins: dict):
+    def _load_and_clear_drift_watchlist(self, retrained_symbols: list = None) -> set:
+        """Reads drifted symbols flagged by live_bot.py and clears symbols once retrained."""
+        mem_path = os.path.join(self.live_dir, "ai_copilot_memory.json")
+        if not os.path.exists(mem_path):
+            return set()
+        try:
+            with open(mem_path, "r", encoding="utf-8-sig") as f:
+                mem = json.load(f)
+            dw = mem.get("drift_watchlist", {}) or {}
+            flagged = {str(k).replace("/", "").upper() for k in dw.keys()}
+            if retrained_symbols:
+                changed = False
+                for sym in retrained_symbols:
+                    clean = str(sym).replace("/", "").upper()
+                    if clean in dw:
+                        dw.pop(clean, None)
+                        changed = True
+                if changed:
+                    mem["drift_watchlist"] = dw
+                    tmp_m = mem_path + ".tmp"
+                    with open(tmp_m, "w", encoding="utf-8") as wf:
+                        json.dump(mem, wf, indent=2)
+                    os.replace(tmp_m, mem_path)
+            return flagged
+        except Exception:
+            return set()
+
+    def _adopt_winning_dynamic_strategies(self, trained_coins: dict, leverage: int = DEFAULT_LEVERAGE):
         if not self.dynamic_strategies:
             return
         adopted = {}
@@ -207,6 +234,21 @@ class PaperStrategyTrainerAndTester:
                 wr = float(cdata.get("win_rate_pct", 0.0))
                 trades = int(cdata.get("trades", 0))
                 if pnl > 0.0 and pf >= 1.25 and trades >= 14:
+                    # 2x-Fee & Slippage Stress Gate before auto-adopting Gemini strategies
+                    st_dict = cdata.get("stats", {}) or {}
+                    raw_rets = st_dict.get("raw_trade_returns") or cdata.get("raw_trade_returns") or []
+                    stress_ok = True
+                    try:
+                        import ai_regime_copilot
+                        if raw_rets and hasattr(ai_regime_copilot, "passes_2x_fee_stress_test"):
+                            stress_ok = ai_regime_copilot.passes_2x_fee_stress_test(
+                                raw_rets, leverage=leverage, double_round_trip_fee=0.0022
+                            )
+                    except Exception:
+                        stress_ok = True
+                    if not stress_ok:
+                        continue
+
                     best_cfg = dict(cdata.get("config", {}))
                     spec = dict(self.dynamic_strategies[sid])
                     spec["adopted_at"] = int(time.time())
@@ -802,6 +844,7 @@ class PaperStrategyTrainerAndTester:
                     se_arr = se_arr & ((htf_dir_aligned == -1) | hc_s)
 
                 trades_pnl = []
+                raw_returns = []
                 equity = initial_capital
                 in_pos = False
                 side_long = True
@@ -856,6 +899,7 @@ class PaperStrategyTrainerAndTester:
                                 pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
                                 equity += pnl_usdt
                                 trades_pnl.append(pnl_usdt)
+                                raw_returns.append(float(raw_ret))
                                 in_pos = False
                         else:
                             if l < low_w:
@@ -875,6 +919,7 @@ class PaperStrategyTrainerAndTester:
                                 pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
                                 equity += pnl_usdt
                                 trades_pnl.append(pnl_usdt)
+                                raw_returns.append(float(raw_ret))
                                 in_pos = False
 
                 arr = np.array(trades_pnl)
@@ -934,6 +979,7 @@ class PaperStrategyTrainerAndTester:
                             "net_pnl": net_usdt,
                             "walk_forward_ok": wf_both_positive,
                             "edge_tier": "HIGH_FREQ_110_150" if is_tier_a else ("SNIPER_HIGH_PF" if is_tier_b_sniper else "STANDARD"),
+                            "raw_trade_returns": [round(r, 6) for r in raw_returns],
                         },
                     }
         return best_eval
@@ -1149,8 +1195,15 @@ class PaperStrategyTrainerAndTester:
             except Exception:
                 existing_paper_portfolio = {}
 
+        drifted_compact = self._load_and_clear_drift_watchlist(retrained_symbols=None)
+
+        candidate_syms = list(added_coins)
+        for existing_sym in existing_paper_portfolio.keys():
+            if existing_sym.replace("/", "").upper() in drifted_compact and existing_sym not in candidate_syms:
+                candidate_syms.append(existing_sym)
+
         filtered_coins = []
-        for sym in added_coins:
+        for sym in candidate_syms:
             mkt = classify_market(sym)
             if (mkt == "CRYPTO" and crypto_enabled) or (mkt == "FOREX" and forex_enabled):
                 filtered_coins.append(sym)
@@ -1395,9 +1448,10 @@ class PaperStrategyTrainerAndTester:
                 "models": best_candidate["models"],
             }
 
-            # Champion vs Challenger: accept new model if it improves PF/PnL OR expands a tiny sample into High-Freq
+            # Champion vs Challenger: always refresh if flagged for live feature drift
+            is_drifted = symbol.replace("/", "").upper() in drifted_compact
             prev_champ = existing_paper_portfolio.get(symbol)
-            if isinstance(prev_champ, dict) and isinstance(prev_champ.get("models"), dict):
+            if (not is_drifted) and isinstance(prev_champ, dict) and isinstance(prev_champ.get("models"), dict):
                 old_trades = int(prev_champ.get("trades", 0))
                 old_pf = float(prev_champ.get("profit_factor", 0.0))
                 old_pnl = float(prev_champ.get("net_pnl_usdt", prev_champ.get("net_pnl", 0.0)))
@@ -1427,7 +1481,10 @@ class PaperStrategyTrainerAndTester:
             trained_coins[symbol] = coin_entry
             paper_portfolio[symbol] = coin_entry
 
-        self._adopt_winning_dynamic_strategies(trained_coins)
+        if trained_coins and drifted_compact:
+            self._load_and_clear_drift_watchlist(retrained_symbols=list(trained_coins.keys()))
+
+        self._adopt_winning_dynamic_strategies(trained_coins, leverage=leverage)
 
         with open(self.paper_results_path, "w", encoding="utf-8") as f:
             json.dump({"leverage": leverage, "training_days": TRAINING_WINDOW_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
@@ -1548,7 +1605,8 @@ class PaperStrategyTrainerAndTester:
 
         portfolio = live_master.setdefault("portfolio", {})
         portfolio.pop(norm_sym.replace("/", ""), None)
-        stats = coin_bundle.get("stats", {})
+        stats = dict(coin_bundle.get("stats", {}))
+        stats.pop("raw_trade_returns", None)
         best_mtf_mode = coin_bundle.get("mtf_alignment_mode") or coin_bundle.get("config", {}).get("mtf_alignment_mode", "STRICT")
 
         models_copy = dict(coin_bundle.get("models", {}))
