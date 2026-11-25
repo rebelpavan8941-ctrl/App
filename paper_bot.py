@@ -521,7 +521,6 @@ class PaperStrategyTrainerAndTester:
                 self._eval_dynamic_rule_list(test_df, spec.get("short_rules", [])),
             )
 
-        # ZERO LOOK-AHEAD: use entry bar Open ([1:]) and previous closed bar indicators ([:-1])
         curr_open = test_df["Open"].to_numpy()[1:]
         prev_close = test_df["Close"].to_numpy()[:-1]
         prev_open = test_df["Open"].to_numpy()[:-1]
@@ -553,12 +552,11 @@ class PaperStrategyTrainerAndTester:
         p_vwap = test_df["VWAP_Dev"].to_numpy()[:-1]
 
         if "trendline" in sid:
-            # Non-repainting swing-pivot trendline retest & rejection on closed bars
             long_ok[1:] = (p_st == 1) & (p_adx >= 17.0) & (p_d20 >= -0.60) & (p_d20 <= 0.85) & (prev_close > prev_open)
             short_ok[1:] = (p_st == -1) & (p_adx >= 17.0) & (p_d20 <= 0.60) & (p_d20 >= -0.85) & (prev_close < prev_open)
         elif "donchian" in sid:
-            long_ok[1:] = (p_st == 1) & ((curr_open >= p_don_h * 0.996) | ((prev_close > p_e20) & (p_di > 0)))
-            short_ok[1:] = (p_st == -1) & ((curr_open <= p_don_l * 1.004) | ((prev_close < p_e20) & (p_di < 0)))
+            long_ok[1:] = (p_st == 1) & (curr_open >= p_don_h * 0.998) & (p_vol >= 1.05)
+            short_ok[1:] = (p_st == -1) & (curr_open <= p_don_l * 1.002) & (p_vol >= 1.05)
         elif "vol_surge" in sid or "ob_imbalance" in sid or "supertrend_adx" in sid:
             long_ok[1:] = (p_vol >= 1.25) & (p_adx >= 20) & (p_di > 0)
             short_ok[1:] = (p_vol >= 1.25) & (p_adx >= 20) & (p_di < 0)
@@ -775,7 +773,7 @@ class PaperStrategyTrainerAndTester:
 
                 if total_trades == 0:
                     score = -100000.0
-                elif total_trades >= min_req_trades and pf >= 1.25 and wr >= 50.0 and net_usdt > 0:
+                elif total_trades >= (4 if dyn_spec is not None else min_req_trades) and pf >= 1.20 and wr >= 48.0 and net_usdt > 0:
                     score = (net_usdt * (sample_conf / 3.5)) + (pf * 30.0) + (wr * 0.5)
                 elif total_trades >= min_req_trades and pf >= 1.10 and net_usdt > 0:
                     score = (net_usdt * 0.6) + (pf * 20.0) + (wr * 0.3)
@@ -841,9 +839,18 @@ class PaperStrategyTrainerAndTester:
         if not test_tfs:
             test_tfs = ["1h", "4h"]
 
-        base_strats = list(active_strategies) if active_strategies else ["xgb_mtf_v2"]
-        if "trendline_retest_pro" not in base_strats:
-            base_strats.append("trendline_retest_pro")
+        diverse_defaults = [
+            "xgb_mtf_v2",
+            "trendline_retest_pro",
+            "xrp_donchian_breakout",
+            "btc_vol_surge_adx",
+            "bb_keltner_squeeze",
+            "eth_rsi_stoch_reversal",
+            "ema_ribbon_pullback",
+            "macd_hist_zero_cross",
+            "near_vwap_profile",
+        ]
+        base_strats = list(dict.fromkeys((list(active_strategies) if active_strategies else []) + diverse_defaults))
 
         raw_strats = list(dict.fromkeys(list(self.dynamic_strategies.keys()) + base_strats))
         seen_archetypes = set()
