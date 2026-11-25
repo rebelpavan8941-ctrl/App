@@ -94,6 +94,17 @@ def is_forex_symbol(symbol: str) -> bool:
     return len(clean) == 6 and clean[:3] in forex_bases and clean[3:] in (forex_bases | {"USD"})
 
 
+def _coin_sector(symbol: str) -> str:
+    clean = symbol.replace("/", "").upper()
+    if clean.startswith(("BTC", "ETH")):
+        return "MAJORS"
+    if clean.startswith(("SOL", "AVAX", "LINK", "ADA", "DOT", "ATOM", "NEAR", "UNI", "AAVE", "SUI", "APT")):
+        return "ALT_L1_DEFI"
+    if is_forex_symbol(clean):
+        return "FOREX"
+    return "HIGH_BETA"
+
+
 def is_valid_xgb_model(model_dict) -> bool:
     return isinstance(model_dict, dict) and "learner" in model_dict and isinstance(model_dict.get("learner"), dict)
 
@@ -231,6 +242,54 @@ class LiveAccountTradingBot:
             except Exception:
                 continue
         return {}
+
+    def _check_orderbook_spread_and_depth(
+        self,
+        bybit_sym: str,
+        order_notional_usdt: float,
+        max_spread_pct: float = 0.08,
+    ) -> tuple:
+        """Blocks entry if bid-ask spread > 0.08% or top-5 orderbook depth < 3x order notional."""
+        data = self._public_get(
+            "/v5/market/orderbook",
+            {"category": self.category, "symbol": bybit_sym, "limit": 5},
+            timeout=3.5,
+        )
+        res = data.get("result", {})
+        bids = res.get("b", [])
+        asks = res.get("a", [])
+        if not bids or not asks:
+            return True, "Orderbook check skipped"
+
+        best_bid = _safe_float(bids[0][0], 0.0)
+        best_ask = _safe_float(asks[0][0], 0.0)
+        if best_bid <= 0.0 or best_ask <= 0.0:
+            return True, "Orderbook check skipped"
+
+        spread_pct = ((best_ask - best_bid) / best_bid) * 100.0
+        bid_depth_usdt = sum(_safe_float(px, 0.0) * _safe_float(sz, 0.0) for px, sz in bids[:5])
+        ask_depth_usdt = sum(_safe_float(px, 0.0) * _safe_float(sz, 0.0) for px, sz in asks[:5])
+        min_side_depth = min(bid_depth_usdt, ask_depth_usdt)
+
+        if spread_pct > max_spread_pct:
+            return False, f"Wide spread {spread_pct:.3f}% > {max_spread_pct:.2f}%"
+        if order_notional_usdt > 0.0 and min_side_depth < (order_notional_usdt * 3.0):
+            return False, f"Thin orderbook depth ${min_side_depth:.0f} < 3x notional (${order_notional_usdt * 3.0:.0f})"
+        return True, f"Spread {spread_pct:.3f}%"
+
+    @staticmethod
+    def _passes_sector_correlation_cap(symbol: str, side: str, open_positions: list) -> tuple:
+        """Prevents holding 2+ simultaneous positions in the same sector and same direction."""
+        target_sec = _coin_sector(symbol)
+        target_side = side.upper()
+        for pos in (open_positions or []):
+            if not isinstance(pos, dict):
+                continue
+            p_sym = str(pos.get("symbol", "")).upper()
+            p_side = str(pos.get("side", "")).upper()
+            if p_sym and _coin_sector(p_sym) == target_sec and p_side == target_side:
+                return False, f"Correlated {target_sec} {target_side} already open ({p_sym})"
+        return True, "Sector OK"
 
     def _fetch_tickers_cached(self) -> tuple:
         now_s = time.time()
@@ -966,6 +1025,7 @@ class LiveAccountTradingBot:
             raise FileNotFoundError(f"Master ML Model not found at {self.master_path}")
 
         leverage = min(max(int(leverage), 1), 20)
+        effective_max_positions = max(1, int(max_open_positions))
         with open(self.master_path, "r", encoding="utf-8-sig") as f:
             master = json.load(f)
 
@@ -1040,7 +1100,8 @@ class LiveAccountTradingBot:
         sl_mult, tp_mult, trail_ratio = self._regime_exit_multipliers(btc_adx, btc_natr, btc_macro_bearish)
         open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio, add_bot_log=add_bot_log)
         virtual_positions = self._sync_virtual_positions(state, mark_prices, trail_ratio, now_ms, add_bot_log)
-        open_syms = {p["symbol"] for p in open_positions} | {vp["symbol"] for vp in virtual_positions}
+        active_pos_records = list(open_positions) + list(virtual_positions)
+        open_syms = {p["symbol"] for p in active_pos_records}
 
         active_items = []
         fetch_tasks = {}
@@ -1302,11 +1363,22 @@ class LiveAccountTradingBot:
                 order_rejections.append(msg)
                 add_bot_log(msg)
                 break
-            if len(open_syms) >= 1:
-                msg = f"{bybit_sym} {cand['direction']} skipped: Focus mode (1 open position max)"
+            if len(open_syms) >= effective_max_positions:
+                msg = f"{bybit_sym} {cand['direction']} skipped: Max open positions reached ({len(open_syms)}/{effective_max_positions})"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
                 break
+
+            sector_ok, sector_reason = self._passes_sector_correlation_cap(
+                bybit_sym, cand["direction"], active_pos_records
+            )
+            if not sector_ok:
+                msg = f"{bybit_sym} {cand['direction']} skipped: {sector_reason}"
+                diagnostics.append(msg)
+                trade_blocks.append(msg)
+                add_bot_log(msg)
+                continue
+
             if live_orders_armed and avail_usdt < 2.0:
                 msg = f"{bybit_sym} {cand['direction']} blocked: Available USDT too low (${avail_usdt:.2f} < $2.00)"
                 diagnostics.append(msg)
@@ -1408,9 +1480,18 @@ class LiveAccountTradingBot:
                 add_bot_log(f"[LAYER 1 ERROR] {bybit_sym} {cand['direction']} skipped: {l1_err}")
                 continue
 
+            if cand["market_type"] == "CRYPTO":
+                ob_ok, ob_reason = self._check_orderbook_spread_and_depth(bybit_sym, notional)
+                if not ob_ok:
+                    msg = f"{bybit_sym} {cand['direction']} blocked by Spread/Depth Guard: {ob_reason}"
+                    diagnostics.append(msg)
+                    trade_blocks.append(msg)
+                    add_bot_log(msg)
+                    continue
+
             if not live_orders_armed:
                 v_list = state.setdefault("virtual_open_positions", [])
-                v_list.append({
+                v_pos = {
                     "symbol": bybit_sym,
                     "side": cand["direction"],
                     "qty": _safe_float(qty_str, 0.0),
@@ -1420,7 +1501,9 @@ class LiveAccountTradingBot:
                     "tp": _safe_float(tp_str, 0.0),
                     "unrealized_pnl": 0.0,
                     "opened_ms": now_ms,
-                })
+                }
+                v_list.append(v_pos)
+                active_pos_records.append(v_pos)
                 open_syms.add(bybit_sym)
                 traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
                 last_trade_epoch_ms[bybit_sym] = now_ms
@@ -1454,6 +1537,14 @@ class LiveAccountTradingBot:
             })
             if res.get("retCode") == 0:
                 open_syms.add(bybit_sym)
+                active_pos_records.append({
+                    "symbol": bybit_sym,
+                    "side": cand["direction"],
+                    "qty": qty_str,
+                    "entry_price": price,
+                    "mark_price": price,
+                    "unrealized_pnl": 0.0,
+                })
                 traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
                 last_trade_epoch_ms[bybit_sym] = now_ms
                 pos_opened_map[bybit_sym] = now_ms
