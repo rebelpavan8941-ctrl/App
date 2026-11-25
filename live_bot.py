@@ -172,9 +172,9 @@ class LiveAccountTradingBot:
 
         self.is_demo = str(endpoint).lower() in ("testnet", "demo")
         self.host_candidates = (
-            ["[https://api-demo.bybit.com](https://api-demo.bybit.com)", "[https://api.bytick.com](https://api.bytick.com)"]
+            ["https://api-demo.bybit.com", "https://api.bytick.com"]
             if self.is_demo
-            else ["[https://api.bytick.com](https://api.bytick.com)", "[https://api.bybit.com](https://api.bybit.com)"]
+            else ["https://api.bytick.com", "https://api.bybit.com"]
         )
         self.base_url = self.host_candidates[0]
         self.category = "linear"
@@ -815,7 +815,7 @@ class LiveAccountTradingBot:
             yf_range = "15d" if yf_interval in ("15m", "30m") else "60d"
             try:
                 y_resp = self.session.get(
-                    f"[https://query1.finance.yahoo.com/v8/finance/chart/](https://query1.finance.yahoo.com/v8/finance/chart/){bybit_symbol}=X",
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
                     params={"interval": yf_interval, "range": yf_range},
                     headers={"User-Agent": "Mozilla/5.0"},
                     timeout=5.0,
