@@ -164,6 +164,7 @@ class LiveAccountTradingBot:
         os.makedirs(self.live_dir, exist_ok=True)
         self.state_path = os.path.join(self.live_dir, "live_engine_state.json")
         self.memory_path = os.path.join(self.live_dir, "ai_copilot_memory.json")
+        self.reports_summary_path = os.path.join(self.live_dir, "live_reports_summary.json")
 
         p1 = os.path.join(models_dir, "LIVE", "UNIFIED_PORTFOLIO_MASTER.json")
         p2 = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
@@ -184,6 +185,7 @@ class LiveAccountTradingBot:
         self._booster_cache = {}
         self._instrument_cache = {}
         self._trend_4h_cache = {}
+        self._positioning_cache = {}
         self._ticker_cache = (0.0, {}, {})
 
         self.session = requests.Session()
@@ -201,6 +203,7 @@ class LiveAccountTradingBot:
             "traded_candle_ts": {},
             "last_trade_epoch_ms": {},
             "position_opened_ms": {},
+            "position_entry_meta": {},
             "loss_cooldown_until_ms": {},
             "agentic_veto_until_ms": {},
             "restricted_symbols_until_ms": {},
@@ -223,6 +226,30 @@ class LiveAccountTradingBot:
     def _save_state(self, state: dict):
         with open(self.state_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+
+    def _write_lightweight_live_summary(self, master: dict):
+        try:
+            port = master.get("portfolio", {}) or {}
+            lite_port = {}
+            for sym, entry in port.items():
+                if not isinstance(entry, dict):
+                    continue
+                lite_entry = {k: v for k, v in entry.items() if k not in ("models", "tested_matrix")}
+                if isinstance(lite_entry.get("stats"), dict):
+                    lite_entry["stats"] = {k: v for k, v in lite_entry["stats"].items() if k != "raw_trade_returns"}
+                lite_port[sym] = lite_entry
+            tmp_s = self.reports_summary_path + ".tmp"
+            with open(tmp_s, "w", encoding="utf-8") as wf:
+                json.dump({
+                    "version": master.get("version", ""),
+                    "exported_at": master.get("exported_at", int(time.time())),
+                    "model_accuracy_pct": master.get("model_accuracy_pct", 0.0),
+                    "total_net_pnl": master.get("total_net_pnl", 0.0),
+                    "portfolio": lite_port,
+                }, wf, indent=2)
+            os.replace(tmp_s, self.reports_summary_path)
+        except Exception:
+            pass
 
     def _load_agentic_memory(self) -> dict:
         if os.path.exists(self.memory_path):
@@ -257,6 +284,45 @@ class LiveAccountTradingBot:
             except Exception:
                 continue
         return {}
+
+    def _fetch_bybit_positioning_metrics(self, bybit_sym: str) -> dict:
+        """Fetches cached 1H Open Interest 4H delta (%) and Top-Trader Long/Short skew (-100 to +100)."""
+        now_s = time.time()
+        cached = self._positioning_cache.get(bybit_sym)
+        if cached and (now_s - cached[0]) < 600.0:
+            return cached[1]
+
+        oi_delta_4h = 0.0
+        ls_skew = 0.0
+        try:
+            oi_res = self._public_get(
+                "/v5/market/open-interest",
+                {"category": self.category, "symbol": bybit_sym, "intervalTime": "1h", "limit": 5},
+                timeout=3.0,
+            )
+            oi_list = oi_res.get("result", {}).get("list", []) or []
+            if len(oi_list) >= 2:
+                oi_now = _safe_float(oi_list[0].get("openInterest"), 0.0)
+                oi_prev = _safe_float(oi_list[-1].get("openInterest"), 0.0)
+                if oi_prev > 0.0:
+                    oi_delta_4h = ((oi_now - oi_prev) / oi_prev) * 100.0
+
+            ar_res = self._public_get(
+                "/v5/market/account-ratio",
+                {"category": self.category, "symbol": bybit_sym, "period": "1h", "limit": 1},
+                timeout=3.0,
+            )
+            ar_list = ar_res.get("result", {}).get("list", []) or []
+            if ar_list:
+                buy_r = _safe_float(ar_list[0].get("buyRatio"), 0.5)
+                sell_r = _safe_float(ar_list[0].get("sellRatio"), 0.5)
+                ls_skew = (buy_r - sell_r) * 100.0
+        except Exception:
+            pass
+
+        out = {"oi_delta_4h": round(oi_delta_4h, 3), "ls_skew": round(ls_skew, 2)}
+        self._positioning_cache[bybit_sym] = (now_s, out)
+        return out
 
     def _sync_bybit_server_time(self, force: bool = False):
         now_s = time.time()
@@ -324,6 +390,68 @@ class LiveAccountTradingBot:
             if p_sym and _coin_sector(p_sym) == target_sec and p_side == target_side:
                 return False, f"Correlated {target_sec} {target_side} already open ({p_sym})"
         return True, "Sector OK"
+
+    @staticmethod
+    def _passes_rolling_correlation_guard(
+        bybit_sym: str,
+        side: str,
+        open_positions: list,
+        returns_map: dict,
+        max_corr: float = 0.82,
+    ) -> tuple:
+        """Computes rolling 72-bar log-return correlation across active pairs to block macro-correlated stacking."""
+        target_ret = returns_map.get(bybit_sym)
+        if target_ret is None or len(target_ret) < 24:
+            return True, "Corr OK"
+        target_side = side.upper()
+        for pos in (open_positions or []):
+            if not isinstance(pos, dict):
+                continue
+            p_sym = str(pos.get("symbol", "")).upper()
+            p_side = str(pos.get("side", "")).upper()
+            if not p_sym or p_sym == bybit_sym or p_side != target_side:
+                continue
+            other_ret = returns_map.get(p_sym)
+            if other_ret is None or len(other_ret) < 24:
+                continue
+            n_min = min(len(target_ret), len(other_ret), 72)
+            a = target_ret[-n_min:]
+            b = other_ret[-n_min:]
+            if np.std(a) > 1e-8 and np.std(b) > 1e-8:
+                corr = float(np.corrcoef(a, b)[0, 1])
+                if math.isfinite(corr) and corr >= max_corr:
+                    return False, f"72h Correlation {corr:.2f} >= {max_corr:.2f} with open {p_sym} {p_side}"
+        return True, "Corr OK"
+
+    @staticmethod
+    def _evaluate_meta_labeler(
+        meta_bundle: dict,
+        raw_prob: float,
+        prob_margin: float,
+        adx_val: float,
+        natr_val: float,
+        vwap_dev: float,
+        oi_delta_4h: float,
+        ls_skew: float,
+    ) -> tuple:
+        """Evaluates trained secondary meta-classifier P(TP1 before SL) when available."""
+        if not isinstance(meta_bundle, dict):
+            return None, 0.0
+        weights = meta_bundle.get("weights")
+        means = meta_bundle.get("means")
+        stds = meta_bundle.get("stds")
+        bias = _safe_float(meta_bundle.get("bias"), 0.0)
+        min_meta_prob = _safe_float(meta_bundle.get("min_prob"), 0.52)
+        if not isinstance(weights, list) or not isinstance(means, list) or not isinstance(stds, list) or len(weights) != 7:
+            return None, 0.0
+        x_vec = [raw_prob, prob_margin, adx_val, natr_val, vwap_dev, oi_delta_4h, ls_skew]
+        z = bias
+        for i in range(7):
+            sd = max(_safe_float(stds[i], 1.0), 1e-5)
+            z += _safe_float(weights[i], 0.0) * ((x_vec[i] - _safe_float(means[i], 0.0)) / sd)
+        z = max(-18.0, min(18.0, z))
+        meta_prob = 1.0 / (1.0 + math.exp(-z))
+        return bool(meta_prob >= min_meta_prob), round(meta_prob, 4)
 
     def _fetch_tickers_cached(self) -> tuple:
         now_s = time.time()
@@ -522,7 +650,7 @@ class LiveAccountTradingBot:
         except Exception:
             pass
 
-    def _sync_virtual_positions(self, state: dict, mark_prices: dict, trail_ratio: float, now_ms: int, add_bot_log, curr_session: str = "NEW_YORK") -> list:
+    def _sync_virtual_positions(self, state: dict, mark_prices: dict, trail_ratio: float, now_ms: int, add_bot_log, curr_session: str = "NEW_YORK", curr_regime: str = "CHOP") -> list:
         v_list = state.get("virtual_open_positions") or []
         if not v_list:
             return []
@@ -576,6 +704,12 @@ class LiveAccountTradingBot:
                     )
                     if hasattr(ai_regime_copilot, "update_bayesian_bucket"):
                         ai_regime_copilot.update_bayesian_bucket(self.live_dir, sym, curr_session, net_pnl)
+                    if hasattr(ai_regime_copilot, "record_conformal_outcome"):
+                        ai_regime_copilot.record_conformal_outcome(
+                            self.live_dir, curr_regime, _safe_float(vp.get("raw_prob"), 0.35), bool(net_pnl > 0.0)
+                        )
+                    if hasattr(ai_regime_copilot, "synthesize_failure_playbook"):
+                        ai_regime_copilot.synthesize_failure_playbook(self.live_dir, max_items=6)
                     if ref_res.get("lesson"):
                         add_bot_log(f"[DRY-RUN REFLECTION] {ref_res['lesson']}")
                 except Exception:
@@ -590,9 +724,10 @@ class LiveAccountTradingBot:
         state["virtual_open_positions"] = remaining
         return remaining
 
-    def _record_recent_stop_losses_and_reflect(self, state: dict, now_ms: int, add_bot_log, curr_session: str = "NEW_YORK"):
+    def _record_recent_stop_losses_and_reflect(self, state: dict, now_ms: int, add_bot_log, curr_session: str = "NEW_YORK", curr_regime: str = "CHOP"):
         loss_cd = state.setdefault("loss_cooldown_until_ms", {})
         reflected = state.setdefault("reflected_closed_ids", [])
+        entry_meta_map = state.setdefault("position_entry_meta", {})
         try:
             res = self._bybit_request("GET", "/v5/position/closed-pnl", {"category": self.category, "limit": 10})
         except Exception:
@@ -610,6 +745,7 @@ class LiveAccountTradingBot:
             if sym and updated_ms > 0 and order_id not in reflected:
                 reflected.append(order_id)
                 side_label = "SHORT" if str(row.get("side", "")).lower() == "buy" else "LONG"
+                meta_info = entry_meta_map.pop(sym, {}) or {}
                 try:
                     import ai_regime_copilot
                     ref_res = ai_regime_copilot.record_post_trade_reflection(
@@ -621,7 +757,18 @@ class LiveAccountTradingBot:
                         _safe_float(row.get("avgExitPrice"), 0.0),
                     )
                     if hasattr(ai_regime_copilot, "update_bayesian_bucket"):
-                        ai_regime_copilot.update_bayesian_bucket(self.live_dir, sym, curr_session, pnl)
+                        ai_regime_copilot.update_bayesian_bucket(
+                            self.live_dir, sym, str(meta_info.get("session", curr_session)), pnl
+                        )
+                    if hasattr(ai_regime_copilot, "record_conformal_outcome"):
+                        ai_regime_copilot.record_conformal_outcome(
+                            self.live_dir,
+                            str(meta_info.get("regime", curr_regime)),
+                            _safe_float(meta_info.get("raw_prob"), 0.35),
+                            bool(pnl > 0.0),
+                        )
+                    if hasattr(ai_regime_copilot, "synthesize_failure_playbook"):
+                        ai_regime_copilot.synthesize_failure_playbook(self.live_dir, max_items=6)
                     if ref_res.get("lesson"):
                         add_bot_log(f"[AGENTIC REFLECTION] {ref_res['lesson']}")
                 except Exception:
@@ -1014,7 +1161,6 @@ class LiveAccountTradingBot:
                     cand_sl = max(entry + tp_dist * 0.55, mark - trail_offset) if side == "LONG" else min(
                         entry - tp_dist * 0.55, mark + trail_offset
                     )
-                    # 0.20% deadband filter prevents micro-tick rate-limit spam
                     should_tighten = (cur_sl == 0.0 or cand_sl > cur_sl * 1.0020) if side == "LONG" else (
                         cur_sl == 0.0 or cand_sl < cur_sl * 0.9980
                     )
@@ -1080,6 +1226,8 @@ class LiveAccountTradingBot:
         with open(self.master_path, "r", encoding="utf-8-sig") as f:
             master = json.load(f)
 
+        self._write_lightweight_live_summary(master)
+
         features = master.get("features", FEATURES)
         portfolio = master.get("portfolio", {})
         if not portfolio:
@@ -1089,6 +1237,7 @@ class LiveAccountTradingBot:
         traded_candle_ts = state.setdefault("traded_candle_ts", {})
         last_trade_epoch_ms = state.setdefault("last_trade_epoch_ms", {})
         pos_opened_map = state.setdefault("position_opened_ms", {})
+        entry_meta_map = state.setdefault("position_entry_meta", {})
         loss_cooldown_until_ms = state.setdefault("loss_cooldown_until_ms", {})
         agentic_veto_until_ms = state.setdefault("agentic_veto_until_ms", {})
         restricted_until_ms = state.setdefault("restricted_symbols_until_ms", {})
@@ -1107,6 +1256,7 @@ class LiveAccountTradingBot:
         radar_signals = []
         radar_by_disp = {}
         per_coin_summaries = []
+        returns_72h_map = {}
 
         now_ist = datetime.datetime.now(IST_TZ)
         today_ist_str = now_ist.strftime("%Y-%m-%d")
@@ -1132,10 +1282,24 @@ class LiveAccountTradingBot:
         daily_total_trades = _safe_int(state.get("daily_total_trades"), 0)
         now_ms = int(time.time() * 1000)
 
-        self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log, curr_session=curr_session)
+        btc_macro_bearish = False
+        btc_adx = 20.0
+        btc_natr = 1.8
+        if btc_macro_guard:
+            btc_st, btc_adx, btc_natr = self._get_cached_4h_metrics("BTCUSDT")
+            btc_macro_bearish = bool(btc_st == -1)
+
+        curr_regime = (
+            "VOLATILE" if btc_natr >= 2.8 else (
+                "BEAR_TREND" if (btc_macro_bearish and btc_adx >= 18.0) else (
+                    "BULL_TREND" if ((not btc_macro_bearish) and btc_adx >= 18.0) else "CHOP"
+                )
+            )
+        )
+
+        self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log, curr_session=curr_session, curr_regime=curr_regime)
         funding_rates, mark_prices = self._fetch_tickers_cached() if (crypto_enabled or forex_enabled) else ({}, {})
 
-        # Evaluate Shadow Counterfactuals against latest live mark prices to self-tune gates
         gate_adjustments = {}
         try:
             import ai_regime_copilot
@@ -1153,7 +1317,6 @@ class LiveAccountTradingBot:
             add_bot_log(err_str)
         avail_usdt, total_equity_usdt = self._extract_wallet_metrics(bal_res) if bal_ret_code == 0 else (0.0, 0.0)
 
-        # Rolling Peak-Equity Drawdown Guard
         peak_equity = _safe_float(state.get("peak_equity_usdt"), 0.0)
         if total_equity_usdt > peak_equity:
             peak_equity = total_equity_usdt
@@ -1162,16 +1325,9 @@ class LiveAccountTradingBot:
         effective_risk_pct = risk_per_trade_pct * 0.5 if peak_dd_pct >= 8.0 else risk_per_trade_pct
         peak_dd_paused = bool(peak_dd_pct >= 10.0)
 
-        btc_macro_bearish = False
-        btc_adx = 20.0
-        btc_natr = 1.8
-        if btc_macro_guard:
-            btc_st, btc_adx, btc_natr = self._get_cached_4h_metrics("BTCUSDT")
-            btc_macro_bearish = bool(btc_st == -1)
-
         sl_mult, tp_mult, trail_ratio = self._regime_exit_multipliers(btc_adx, btc_natr, btc_macro_bearish)
         open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio, add_bot_log=add_bot_log)
-        virtual_positions = self._sync_virtual_positions(state, mark_prices, trail_ratio, now_ms, add_bot_log, curr_session=curr_session)
+        virtual_positions = self._sync_virtual_positions(state, mark_prices, trail_ratio, now_ms, add_bot_log, curr_session=curr_session, curr_regime=curr_regime)
         active_pos_records = list(open_positions) + list(virtual_positions)
         open_syms = {p["symbol"] for p in active_pos_records}
 
@@ -1223,6 +1379,7 @@ class LiveAccountTradingBot:
         candidates = []
         top_wait_tuple = None
         coins_scanned_count = 0
+        any_conformal_tight = False
 
         for symbol, entry, market_type, cfg, bybit_sym, interval in active_items:
             coins_scanned_count += 1
@@ -1278,11 +1435,13 @@ class LiveAccountTradingBot:
             if len(df) < 3:
                 continue
 
+            # Cache rolling 72-bar returns for cross-asset correlation guard
+            returns_72h_map[bybit_sym] = df["Ret_1h"].iloc[-73:-1].to_numpy(dtype=np.float64)
+
             closed_bar = df.iloc[-2]
             live_bar = df.iloc[-1]
             latest_bar_ms = int(df.index[-1].timestamp() * 1000)
 
-            # Check Feature Drift against stored training baselines
             try:
                 import ai_regime_copilot
                 if hasattr(ai_regime_copilot, "check_coin_feature_drift"):
@@ -1311,8 +1470,28 @@ class LiveAccountTradingBot:
 
             direction = "LONG" if p_long >= p_short else "SHORT"
             raw_prob = p_long if direction == "LONG" else p_short
+            prob_margin = abs(p_long - p_short)
             default_th = 0.24 if market_type == "FOREX" else 0.28
             req_thresh = _safe_float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh"), default_th)
+
+            is_quarantined = (
+                now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0)
+                or now_ms < _safe_int(quarantine_mem.get(bybit_sym), 0)
+            )
+            in_cooldown = (
+                is_quarantined
+                or now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
+                or now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0)
+                or bybit_sym in open_syms
+            )
+
+            # Institutional Positioning (Open Interest 4H Delta & Long/Short Skew) for active crypto candidates
+            oi_delta_4h = 0.0
+            ls_skew = 0.0
+            if market_type == "CRYPTO" and (not in_cooldown) and raw_prob >= (req_thresh * 0.85):
+                pos_metrics = self._fetch_bybit_positioning_metrics(bybit_sym)
+                oi_delta_4h = _safe_float(pos_metrics.get("oi_delta_4h"), 0.0)
+                ls_skew = _safe_float(pos_metrics.get("ls_skew"), 0.0)
 
             if interval == "240":
                 trend_4h = int(closed_bar["Supertrend"])
@@ -1321,6 +1500,8 @@ class LiveAccountTradingBot:
                 trend_4h = cached_4h[1] if cached_4h else 0
 
             adx_val = _safe_float(closed_bar.get("ADX"), 0.0)
+            natr_val = _safe_float(closed_bar.get("NATR"), 1.5)
+            vwap_dev = _safe_float(closed_bar.get("VWAP_Dev"), 0.0)
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.06) and (_safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.15)
 
@@ -1334,7 +1515,10 @@ class LiveAccountTradingBot:
             )
 
             fr_val = _safe_float(funding_rates.get(bybit_sym), 0.0) if market_type == "CRYPTO" else 0.0
-            funding_blocked = (direction == "LONG" and fr_val > 0.0004) or (direction == "SHORT" and fr_val < -0.0004)
+            crowded_oi_top = (direction == "LONG" and ls_skew > 48.0 and oi_delta_4h > 4.0) or (
+                direction == "SHORT" and ls_skew < -48.0 and oi_delta_4h > 4.0
+            )
+            funding_blocked = (direction == "LONG" and fr_val > 0.0004) or (direction == "SHORT" and fr_val < -0.0004) or crowded_oi_top
 
             effective_mtf = str(cfg.get("mtf_alignment_mode") or entry.get("mtf_alignment_mode") or mtf_mode).upper()
             if effective_mtf == "OFF":
@@ -1343,17 +1527,6 @@ class LiveAccountTradingBot:
                 mtf_aligned = (raw_4h_ok or (raw_prob >= (req_thresh + 0.04) and _safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.10)) and not guard_blocked
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
-
-            is_quarantined = (
-                now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0)
-                or now_ms < _safe_int(quarantine_mem.get(bybit_sym), 0)
-            )
-            in_cooldown = (
-                is_quarantined
-                or now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
-                or now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0)
-                or bybit_sym in open_syms
-            )
 
             anti_chase_ok, chase_reason = self._passes_anti_chase_guard(closed_bar, live_bar, direction)
             strat_ok = self._strategy_entry_filter(
@@ -1365,9 +1538,53 @@ class LiveAccountTradingBot:
                 custom_rules=custom_rules,
             )
 
+            # Secondary Meta-Labeling Filter ("Should we take this signal?")
+            trained_meta_ok, trained_meta_prob = self._evaluate_meta_labeler(
+                models_map.get("meta"),
+                raw_prob,
+                prob_margin,
+                adx_val,
+                natr_val,
+                vwap_dev,
+                oi_delta_4h,
+                ls_skew,
+            )
+            if trained_meta_ok is not None:
+                meta_ok = trained_meta_ok
+                meta_prob = trained_meta_prob
+            else:
+                meta_prob = 0.65
+                try:
+                    import ai_regime_copilot
+                    if hasattr(ai_regime_copilot, "compute_meta_label_score"):
+                        meta_prob = ai_regime_copilot.compute_meta_label_score(
+                            p_long, p_short, adx_val, natr_val, vwap_dev, raw_4h_ok, curr_session
+                        )
+                except Exception:
+                    meta_prob = 0.65
+                meta_ok = bool(meta_prob >= 0.48)
+
             learned_score = _safe_float(agentic_coin_scores.get(disp_sym), 0.0)
             gate_prob_delta = _safe_float(gate_adjustments.get("PROB_THRESH"), 0.0)
-            effective_min_prob = max((req_thresh * 0.94) + gate_prob_delta, 0.19) + session_prob_penalty
+            base_min_prob = max((req_thresh * 0.94) + gate_prob_delta, 0.19) + session_prob_penalty
+
+            # Regime-Aware Conformal Abstention & Fractional-Kelly Multiplier
+            est_tp_rr = min(max(_safe_float(cfg.get("tp1_rr"), 1.65) * tp_mult, 1.50), 1.85)
+            conformal_abstain = False
+            effective_min_prob = base_min_prob
+            kelly_scale = 1.0
+            try:
+                import ai_regime_copilot
+                if hasattr(ai_regime_copilot, "get_conformal_threshold_and_kelly"):
+                    conformal_abstain, effective_min_prob, kelly_scale, _ = ai_regime_copilot.get_conformal_threshold_and_kelly(
+                        self.live_dir, curr_regime, raw_prob, base_min_prob, rr_ratio=est_tp_rr
+                    )
+                    if effective_min_prob > base_min_prob + 0.001:
+                        any_conformal_tight = True
+            except Exception:
+                conformal_abstain = False
+                effective_min_prob = base_min_prob
+                kelly_scale = 1.0
 
             # 4-Pillar Setup & Confidence Score (12%-97% while scanning; 98%-100% ONLY when all gates pass)
             prob_ratio = raw_prob / max(effective_min_prob, 0.16)
@@ -1375,7 +1592,7 @@ class LiveAccountTradingBot:
             mtf_pts = 24.0 if mtf_aligned else (8.0 if raw_4h_ok else 0.0)
             strat_pts = 20.0 if strat_ok else 4.0
             adx_pts = min(9.0, max(0.0, (adx_val / 28.0) * 9.0))
-            clean_pts = 8.0 if (anti_chase_ok and not funding_blocked) else 0.0
+            clean_pts = 8.0 if (anti_chase_ok and not funding_blocked and meta_ok and not conformal_abstain) else 0.0
             setup_score = int(round(min(97.0, max(12.0, prob_pts + mtf_pts + strat_pts + adx_pts + clean_pts))))
 
             mtf_or_momentum_ok = raw_4h_ok or (raw_prob >= effective_min_prob + 0.05 and adx_val >= 18.0)
@@ -1384,9 +1601,11 @@ class LiveAccountTradingBot:
             all_gates_ready = (
                 (not in_cooldown)
                 and (not peak_dd_paused)
+                and (not conformal_abstain)
                 and mtf_aligned
                 and strat_ok
                 and anti_chase_ok
+                and meta_ok
                 and grade_ok
                 and (not funding_blocked)
                 and (raw_prob >= effective_min_prob)
@@ -1450,6 +1669,8 @@ class LiveAccountTradingBot:
                     "grade": grade_tag,
                     "raw_prob": raw_prob,
                     "req_thresh": effective_min_prob,
+                    "meta_prob": meta_prob,
+                    "kelly_scale": kelly_scale,
                     "prior_wr_pct": _safe_float(entry.get("win_rate_pct"), 55.0),
                     "bybit_sym": bybit_sym,
                     "disp_sym": disp_sym,
@@ -1462,6 +1683,8 @@ class LiveAccountTradingBot:
                     "candles_df": df.iloc[:-1].tail(72).copy(),
                     "adx_val": adx_val,
                     "fr_val": fr_val,
+                    "oi_delta_4h": oi_delta_4h,
+                    "ls_skew": ls_skew,
                 })
             else:
                 reasons = []
@@ -1476,20 +1699,23 @@ class LiveAccountTradingBot:
                     reasons.append(f"4H MTF ({effective_mtf})")
                     primary_gate = "MTF_4H"
                 if funding_blocked:
-                    reasons.append(f"Crowded funding ({fr_val * 100:+.3f}%)")
+                    reasons.append(f"Crowded positioning (FR {fr_val * 100:+.3f}%, LS {ls_skew:+.0f})")
                 if not anti_chase_ok:
                     reasons.append(chase_reason)
                     primary_gate = "ANTI_CHASE"
+                if not meta_ok:
+                    reasons.append(f"Meta-Filter ({meta_prob:.2f})")
+                    primary_gate = "META_LABEL"
                 if not strat_ok:
                     reasons.append(f"Waiting {strat_id}")
                     primary_gate = "STRATEGY_WAIT"
                 if not grade_ok:
                     reasons.append(f"Below B floor (Setup {setup_score}%<66% or ADX {adx_val:.1f}<14.5)")
-                if raw_prob < effective_min_prob:
-                    reasons.append(f"Prob {raw_prob:.2f}<{effective_min_prob:.2f}")
+                if conformal_abstain or raw_prob < effective_min_prob:
+                    tag_p = "Conformal Prob" if conformal_abstain else "Prob"
+                    reasons.append(f"{tag_p} {raw_prob:.2f}<{effective_min_prob:.2f}")
                     primary_gate = "PROB_THRESH"
 
-                # Record Shadow Counterfactual for high-setup blocked trades (75%-97%)
                 if setup_score >= 75:
                     try:
                         import ai_regime_copilot
@@ -1551,6 +1777,29 @@ class LiveAccountTradingBot:
             if not sector_ok:
                 _downgrade_radar(disp_sym)
                 msg = f"{bybit_sym} {cand['direction']} skipped: {sector_reason}"
+                diagnostics.append(msg)
+                trade_blocks.append(msg)
+                add_bot_log(msg)
+                continue
+
+            corr_ok, corr_reason = True, "Corr OK"
+            try:
+                import ai_regime_copilot
+                if hasattr(ai_regime_copilot, "check_rolling_correlation_guard"):
+                    corr_ok, corr_reason = ai_regime_copilot.check_rolling_correlation_guard(
+                        bybit_sym, cand["direction"], active_pos_records, returns_72h_map, max_corr=0.82
+                    )
+                else:
+                    corr_ok, corr_reason = self._passes_rolling_correlation_guard(
+                        bybit_sym, cand["direction"], active_pos_records, returns_72h_map, max_corr=0.82
+                    )
+            except Exception:
+                corr_ok, corr_reason = self._passes_rolling_correlation_guard(
+                    bybit_sym, cand["direction"], active_pos_records, returns_72h_map, max_corr=0.82
+                )
+            if not corr_ok:
+                _downgrade_radar(disp_sym)
+                msg = f"{bybit_sym} {cand['direction']} skipped: {corr_reason}"
                 diagnostics.append(msg)
                 trade_blocks.append(msg)
                 add_bot_log(msg)
@@ -1623,8 +1872,9 @@ class LiveAccountTradingBot:
                 bayes_mult = 1.0
 
             conv_scale = self._conviction_risk_scale(_safe_float(cand.get("raw_prob"), 0.3), _safe_float(cand.get("req_thresh"), 0.3))
+            combined_risk_mult = min(max(conv_scale * bayes_mult * _safe_float(cand.get("kelly_scale"), 1.0), 0.50), 1.35)
             max_risk_cap = max(effective_risk_pct * 1.25, 2.50)
-            scaled_risk_pct = min(max(effective_risk_pct * conv_scale * bayes_mult, 0.50), max_risk_cap)
+            scaled_risk_pct = min(max(effective_risk_pct * combined_risk_mult, 0.50), max_risk_cap)
             risk_usdt = max(sim_equity * (scaled_risk_pct / 100.0), 0.15)
             notional = min(max(risk_usdt / (risk_dist / price), min_required_notional, 5.5), max(max_buying_power, min_required_notional))
             qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)
@@ -1673,7 +1923,10 @@ class LiveAccountTradingBot:
                     add_bot_log(msg)
                     continue
                 else:
-                    add_bot_log(f"[LAYER 1 APPROVED] {bybit_sym} {cand['direction']} ({pa_res.get('score', 75)}/100 • Bayes {bayes_mult:.2f}x): {'; '.join(pa_res.get('reasons', [])[:1])}")
+                    add_bot_log(
+                        f"[LAYER 1 APPROVED] {bybit_sym} {cand['direction']} ({pa_res.get('score', 75)}/100 • "
+                        f"Meta {cand['meta_prob']:.2f} • Size {combined_risk_mult:.2f}x): {'; '.join(pa_res.get('reasons', [])[:1])}"
+                    )
             except Exception as l1_err:
                 _downgrade_radar(disp_sym)
                 add_bot_log(f"[LAYER 1 ERROR] {bybit_sym} {cand['direction']} skipped: {l1_err}")
@@ -1701,6 +1954,9 @@ class LiveAccountTradingBot:
                     "tp": _safe_float(tp_str, 0.0),
                     "unrealized_pnl": 0.0,
                     "opened_ms": now_ms,
+                    "raw_prob": cand["raw_prob"],
+                    "oi_delta_4h": cand["oi_delta_4h"],
+                    "ls_skew": cand["ls_skew"],
                 }
                 v_list.append(v_pos)
                 active_pos_records.append(v_pos)
@@ -1748,6 +2004,13 @@ class LiveAccountTradingBot:
                 traded_candle_ts[bybit_sym] = cand["latest_bar_ms"]
                 last_trade_epoch_ms[bybit_sym] = now_ms
                 pos_opened_map[bybit_sym] = now_ms
+                entry_meta_map[bybit_sym] = {
+                    "raw_prob": cand["raw_prob"],
+                    "session": curr_session,
+                    "regime": curr_regime,
+                    "oi_delta_4h": cand["oi_delta_4h"],
+                    "ls_skew": cand["ls_skew"],
+                }
                 daily_coin_trades[bybit_sym] = _safe_int(daily_coin_trades.get(bybit_sym), 0) + 1
                 daily_total_trades += 1
                 state["daily_total_trades"] = daily_total_trades
@@ -1785,7 +2048,7 @@ class LiveAccountTradingBot:
         summary_detail = top_wait_tuple[1] if top_wait_tuple else (diagnostics[0] if diagnostics else "All pairs scanned")
         dry_tag = " [DRY-RUN]" if not live_orders_armed else ""
         mode_tag = f"Active ({daily_total_trades} today • A+/A/B+/B){dry_tag}"
-        sess_note = f"{curr_session}{' (Tight)' if session_prob_penalty > 0 else ''}"
+        sess_note = f"{curr_session}{' (Tight)' if (session_prob_penalty > 0 or any_conformal_tight) else ''}"
         state["top_status_summary"] = f"{mode_tag} | {sess_note} | {summary_detail}"
 
         if live_trades_this_cycle == 0:

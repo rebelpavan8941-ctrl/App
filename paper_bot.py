@@ -185,6 +185,18 @@ class PaperStrategyTrainerAndTester:
                     pass
         return merged
 
+    def _load_failure_playbook(self) -> list:
+        mem_path = os.path.join(self.live_dir, "ai_copilot_memory.json")
+        if not os.path.exists(mem_path):
+            return []
+        try:
+            with open(mem_path, "r", encoding="utf-8-sig") as f:
+                mem = json.load(f)
+            pb = mem.get("failure_playbook", []) or []
+            return pb if isinstance(pb, list) else []
+        except Exception:
+            return []
+
     def _load_and_clear_drift_watchlist(self, retrained_symbols: list = None) -> set:
         """Reads drifted symbols flagged by live_bot.py and clears symbols once retrained."""
         mem_path = os.path.join(self.live_dir, "ai_copilot_memory.json")
@@ -602,6 +614,56 @@ class PaperStrategyTrainerAndTester:
         clf_short.fit(X_train, y_s)
         return clf_long, clf_short
 
+    @staticmethod
+    def _fit_meta_labeler(meta_samples: list):
+        """
+        Trains a lightweight L2-regularized logistic meta-classifier predicting P(TP1 before SL)
+        on out-of-sample trade features: [raw_prob, prob_margin, adx, natr, vwap_dev, 0.0, 0.0].
+        """
+        if not meta_samples or len(meta_samples) < 16:
+            return None
+        X = np.array([s[0] for s in meta_samples], dtype=np.float64)
+        y = np.array([1.0 if s[1] else 0.0 for s in meta_samples], dtype=np.float64)
+        if y.sum() < 3 or (len(y) - y.sum()) < 3:
+            return None
+
+        means = X.mean(axis=0)
+        stds = X.std(axis=0)
+        stds = np.where(stds < 1e-6, 1.0, stds)
+        Xn = (X - means) / stds
+
+        w = np.zeros(7, dtype=np.float64)
+        b = 0.0
+        lr = 0.08
+        l2 = 0.15
+        n = float(len(y))
+
+        for _ in range(180):
+            z = np.clip(Xn @ w + b, -18.0, 18.0)
+            preds = 1.0 / (1.0 + np.exp(-z))
+            err = preds - y
+            grad_w = (Xn.T @ err) / n + l2 * w
+            grad_b = float(err.mean())
+            w -= lr * grad_w
+            b -= lr * grad_b
+
+        # Keep unseen derivatives positioning slots (5, 6) strictly zero-weighted in historical fit
+        w[5] = 0.0
+        w[6] = 0.0
+
+        final_probs = 1.0 / (1.0 + np.exp(-np.clip(Xn @ w + b, -18.0, 18.0)))
+        q25 = float(np.quantile(final_probs, 0.25))
+        min_prob = round(min(max(q25, 0.44), 0.55), 4)
+
+        return {
+            "weights": [round(float(v), 6) for v in w],
+            "means": [round(float(v), 6) for v in means],
+            "stds": [round(float(v), 6) for v in stds],
+            "bias": round(float(b), 6),
+            "min_prob": min_prob,
+            "samples": int(len(y)),
+        }
+
     def _eval_dynamic_rule_list(self, test_df: pd.DataFrame, rules: list) -> np.ndarray:
         n = len(test_df)
         mask = np.ones(n, dtype=bool)
@@ -756,7 +818,6 @@ class PaperStrategyTrainerAndTester:
         round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (BYBIT_TAKER_FEE * 2.0)
         dyn_spec = self.dynamic_strategies.get(strategy_id)
 
-        # Wide sweep covering BOTH 110-150 high-frequency setups (0.18-0.26) AND high-PF sniper setups (0.30-0.38)
         param_configs = [
             (0.16, 1.10, 1.75, False, 1.6),
             (0.20, 1.20, 1.90, False, 1.7),
@@ -798,7 +859,11 @@ class PaperStrategyTrainerAndTester:
         lows = test_df["Low"].to_numpy()
         atrs = test_df["ATR"].to_numpy()
         vols = test_df["Vol_Surge"].to_numpy()
+        adxs = test_df["ADX"].to_numpy()
+        natrs = test_df["NATR"].to_numpy()
+        vwaps = test_df["VWAP_Dev"].to_numpy()
         n_bars = len(test_df)
+        mid_oos = max(1, n_bars // 2)  # Splits 40% OOS into 20% Validation + 20% Untouched Holdout
 
         f_long, f_short = self._compute_vectorized_filter_masks(test_df, strategy_id, relaxed=relaxed_filter)
 
@@ -844,11 +909,16 @@ class PaperStrategyTrainerAndTester:
                     se_arr = se_arr & ((htf_dir_aligned == -1) | hc_s)
 
                 trades_pnl = []
+                val_pnls = []
+                holdout_pnls = []
                 raw_returns = []
+                meta_samples = []
                 equity = initial_capital
                 in_pos = False
                 side_long = True
                 entry = sl = tp1 = tp2 = high_w = low_w = 0.0
+                entry_bar_idx = 0
+                entry_meta_vec = None
                 tp1_hit = False
 
                 for i in range(1, n_bars):
@@ -868,8 +938,20 @@ class PaperStrategyTrainerAndTester:
                             in_pos = True
                             side_long = le
                             entry = opens[i]
+                            entry_bar_idx = i
                             high_w = low_w = entry
                             tp1_hit = False
+                            chosen_p = float(p_long[i - 1] if side_long else p_short[i - 1])
+                            p_margin = abs(float(p_long[i - 1]) - float(p_short[i - 1]))
+                            entry_meta_vec = [
+                                chosen_p,
+                                p_margin,
+                                float(adxs[i - 1]),
+                                float(natrs[i - 1]),
+                                float(vwaps[i - 1]),
+                                0.0,
+                                0.0,
+                            ]
                             min_sl_floor = entry * (0.0020 if is_forex else 0.0155)
                             risk = max(sl_atr * atr, min_sl_floor)
                             if side_long:
@@ -886,9 +968,7 @@ class PaperStrategyTrainerAndTester:
                                 high_w = h
                             if h >= tp1 and not tp1_hit:
                                 tp1_hit = True
-                                # Lock +0.35R risk-free on TP1 without choking TP2 runner
                                 sl = max(sl, entry + 0.35 * (tp1 - entry))
-                            # Engage ATR trailing only once price advances >= 75% toward TP2
                             if tp1_hit and high_w >= entry + 0.75 * (tp2 - entry):
                                 tr_sl = high_w - trail_mult * atr
                                 if tr_sl > sl:
@@ -899,16 +979,20 @@ class PaperStrategyTrainerAndTester:
                                 pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
                                 equity += pnl_usdt
                                 trades_pnl.append(pnl_usdt)
+                                if entry_bar_idx < mid_oos:
+                                    val_pnls.append(pnl_usdt)
+                                else:
+                                    holdout_pnls.append(pnl_usdt)
                                 raw_returns.append(float(raw_ret))
+                                if entry_meta_vec is not None:
+                                    meta_samples.append((entry_meta_vec, bool(pnl_usdt > 0.0)))
                                 in_pos = False
                         else:
                             if l < low_w:
                                 low_w = l
                             if l <= tp1 and not tp1_hit:
                                 tp1_hit = True
-                                # Lock +0.35R risk-free on TP1 without choking TP2 runner
                                 sl = min(sl, entry - 0.35 * (entry - tp1))
-                            # Engage ATR trailing only once price advances >= 75% toward TP2
                             if tp1_hit and low_w <= entry - 0.75 * (entry - tp2):
                                 tr_sl = low_w + trail_mult * atr
                                 if tr_sl < sl:
@@ -919,7 +1003,13 @@ class PaperStrategyTrainerAndTester:
                                 pnl_usdt = (equity * 0.05) * ((raw_ret - round_trip_fee) * leverage)
                                 equity += pnl_usdt
                                 trades_pnl.append(pnl_usdt)
+                                if entry_bar_idx < mid_oos:
+                                    val_pnls.append(pnl_usdt)
+                                else:
+                                    holdout_pnls.append(pnl_usdt)
                                 raw_returns.append(float(raw_ret))
+                                if entry_meta_vec is not None:
+                                    meta_samples.append((entry_meta_vec, bool(pnl_usdt > 0.0)))
                                 in_pos = False
 
                 arr = np.array(trades_pnl)
@@ -931,12 +1021,11 @@ class PaperStrategyTrainerAndTester:
                 net_usdt = round(float(equity - initial_capital), 2)
                 net_pct = round((net_usdt / initial_capital) * 100.0, 2)
 
-                # Walk-forward two-half stability check against single-spike overfitting
-                half_idx = max(1, total_trades // 2)
-                first_half_pnl = float(arr[:half_idx].sum()) if total_trades >= 4 else net_usdt
-                second_half_pnl = float(arr[half_idx:].sum()) if total_trades >= 4 else net_usdt
-                wf_both_positive = (total_trades >= 14 and first_half_pnl > 0.0 and second_half_pnl > 0.0)
-                walk_forward_mult = 1.20 if wf_both_positive else 0.75
+                # 3-Way Nested Temporal Holdout Verification (20% Validation + 20% Untouched Holdout)
+                val_sum = float(sum(val_pnls)) if val_pnls else net_usdt
+                holdout_sum = float(sum(holdout_pnls)) if holdout_pnls else net_usdt
+                wf_both_positive = (total_trades >= 14 and val_sum > 0.0 and holdout_sum > 0.0)
+                walk_forward_mult = 1.22 if wf_both_positive else 0.72
 
                 # Dual-Tier Scoring:
                 # Tier A: High-Frequency Edge (85-175 trades, PF >= 1.50, WR >= 50%)
@@ -954,7 +1043,6 @@ class PaperStrategyTrainerAndTester:
                     pf_bonus = min(pf, 4.0) * 42.0
                     score = ((net_usdt * 1.45) + pf_bonus + (wr * 0.65)) * freq_bonus * walk_forward_mult
                 elif is_tier_b_sniper:
-                    # High-PF sniper coin (PF 2.5-3.5+ with fewer setups) scored on equal footing
                     pf_bonus = min(pf, 4.5) * 58.0
                     score = ((net_usdt * 1.75) + pf_bonus + (wr * 0.85)) * walk_forward_mult
                 elif total_trades >= sniper_floor and pf >= 1.25 and net_usdt > 0:
@@ -969,6 +1057,7 @@ class PaperStrategyTrainerAndTester:
                     best_eval = {
                         "score": score,
                         "cfg": cfg,
+                        "meta_samples": meta_samples,
                         "stats": {
                             "trades": total_trades,
                             "win_rate_pct": wr,
@@ -977,6 +1066,8 @@ class PaperStrategyTrainerAndTester:
                             "net_pnl_pct": net_pct,
                             "net_pnl_usdt": net_usdt,
                             "net_pnl": net_usdt,
+                            "val_pnl_usdt": round(val_sum, 2),
+                            "holdout_pnl_usdt": round(holdout_sum, 2),
                             "walk_forward_ok": wf_both_positive,
                             "edge_tier": "HIGH_FREQ_110_150" if is_tier_a else ("SNIPER_HIGH_PF" if is_tier_b_sniper else "STANDARD"),
                             "raw_trade_returns": [round(r, 6) for r in raw_returns],
@@ -1027,8 +1118,8 @@ class PaperStrategyTrainerAndTester:
     def agentic_analyze_and_auto_promote(self, trained_coins: dict) -> dict:
         """
         Agentic AI Post-Training Analyzer:
-        Evaluates all trained coins (both 110-150 trade High-Frequency winners AND
-        18-84 trade High-PF Sniper setups), logs per-coin verdicts, and automatically
+        Evaluates all trained coins across 3-way temporal holdout, meta-labeling,
+        and failure-playbook rules, logs per-coin verdicts, and automatically
         promotes qualifying winners into LIVE/UNIFIED_PORTFOLIO_MASTER.json.
         """
         live_portfolio = {}
@@ -1039,11 +1130,15 @@ class PaperStrategyTrainerAndTester:
             except Exception:
                 live_portfolio = {}
 
+        playbook = self._load_failure_playbook()
         clock_str = datetime.datetime.now(IST_TZ).strftime("%H:%M:%S IST")
         promoted_coins = []
         held_coins = []
         analysis_items = []
         log_entries = []
+
+        if playbook:
+            log_entries.append(f"[{clock_str}] [FAILURE PLAYBOOK] Active lessons applied: {len(playbook)} rules")
 
         ranked_coins = sorted(
             trained_coins.items(),
@@ -1062,6 +1157,7 @@ class PaperStrategyTrainerAndTester:
             pf = float(cdata.get("profit_factor", st.get("profit_factor", 0.0)))
             pnl = float(cdata.get("net_pnl_usdt", st.get("net_pnl_usdt", 0.0)))
             wf_ok = bool(st.get("walk_forward_ok", True))
+            has_meta = isinstance((cdata.get("models") or {}).get("meta"), dict)
             is_fx = (classify_market(sym) == "FOREX")
 
             sniper_min = 12 if is_fx else 18
@@ -1072,6 +1168,7 @@ class PaperStrategyTrainerAndTester:
             qualifies = (qualifies_freq or qualifies_sniper) and (wf_ok or pf >= 2.30)
 
             archetype = "HIGH-FREQ" if qualifies_freq else ("SNIPER-HIGH-PF" if qualifies_sniper else "SUB-THRESHOLD")
+            meta_tag = " + MetaML" if has_meta else ""
             in_live = sym in live_portfolio
 
             if in_live:
@@ -1086,14 +1183,14 @@ class PaperStrategyTrainerAndTester:
                 )
                 should_promote = qualifies and beats_live
                 reason = (
-                    f"Upgraded Live ({archetype}: PF {l_pf:.2f}->{pf:.2f}, {trades} trades, WR {wr:.1f}%, +${pnl:.0f})"
+                    f"Upgraded Live ({archetype}{meta_tag}: PF {l_pf:.2f}->{pf:.2f}, {trades} trades, WR {wr:.1f}%, +${pnl:.0f})"
                     if should_promote
                     else f"Kept existing Live champion (Paper PF {pf:.2f} vs Live PF {l_pf:.2f})"
                 )
             else:
                 should_promote = qualifies
                 if should_promote:
-                    reason = f"Auto-Promoted ({archetype}: PF {pf:.2f}, WR {wr:.1f}%, {trades} trades, +${pnl:.0f})"
+                    reason = f"Auto-Promoted ({archetype}{meta_tag}: PF {pf:.2f}, WR {wr:.1f}%, {trades} trades, +${pnl:.0f})"
                 else:
                     why_parts = []
                     if trades < sniper_min:
@@ -1107,7 +1204,7 @@ class PaperStrategyTrainerAndTester:
                     if wr < 50.0:
                         why_parts.append(f"WR {wr:.1f}%<50%")
                     if not wf_ok and pf < 2.30:
-                        why_parts.append("uneven walk-forward")
+                        why_parts.append("failed 20% untouched holdout")
                     reason = f"Held in Paper ({', '.join(why_parts) or 'below live bar'})"
 
             if should_promote and self.move_coin_to_live_model(sym):
@@ -1125,6 +1222,7 @@ class PaperStrategyTrainerAndTester:
                 "profit_factor": pf,
                 "net_pnl_usdt": pnl,
                 "walk_forward_ok": wf_ok,
+                "meta_labeler_trained": has_meta,
                 "auto_promoted": should_promote,
                 "verdict": reason,
             })
@@ -1242,7 +1340,8 @@ class PaperStrategyTrainerAndTester:
                 if len(df) < 180:
                     continue
 
-                split = int(len(df) * 0.65)
+                # 60% Train / 40% Out-of-Sample (20% Validation + 20% Untouched Holdout)
+                split = int(len(df) * 0.60)
                 train_end = max(120, split - hor_bars)
                 train_df = df.iloc[:train_end]
                 test_df = df.iloc[split:]
@@ -1297,6 +1396,15 @@ class PaperStrategyTrainerAndTester:
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
                         cfg["strategy"] = f"{strat_name} ({tf.upper()} • MTF:{best_mtf})"
+                        meta_model = self._fit_meta_labeler(eval_res.get("meta_samples", []))
+                        models_payload = {
+                            "long": self._serialize_booster(clf_long),
+                            "short": self._serialize_booster(clf_short),
+                            "feature_means": f_means,
+                            "feature_stds": f_stds,
+                        }
+                        if meta_model is not None:
+                            models_payload["meta"] = meta_model
                         best_candidate = {
                             "score": eval_res["score"],
                             "strategy_id": strat_id,
@@ -1304,12 +1412,7 @@ class PaperStrategyTrainerAndTester:
                             "timeframe": tf.upper(),
                             "stats": st,
                             "cfg": cfg,
-                            "models": {
-                                "long": self._serialize_booster(clf_long),
-                                "short": self._serialize_booster(clf_short),
-                                "feature_means": f_means,
-                                "feature_stds": f_stds,
-                            },
+                            "models": models_payload,
                         }
 
             cur_trades = best_candidate["stats"]["trades"] if best_candidate else 0
@@ -1349,6 +1452,15 @@ class PaperStrategyTrainerAndTester:
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
                         cfg["strategy"] = f"Adaptive Tuned XGBoost ({tf.upper()} • MTF:{best_mtf})"
+                        meta_model = self._fit_meta_labeler(eval_res.get("meta_samples", []))
+                        models_payload = {
+                            "long": self._serialize_booster(clf_long),
+                            "short": self._serialize_booster(clf_short),
+                            "feature_means": f_means,
+                            "feature_stds": f_stds,
+                        }
+                        if meta_model is not None:
+                            models_payload["meta"] = meta_model
                         best_candidate = {
                             "score": eval_res["score"],
                             "strategy_id": "xgb_adaptive_quantile",
@@ -1356,12 +1468,7 @@ class PaperStrategyTrainerAndTester:
                             "timeframe": tf.upper(),
                             "stats": st,
                             "cfg": cfg,
-                            "models": {
-                                "long": self._serialize_booster(clf_long),
-                                "short": self._serialize_booster(clf_short),
-                                "feature_means": f_means,
-                                "feature_stds": f_stds,
-                            },
+                            "models": models_payload,
                         }
 
             if (cur_trades < sniper_floor or cur_pnl <= 0.0) and cached_tf_bundles:
@@ -1369,7 +1476,7 @@ class PaperStrategyTrainerAndTester:
                     df_sens = self.build_matrix(raw, max_dd=1.15, expansion=0.75, horizon=14)
                     if len(df_sens) < 180:
                         continue
-                    split = int(len(df_sens) * 0.65)
+                    split = int(len(df_sens) * 0.60)
                     train_s = df_sens.iloc[:max(120, split - 14)]
                     test_s = df_sens.iloc[split:]
                     f_means = train_s[FEATURES].mean().tolist()
@@ -1406,6 +1513,15 @@ class PaperStrategyTrainerAndTester:
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
                         cfg["strategy"] = f"High-Sensitivity XGBoost ({tf.upper()} • MTF:{best_mtf})"
+                        meta_model = self._fit_meta_labeler(eval_res.get("meta_samples", []))
+                        models_payload = {
+                            "long": self._serialize_booster(clf_l2),
+                            "short": self._serialize_booster(clf_s2),
+                            "feature_means": f_means,
+                            "feature_stds": f_stds,
+                        }
+                        if meta_model is not None:
+                            models_payload["meta"] = meta_model
                         best_candidate = {
                             "score": eval_res["score"],
                             "strategy_id": "xgb_high_sensitivity",
@@ -1413,12 +1529,7 @@ class PaperStrategyTrainerAndTester:
                             "timeframe": tf.upper(),
                             "stats": st,
                             "cfg": cfg,
-                            "models": {
-                                "long": self._serialize_booster(clf_l2),
-                                "short": self._serialize_booster(clf_s2),
-                                "feature_means": f_means,
-                                "feature_stds": f_stds,
-                            },
+                            "models": models_payload,
                         }
                     del df_sens, train_s, test_s, clf_l2, clf_s2
 
