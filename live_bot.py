@@ -23,6 +23,15 @@ TIMEFRAME_TO_BYBIT_INTERVAL = {
     "4h": "240",
 }
 
+FOREX_LINEAR_SYMBOLS = {
+    "EURUSDUSDT",
+    "GBPUSDUSDT",
+    "USDJPYUSDT",
+    "XAUUSDT",
+    "XAGUSDT",
+    "XAUTUSDT",
+}
+
 FEATURES = [
     "NATR", "BB_PctB", "BB_Width",
     "Ret_1h", "Ret_3h", "Ret_6h", "Ret_12h", "Ret_24h",
@@ -33,6 +42,7 @@ FEATURES = [
 
 BYBIT_ERROR_HINTS = {
     10001: "Invalid order parameter / quantity step or price precision",
+    10002: "Timestamp outside Bybit recv_window — resyncing server clock",
     10003: "API key invalid or Mainnet/Demo endpoint mismatch",
     10004: "API signature mismatch — check API Secret",
     10006: "Bybit API rate limit exceeded",
@@ -90,18 +100,20 @@ def get_ist_session_name(dt_ist: datetime.datetime) -> str:
 
 def is_forex_symbol(symbol: str) -> bool:
     clean = symbol.replace("/", "").upper()
+    if clean in FOREX_LINEAR_SYMBOLS:
+        return True
     forex_bases = {"EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
     return len(clean) == 6 and clean[:3] in forex_bases and clean[3:] in (forex_bases | {"USD"})
 
 
 def _coin_sector(symbol: str) -> str:
     clean = symbol.replace("/", "").upper()
+    if is_forex_symbol(clean):
+        return "FOREX"
     if clean.startswith(("BTC", "ETH")):
         return "MAJORS"
     if clean.startswith(("SOL", "AVAX", "LINK", "ADA", "DOT", "ATOM", "NEAR", "UNI", "AAVE", "SUI", "APT")):
         return "ALT_L1_DEFI"
-    if is_forex_symbol(clean):
-        return "FOREX"
     return "HIGH_BETA"
 
 
@@ -167,6 +179,8 @@ class LiveAccountTradingBot:
         self.category = "linear"
         self.rate_limit_remaining = 120
         self.rate_limit_cap = 120
+        self._server_time_offset_ms = 0
+        self._last_time_sync_s = 0.0
         self._booster_cache = {}
         self._instrument_cache = {}
         self._trend_4h_cache = {}
@@ -193,6 +207,7 @@ class LiveAccountTradingBot:
             "reflected_closed_ids": [],
             "daily_coin_trades": {},
             "daily_total_trades": 0,
+            "peak_equity_usdt": 0.0,
             "tp1_partial_done": {},
             "native_trail_set": {},
             "virtual_open_positions": [],
@@ -243,13 +258,32 @@ class LiveAccountTradingBot:
                 continue
         return {}
 
+    def _sync_bybit_server_time(self, force: bool = False):
+        now_s = time.time()
+        if not force and (now_s - self._last_time_sync_s) < 600.0:
+            return
+        try:
+            local_before_ms = int(time.time() * 1000)
+            data = self._public_get("/v5/market/time", {}, timeout=3.0)
+            local_after_ms = int(time.time() * 1000)
+            res = data.get("result", {})
+            srv_nano = _safe_int(res.get("timeNano"), 0)
+            srv_sec = _safe_int(res.get("timeSecond"), 0)
+            srv_ms = (srv_nano // 1_000_000) if srv_nano > 0 else (srv_sec * 1000 if srv_sec > 0 else 0)
+            if srv_ms > 0:
+                mid_local_ms = (local_before_ms + local_after_ms) // 2
+                self._server_time_offset_ms = srv_ms - mid_local_ms
+                self._last_time_sync_s = now_s
+        except Exception:
+            pass
+
     def _check_orderbook_spread_and_depth(
         self,
         bybit_sym: str,
         order_notional_usdt: float,
         max_spread_pct: float = 0.08,
     ) -> tuple:
-        """Blocks entry if bid-ask spread > 0.08% or top-5 orderbook depth < 3x order notional."""
+        """Blocks entry if bid-ask spread > max_spread_pct or top-5 orderbook depth < 3x order notional."""
         data = self._public_get(
             "/v5/market/orderbook",
             {"category": self.category, "symbol": bybit_sym, "limit": 5},
@@ -320,9 +354,10 @@ class LiveAccountTradingBot:
         if self.rate_limit_cap > 0 and self.rate_limit_remaining < int(self.rate_limit_cap * 0.10):
             time.sleep(0.4)
 
+        self._sync_bybit_server_time(force=False)
         last_err = None
         for base in self.host_candidates:
-            ts = str(int(time.time() * 1000))
+            ts = str(int(time.time() * 1000) + self._server_time_offset_ms)
             recv_window = "5000"
             try:
                 if method == "GET":
@@ -338,7 +373,11 @@ class LiveAccountTradingBot:
                     resp = self.session.get(url, headers=headers, timeout=5.0)
                     self._update_rate_limits(resp)
                     if resp.status_code == 200:
-                        return resp.json()
+                        j_out = resp.json()
+                        if _safe_int(j_out.get("retCode"), 0) == 10002:
+                            self._sync_bybit_server_time(force=True)
+                            continue
+                        return j_out
                 else:
                     raw_body = json.dumps(body or {})
                     sig = self._sign(ts, recv_window, raw_body)
@@ -352,7 +391,11 @@ class LiveAccountTradingBot:
                     resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=5.0)
                     self._update_rate_limits(resp)
                     if resp.status_code == 200:
-                        return resp.json()
+                        j_out = resp.json()
+                        if _safe_int(j_out.get("retCode"), 0) == 10002:
+                            self._sync_bybit_server_time(force=True)
+                            continue
+                        return j_out
             except Exception as e:
                 last_err = e
                 continue
@@ -360,20 +403,23 @@ class LiveAccountTradingBot:
             raise last_err
         return {}
 
-    def _extract_available_usdt(self, bal_res: dict) -> float:
+    def _extract_wallet_metrics(self, bal_res: dict) -> tuple:
+        """Returns (available_usdt, total_equity_usdt)."""
         acct_list = bal_res.get("result", {}).get("list", [])
         if not acct_list or not isinstance(acct_list[0], dict):
-            return 0.0
+            return 0.0, 0.0
         acct = acct_list[0]
+        total_eq = _safe_float(acct.get("totalEquity"), 0.0)
         raw_avail = str(acct.get("totalAvailableBalance", "")).strip()
         if raw_avail != "":
-            return _safe_float(raw_avail, 0.0)
+            return _safe_float(raw_avail, 0.0), total_eq
         for c_item in acct.get("coin", []) or []:
             if str(c_item.get("coin", "")).upper() == "USDT":
                 wb = _safe_float(c_item.get("walletBalance"), 0.0)
                 im = _safe_float(c_item.get("totalPositionIM"), 0.0) + _safe_float(c_item.get("totalOrderIM"), 0.0)
-                return max(0.0, wb - im)
-        return _safe_float(acct.get("totalEquity"), 0.0)
+                eq = _safe_float(c_item.get("equity"), wb)
+                return max(0.0, wb - im), (total_eq if total_eq > 0.0 else eq)
+        return total_eq, total_eq
 
     def _get_instrument_filters(self, bybit_symbol: str):
         if bybit_symbol in self._instrument_cache:
@@ -593,7 +639,7 @@ class LiveAccountTradingBot:
                 df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
             return df.sort_values("timestamp").set_index("timestamp")
 
-        if is_forex_symbol(bybit_symbol):
+        if is_forex_symbol(bybit_symbol) and not bybit_symbol.endswith("USDT"):
             yf_interval = "15m" if interval == "15" else ("30m" if interval == "30" else "1h")
             yf_range = "15d" if yf_interval in ("15m", "30m") else "60d"
             try:
@@ -912,7 +958,7 @@ class LiveAccountTradingBot:
                     else:
                         tight_sl = (entry - tp_dist * 0.25) if side == "LONG" else (entry + tp_dist * 0.25)
                         valid_vs_mark = (tight_sl < mark * 0.9985) if side == "LONG" else (tight_sl > mark * 1.0015)
-                        better_than_cur = (cur_sl == 0.0 or tight_sl > cur_sl * 1.0005) if side == "LONG" else (cur_sl == 0.0 or tight_sl < cur_sl * 0.9995)
+                        better_than_cur = (cur_sl == 0.0 or tight_sl > cur_sl * 1.0020) if side == "LONG" else (cur_sl == 0.0 or tight_sl < cur_sl * 0.9980)
                         if valid_vs_mark and better_than_cur:
                             self._bybit_request("POST", "/v5/position/trading-stop", body={
                                 "category": self.category,
@@ -928,8 +974,8 @@ class LiveAccountTradingBot:
                 if filters and tp_dist > 0.0 and profit_dist >= tp_dist * 0.65:
                     qty_step, min_qty, min_notional, tick_size = filters
                     be_sl = (entry + tp_dist * 0.15) if side == "LONG" else (entry - tp_dist * 0.15)
-                    need_be = (cur_sl == 0.0 or be_sl > cur_sl * 1.0005) if side == "LONG" else (
-                        cur_sl == 0.0 or be_sl < cur_sl * 0.9995
+                    need_be = (cur_sl == 0.0 or be_sl > cur_sl * 1.0020) if side == "LONG" else (
+                        cur_sl == 0.0 or be_sl < cur_sl * 0.9980
                     )
                     if need_be:
                         self._bybit_request("POST", "/v5/position/trading-stop", body={
@@ -964,8 +1010,9 @@ class LiveAccountTradingBot:
                     cand_sl = max(entry + tp_dist * 0.55, mark - trail_offset) if side == "LONG" else min(
                         entry - tp_dist * 0.55, mark + trail_offset
                     )
-                    should_tighten = (cur_sl == 0.0 or cand_sl > cur_sl * 1.0005) if side == "LONG" else (
-                        cur_sl == 0.0 or cand_sl < cur_sl * 0.9995
+                    # 0.20% deadband filter prevents micro-tick rate-limit spam
+                    should_tighten = (cur_sl == 0.0 or cand_sl > cur_sl * 1.0020) if side == "LONG" else (
+                        cur_sl == 0.0 or cand_sl < cur_sl * 0.9980
                     )
                     if should_tighten:
                         self._bybit_request("POST", "/v5/position/trading-stop", body={
@@ -1081,7 +1128,7 @@ class LiveAccountTradingBot:
         now_ms = int(time.time() * 1000)
 
         self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log)
-        funding_rates, mark_prices = self._fetch_tickers_cached() if crypto_enabled else ({}, {})
+        funding_rates, mark_prices = self._fetch_tickers_cached() if (crypto_enabled or forex_enabled) else ({}, {})
 
         bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
         bal_ret_code = _safe_int(bal_res.get("retCode"), -1) if bal_res else -1
@@ -1090,7 +1137,16 @@ class LiveAccountTradingBot:
             err_str = f"Bybit Wallet API Error [{bal_ret_code}]: {BYBIT_ERROR_HINTS.get(bal_ret_code, bal_msg)}"
             order_rejections.append(err_str)
             add_bot_log(err_str)
-        avail_usdt = self._extract_available_usdt(bal_res) if bal_ret_code == 0 else 0.0
+        avail_usdt, total_equity_usdt = self._extract_wallet_metrics(bal_res) if bal_ret_code == 0 else (0.0, 0.0)
+
+        # Rolling Peak-Equity Drawdown Guard
+        peak_equity = _safe_float(state.get("peak_equity_usdt"), 0.0)
+        if total_equity_usdt > peak_equity:
+            peak_equity = total_equity_usdt
+            state["peak_equity_usdt"] = round(peak_equity, 4)
+        peak_dd_pct = ((peak_equity - total_equity_usdt) / peak_equity * 100.0) if (peak_equity > 0.0 and total_equity_usdt > 0.0) else 0.0
+        effective_risk_pct = risk_per_trade_pct * 0.5 if peak_dd_pct >= 8.0 else risk_per_trade_pct
+        peak_dd_paused = bool(peak_dd_pct >= 10.0)
 
         btc_macro_bearish = False
         btc_adx = 20.0
@@ -1110,7 +1166,7 @@ class LiveAccountTradingBot:
         for symbol, entry in portfolio.items():
             if not isinstance(entry, dict):
                 continue
-            market_type = entry.get("market", "FOREX" if is_forex_symbol(symbol) else "CRYPTO").upper()
+            market_type = "FOREX" if is_forex_symbol(symbol) else entry.get("market", "CRYPTO").upper()
             if (market_type == "CRYPTO" and not crypto_enabled) or (market_type == "FOREX" and not forex_enabled):
                 continue
             cfg = entry.get("config", {})
@@ -1283,6 +1339,7 @@ class LiveAccountTradingBot:
 
             all_gates_ready = (
                 (not in_cooldown)
+                and (not peak_dd_paused)
                 and mtf_aligned
                 and strat_ok
                 and anti_chase_ok
@@ -1363,6 +1420,8 @@ class LiveAccountTradingBot:
                 })
             else:
                 reasons = []
+                if peak_dd_paused:
+                    reasons.append(f"Peak DD Guard ({peak_dd_pct:.1f}%>=10%)")
                 if guard_blocked:
                     reasons.append("BTC 4H Guard")
                 elif not mtf_aligned:
@@ -1483,8 +1542,8 @@ class LiveAccountTradingBot:
                 continue
 
             conv_scale = self._conviction_risk_scale(_safe_float(cand.get("raw_prob"), 0.3), _safe_float(cand.get("req_thresh"), 0.3))
-            max_risk_cap = max(risk_per_trade_pct * 1.20, 2.50)
-            scaled_risk_pct = min(max(risk_per_trade_pct * conv_scale, 0.50), max_risk_cap)
+            max_risk_cap = max(effective_risk_pct * 1.20, 2.50)
+            scaled_risk_pct = min(max(effective_risk_pct * conv_scale, 0.50), max_risk_cap)
             risk_usdt = max(sim_equity * (scaled_risk_pct / 100.0), 0.15)
             notional = min(max(risk_usdt / (risk_dist / price), min_required_notional, 5.5), max(max_buying_power, min_required_notional))
             qty_str = self._format_step(max(notional / price, min_qty), qty_step, round_up=True)
@@ -1535,15 +1594,15 @@ class LiveAccountTradingBot:
                 add_bot_log(f"[LAYER 1 ERROR] {bybit_sym} {cand['direction']} skipped: {l1_err}")
                 continue
 
-            if cand["market_type"] == "CRYPTO":
-                ob_ok, ob_reason = self._check_orderbook_spread_and_depth(bybit_sym, notional)
-                if not ob_ok:
-                    _downgrade_radar(disp_sym)
-                    msg = f"{bybit_sym} {cand['direction']} blocked by Spread/Depth Guard: {ob_reason}"
-                    diagnostics.append(msg)
-                    trade_blocks.append(msg)
-                    add_bot_log(msg)
-                    continue
+            spread_cap = 0.05 if cand["market_type"] == "FOREX" else 0.08
+            ob_ok, ob_reason = self._check_orderbook_spread_and_depth(bybit_sym, notional, max_spread_pct=spread_cap)
+            if not ob_ok:
+                _downgrade_radar(disp_sym)
+                msg = f"{bybit_sym} {cand['direction']} blocked by Spread/Depth Guard: {ob_reason}"
+                diagnostics.append(msg)
+                trade_blocks.append(msg)
+                add_bot_log(msg)
+                continue
 
             if not live_orders_armed:
                 v_list = state.setdefault("virtual_open_positions", [])
@@ -1640,7 +1699,8 @@ class LiveAccountTradingBot:
 
         if live_trades_this_cycle == 0:
             all_coins_line = " | ".join(per_coin_summaries) if per_coin_summaries else summary_detail
-            add_bot_log(f"Scanning {coins_scanned_count} coins ({daily_total_trades} today • {sess_note}{dry_tag}, Avail ${avail_usdt:.2f}): {all_coins_line}")
+            dd_note = f" | PeakDD {peak_dd_pct:.1f}%" if peak_dd_pct >= 5.0 else ""
+            add_bot_log(f"Scanning {coins_scanned_count} coins ({daily_total_trades} today • {sess_note}{dry_tag}, Avail ${avail_usdt:.2f}{dd_note}): {all_coins_line}")
 
         if not bot_logs_enabled:
             state["last_bot_logs"] = []

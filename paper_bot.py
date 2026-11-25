@@ -28,6 +28,15 @@ BARS_PER_DAY = {
     "4h": 6,
 }
 
+FOREX_LINEAR_SYMBOLS = {
+    "EURUSDUSDT",
+    "GBPUSDUSDT",
+    "USDJPYUSDT",
+    "XAUUSDT",
+    "XAGUSDT",
+    "XAUTUSDT",
+}
+
 DEFAULT_TEST_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
 TRAINING_WINDOW_DAYS = 135   # 4.5 months (~135 days) full multi-regime coverage
 MAX_KEPT_MODEL_VERSIONS = 2  # Retain only latest 2 trained ML models on disk
@@ -78,13 +87,24 @@ STRATEGY_CATALOG_META = {
 
 def classify_market(symbol: str) -> str:
     clean = symbol.strip().upper()
+    compact = clean.replace("/", "").replace("-", "").replace("_", "")
+    if compact in FOREX_LINEAR_SYMBOLS:
+        return "FOREX"
     forex_bases = {"EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
     parts = clean.replace("-", "/").replace("_", "/").split("/")
     if len(parts) >= 2 and parts[0] in forex_bases and parts[1] in (forex_bases | {"USD"}):
         return "FOREX"
-    if len(clean) == 6 and clean[:3] in forex_bases and clean[3:] in (forex_bases | {"USD"}):
+    if len(compact) == 6 and compact[:3] in forex_bases and compact[3:] in (forex_bases | {"USD"}):
         return "FOREX"
     return "CRYPTO"
+
+
+def _is_legacy_yahoo_forex(symbol: str) -> bool:
+    compact = symbol.strip().upper().replace("/", "").replace("-", "").replace("_", "")
+    if compact in FOREX_LINEAR_SYMBOLS or compact.endswith("USDT"):
+        return False
+    forex_bases = {"EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
+    return len(compact) == 6 and compact[:3] in forex_bases and compact[3:] in (forex_bases | {"USD"})
 
 
 class PaperStrategyTrainerAndTester:
@@ -355,7 +375,7 @@ class PaperStrategyTrainerAndTester:
         return pd.DataFrame()
 
     def fetch_bybit_history(self, symbol: str, timeframe: str = "1h", days: int = TRAINING_WINDOW_DAYS) -> pd.DataFrame:
-        if classify_market(symbol) == "FOREX":
+        if _is_legacy_yahoo_forex(symbol):
             return self._fetch_forex_yahoo_history(symbol, timeframe=timeframe)
 
         bybit_sym = symbol.replace("/", "").upper()
