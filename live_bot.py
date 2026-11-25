@@ -1224,10 +1224,11 @@ class LiveAccountTradingBot:
                 sig_entry = {
                     "symbol": disp_sym,
                     "direction": "WAIT",
-                    "confidence_pct": 25,
+                    "confidence_pct": 18,
+                    "setup_score": 18,
                     "mtf_aligned": False,
                     "side": "WAIT",
-                    "conviction_pct": 25,
+                    "conviction_pct": 18,
                     "aligned_4h": False,
                     "raw_prob": 0.0,
                 }
@@ -1247,10 +1248,11 @@ class LiveAccountTradingBot:
                 sig_entry = {
                     "symbol": disp_sym,
                     "direction": "WAIT",
-                    "confidence_pct": 30,
+                    "confidence_pct": 22,
+                    "setup_score": 22,
                     "mtf_aligned": False,
                     "side": "WAIT",
-                    "conviction_pct": 30,
+                    "conviction_pct": 22,
                     "aligned_4h": False,
                     "raw_prob": 0.0,
                 }
@@ -1333,9 +1335,17 @@ class LiveAccountTradingBot:
             learned_score = _safe_float(agentic_coin_scores.get(disp_sym), 0.0)
             effective_min_prob = max(req_thresh * 0.94, 0.21) + session_prob_penalty
 
+            # 4-Pillar Setup & Confidence Score (12%-97% while scanning; 98%-100% ONLY when all gates pass)
+            prob_ratio = raw_prob / max(effective_min_prob, 0.16)
+            prob_pts = min(36.0, max(0.0, (prob_ratio - 0.55) * 45.0))
+            mtf_pts = 24.0 if mtf_aligned else (8.0 if raw_4h_ok else 0.0)
+            strat_pts = 20.0 if strat_ok else 4.0
+            adx_pts = min(9.0, max(0.0, (adx_val / 28.0) * 9.0))
+            clean_pts = 8.0 if (anti_chase_ok and not funding_blocked) else 0.0
+            setup_score = int(round(min(97.0, max(12.0, prob_pts + mtf_pts + strat_pts + adx_pts + clean_pts))))
+
             mtf_or_momentum_ok = raw_4h_ok or (raw_prob >= effective_min_prob + 0.05 and adx_val >= 18.0)
-            base_conv = int(min(96, max(45, round((raw_prob / max(req_thresh, 0.16)) * 75 + (10 if raw_4h_ok else -4) + min(adx_val * 0.25, 8)))))
-            grade_ok = (base_conv >= 66) and mtf_or_momentum_ok and (adx_val >= 14.5) and (learned_score >= -10.0)
+            grade_ok = (setup_score >= 66) and mtf_or_momentum_ok and (adx_val >= 14.5) and (learned_score >= -10.0)
 
             all_gates_ready = (
                 (not in_cooldown)
@@ -1347,14 +1357,14 @@ class LiveAccountTradingBot:
                 and (not funding_blocked)
                 and (raw_prob >= effective_min_prob)
             )
-            # Radar is >= 98% (Green) ONLY when all execution gates pass; otherwise capped <= 74% (Amber/Red)
-            conv_pct = max(98, min(100, base_conv + 6)) if all_gates_ready else min(base_conv, 74)
+            conv_pct = max(98, min(100, setup_score + 4)) if all_gates_ready else setup_score
             aligned_flag = bool(all_gates_ready)
 
             sig_entry = {
                 "symbol": disp_sym,
                 "direction": direction,
                 "confidence_pct": conv_pct,
+                "setup_score": setup_score,
                 "mtf_aligned": aligned_flag,
                 "side": direction,
                 "conviction_pct": conv_pct,
@@ -1433,7 +1443,7 @@ class LiveAccountTradingBot:
                 if not strat_ok:
                     reasons.append(f"Waiting {strat_id}")
                 if not grade_ok:
-                    reasons.append(f"Below B floor (Conv {base_conv}%<66% or ADX {adx_val:.1f}<14.5)")
+                    reasons.append(f"Below B floor (Setup {setup_score}%<66% or ADX {adx_val:.1f}<14.5)")
                 if raw_prob < effective_min_prob:
                     reasons.append(f"Prob {raw_prob:.2f}<{effective_min_prob:.2f}")
                 short_why = reasons[0] if reasons else "Waiting"
@@ -1446,11 +1456,12 @@ class LiveAccountTradingBot:
 
         candidates.sort(key=lambda x: x["edge"], reverse=True)
 
-        def _downgrade_radar(disp_key: str, cap_pct: int = 72):
+        def _downgrade_radar(disp_key: str, max_cap_pct: int = 96):
             entry_r = radar_by_disp.get(disp_key)
             if entry_r:
-                entry_r["confidence_pct"] = min(int(entry_r["confidence_pct"]), cap_pct)
-                entry_r["conviction_pct"] = entry_r["confidence_pct"]
+                restored = min(int(entry_r.get("setup_score", entry_r["confidence_pct"])), max_cap_pct)
+                entry_r["confidence_pct"] = restored
+                entry_r["conviction_pct"] = restored
                 entry_r["mtf_aligned"] = False
                 entry_r["aligned_4h"] = False
 
