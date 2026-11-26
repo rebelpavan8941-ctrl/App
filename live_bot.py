@@ -1702,6 +1702,7 @@ class LiveAccountTradingBot:
             base_min_prob = max((req_thresh * 0.94) + gate_prob_delta, 0.19) + session_prob_penalty
 
             est_tp_rr = min(max(_safe_float(cfg.get("tp1_rr"), 1.65) * tp_mult, 1.50), 1.85)
+            conformal_regime = f"G2_CHOP_{curr_regime}" if is_chop_gear else curr_regime
             conformal_abstain = False
             effective_min_prob = base_min_prob
             kelly_scale = 1.0
@@ -1709,7 +1710,7 @@ class LiveAccountTradingBot:
                 import ai_regime_copilot
                 if hasattr(ai_regime_copilot, "get_conformal_threshold_and_kelly"):
                     conformal_abstain, effective_min_prob, kelly_scale, _ = ai_regime_copilot.get_conformal_threshold_and_kelly(
-                        self.live_dir, curr_regime, raw_prob, base_min_prob, rr_ratio=est_tp_rr
+                        self.live_dir, conformal_regime, raw_prob, base_min_prob, rr_ratio=est_tp_rr
                     )
                     if effective_min_prob > base_min_prob + 0.001:
                         any_conformal_tight = True
@@ -1765,9 +1766,12 @@ class LiveAccountTradingBot:
                 per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): Quarantined")
                 continue
 
-            if now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0):
-                rem_min = max(1, int((_safe_int(loss_cooldown_until_ms.get(bybit_sym), 0) - now_ms) / 60000))
-                cd_msg = f"{bybit_sym} {direction} ({conv_pct}%): 4h post-loss cooldown ({rem_min}m left)"
+            raw_cd_until = _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
+            eff_cd_until = max(0, raw_cd_until - (195 * 60 * 1000)) if is_chop_gear else raw_cd_until
+            if now_ms < eff_cd_until:
+                rem_min = max(1, int((eff_cd_until - now_ms) / 60000))
+                cd_lbl = "45m" if is_chop_gear else "4h"
+                cd_msg = f"{bybit_sym} {direction} ({conv_pct}%): {cd_lbl} post-loss cooldown ({rem_min}m left)"
                 emit_layer_block_alert(bybit_sym, direction, "LOSS_COOLDOWN", cd_msg)
                 diagnostics.append(cd_msg)
                 per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): Cooldown {rem_min}m")
@@ -1787,9 +1791,9 @@ class LiveAccountTradingBot:
             quality_edge = (raw_prob - effective_min_prob) + (0.04 if raw_4h_ok else 0.0) + (0.02 if adx_val >= 19.0 else 0.0) + (learned_score * 0.002)
 
             if all_gates_ready:
-                if conv_pct >= 99 and raw_4h_ok and adx_val >= 22.0:
+                if conv_pct >= 99 and ((raw_4h_ok and adx_val >= 22.0) or (is_chop_gear and adx_val < 20.5)):
                     grade_tag = "A+"
-                elif conv_pct >= 98 and adx_val >= 18.5:
+                elif conv_pct >= 98 and (adx_val >= 18.5 or (is_chop_gear and adx_val < 23.0)):
                     grade_tag = "A"
                 else:
                     grade_tag = "B+"
@@ -1882,7 +1886,7 @@ class LiveAccountTradingBot:
                             px_s = _safe_float(live_bar["Close"], 0.0)
                             atr_s = _safe_float(closed_bar["ATR"], 0.0)
                             if px_s > 0.0 and atr_s > 0.0:
-                                r_dist = max(_safe_float(cfg.get("sl_atr"), 1.35) * atr_s, px_s * (0.0020 if market_type == "FOREX" else 0.0155))
+                                r_dist = max(_safe_float(cfg.get("sl_atr"), 1.65 if is_chop_gear else 1.35) * atr_s, px_s * (0.0020 if market_type == "FOREX" else (0.0038 if is_chop_gear else 0.0155)))
                                 sl_s = (px_s - r_dist) if direction == "LONG" else (px_s + r_dist)
                                 tp_s = (px_s + r_dist * 1.75) if direction == "LONG" else (px_s - r_dist * 1.75)
                                 ai_regime_copilot.record_shadow_counterfactual(
@@ -2063,6 +2067,8 @@ class LiveAccountTradingBot:
                     gemini_enabled=gem_shadow_on,
                     gemini_api_key=gem_shadow_key,
                     is_chop_regime=is_chop_cand,
+                    timeframe=str(cand.get("timeframe", "1H")),
+                    strategy_name=str(cand.get("strategy_id", "")),
                 )
                 if pa_res.get("shadow_log"):
                     add_bot_log(pa_res["shadow_log"])

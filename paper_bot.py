@@ -1,4 +1,4 @@
-import os
+﻿import os
 import gc
 import sys
 import json
@@ -12,6 +12,7 @@ import xgboost as xgb
 
 IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 BYBIT_TAKER_FEE = 0.00055    # 0.055% per side (0.11% round-trip for Crypto)
+BYBIT_MAKER_FEE = 0.00020    # 0.020% per side (0.04% round-trip for Post-Only Maker)
 FOREX_HALF_SPREAD = 0.00006  # 0.6 pip per side (1.2 pips = 0.012% round-trip for Forex)
 MAX_LEVERAGE = 20
 DEFAULT_LEVERAGE = 10
@@ -112,6 +113,14 @@ def _is_legacy_yahoo_forex(symbol: str) -> bool:
         return False
     forex_bases = {"EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF"}
     return len(compact) == 6 and compact[:3] in forex_bases and compact[3:] in (forex_bases | {"USD"})
+
+
+def _atomic_write_json(path: str, payload: dict):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as wf:
+        json.dump(payload, wf, indent=2)
+    os.replace(tmp_path, path)
 
 
 class PaperStrategyTrainerAndTester:
@@ -221,10 +230,7 @@ class PaperStrategyTrainerAndTester:
                         changed = True
                 if changed:
                     mem["drift_watchlist"] = dw
-                    tmp_m = mem_path + ".tmp"
-                    with open(tmp_m, "w", encoding="utf-8") as wf:
-                        json.dump(mem, wf, indent=2)
-                    os.replace(tmp_m, mem_path)
+                    _atomic_write_json(mem_path, mem)
             return flagged
         except Exception:
             return set()
@@ -251,7 +257,6 @@ class PaperStrategyTrainerAndTester:
                 wr = float(cdata.get("win_rate_pct", 0.0))
                 trades = int(cdata.get("trades", 0))
                 if pnl > 0.0 and pf >= 1.25 and trades >= 14:
-                    # 2x-Fee & Slippage Stress Gate before auto-adopting Gemini strategies
                     st_dict = cdata.get("stats", {}) or {}
                     raw_rets = st_dict.get("raw_trade_returns") or cdata.get("raw_trade_returns") or []
                     stress_ok = True
@@ -287,59 +292,56 @@ class PaperStrategyTrainerAndTester:
                     changed = True
 
         if changed:
-            tmp_a = self.adopted_strats_path + ".tmp"
-            with open(tmp_a, "w", encoding="utf-8") as wf:
-                json.dump({"updated_at": int(time.time()), "strategies": adopted}, wf, indent=2)
-            os.replace(tmp_a, self.adopted_strats_path)
+            _atomic_write_json(self.adopted_strats_path, {"updated_at": int(time.time()), "strategies": adopted})
 
     def _prune_underperforming_gemini_strategies(self, trained_coins: dict):
         """Auto-removes Gemini strategies failing Paper backtest thresholds or Live performance."""
+        copilot_pruned = False
         try:
             import ai_regime_copilot
-            prune_res = ai_regime_copilot.prune_underperforming_gemini_strategies(
-                paper_dir=self.paper_dir,
-                live_dir=self.live_dir,
-                models_dir=self.models_dir,
-            )
-            if prune_res.get("removed"):
-                print(f"[AGENTIC PRUNE] Auto-removed underperforming Gemini strategies: {prune_res['removed']}")
-                self.dynamic_strategies = self._load_dynamic_strategies()
-            return
+            if hasattr(ai_regime_copilot, "prune_underperforming_gemini_strategies"):
+                prune_res = ai_regime_copilot.prune_underperforming_gemini_strategies(
+                    paper_dir=self.paper_dir,
+                    live_dir=self.live_dir,
+                    models_dir=self.models_dir,
+                )
+                if isinstance(prune_res, dict):
+                    copilot_pruned = True
+                    if prune_res.get("removed"):
+                        print(f"[AGENTIC PRUNE] Auto-removed underperforming Gemini strategies: {prune_res['removed']}")
         except Exception:
-            pass
+            copilot_pruned = False
 
-        for fpath in (self.discovered_strats_path, self.adopted_strats_path):
-            if not os.path.exists(fpath):
-                continue
-            try:
-                with open(fpath, "r", encoding="utf-8-sig") as f:
-                    payload = json.load(f)
-                strats = payload.get("strategies", {}) or {}
-                kept = {}
-                for sid, spec in strats.items():
-                    runs = []
-                    for cdata in trained_coins.values():
-                        if not isinstance(cdata, dict):
-                            continue
-                        if str(cdata.get("strategy_id", "")) == sid:
-                            runs.append(cdata)
-                        for m in (cdata.get("tested_matrix", []) or []):
-                            if isinstance(m, dict) and str(m.get("strategy_id", "")) == sid:
-                                runs.append(m)
-                    if runs:
-                        best_r = max(runs, key=lambda r: (float(r.get("net_pnl_usdt", 0.0)), float(r.get("profit_factor", 0.0))))
-                        if int(best_r.get("trades", 0)) < 14 or float(best_r.get("net_pnl_usdt", 0.0)) <= 0.0 or float(best_r.get("profit_factor", 0.0)) < 1.25:
-                            continue
-                    kept[sid] = spec
-                if len(kept) != len(strats):
-                    payload["strategies"] = kept
-                    payload["updated_at"] = int(time.time())
-                    tmp_f = fpath + ".tmp"
-                    with open(tmp_f, "w", encoding="utf-8") as wf:
-                        json.dump(payload, wf, indent=2)
-                    os.replace(tmp_f, fpath)
-            except Exception:
-                continue
+        if not copilot_pruned:
+            for fpath in (self.discovered_strats_path, self.adopted_strats_path):
+                if not os.path.exists(fpath):
+                    continue
+                try:
+                    with open(fpath, "r", encoding="utf-8-sig") as f:
+                        payload = json.load(f)
+                    strats = payload.get("strategies", {}) or {}
+                    kept = {}
+                    for sid, spec in strats.items():
+                        runs = []
+                        for cdata in trained_coins.values():
+                            if not isinstance(cdata, dict):
+                                continue
+                            if str(cdata.get("strategy_id", "")) == sid:
+                                runs.append(cdata)
+                            for m in (cdata.get("tested_matrix", []) or []):
+                                if isinstance(m, dict) and str(m.get("strategy_id", "")) == sid:
+                                    runs.append(m)
+                        if runs:
+                            best_r = max(runs, key=lambda r: (float(r.get("net_pnl_usdt", 0.0)), float(r.get("profit_factor", 0.0))))
+                            if int(best_r.get("trades", 0)) < 10 or float(best_r.get("net_pnl_usdt", 0.0)) <= 0.0 or float(best_r.get("profit_factor", 0.0)) < 1.20:
+                                continue
+                        kept[sid] = spec
+                    if len(kept) != len(strats):
+                        payload["strategies"] = kept
+                        payload["updated_at"] = int(time.time())
+                        _atomic_write_json(fpath, payload)
+                except Exception:
+                    continue
         self.dynamic_strategies = self._load_dynamic_strategies()
 
     def _prune_old_trained_models(self, keep_latest: int = MAX_KEPT_MODEL_VERSIONS):
@@ -377,8 +379,8 @@ class PaperStrategyTrainerAndTester:
     def _fetch_forex_yahoo_history(self, symbol: str, timeframe: str = "1h") -> pd.DataFrame:
         clean_sym = symbol.replace("/", "").upper()
         tf_key = timeframe.lower()
-        yf_interval = "15m" if tf_key == "15m" else ("30m" if tf_key == "30m" else "1h")
-        yf_range = "60d" if yf_interval in ("15m", "30m") else "6mo"
+        yf_interval = "5m" if tf_key == "5m" else ("15m" if tf_key == "15m" else ("30m" if tf_key == "30m" else "1h"))
+        yf_range = "30d" if yf_interval == "5m" else ("60d" if yf_interval in ("15m", "30m") else "6mo")
 
         for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
             try:
@@ -445,12 +447,13 @@ class PaperStrategyTrainerAndTester:
         tf_key = timeframe.lower()
         interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_key, "60")
         target_bars = (days * BARS_PER_DAY.get(tf_key, 24)) + 210
+        max_pages = max(14, int(np.ceil(target_bars / 950.0)) + 2)
 
         collected = {}
         cursor_end = None
         pages = 0
 
-        while len(collected) < target_bars and pages < 14:
+        while len(collected) < target_bars and pages < max_pages:
             params = {"category": "linear", "symbol": bybit_sym, "interval": interval, "limit": 1000}
             if cursor_end is not None:
                 params["end"] = cursor_end
@@ -652,7 +655,6 @@ class PaperStrategyTrainerAndTester:
             w -= lr * grad_w
             b -= lr * grad_b
 
-        # Keep unseen derivatives positioning slots (5, 6) strictly zero-weighted in historical fit
         w[5] = 0.0
         w[6] = 0.0
 
@@ -852,11 +854,13 @@ class PaperStrategyTrainerAndTester:
         initial_capital: float,
         is_forex: bool = False,
         htf_dir_aligned: np.ndarray = None,
+        htf_adx_aligned: np.ndarray = None,
         relaxed_filter: bool = False,
         extra_quantile_thresholds: list = None,
         extended_param_sweep: bool = False,
     ) -> dict:
-        is_g2_chop = str(strategy_id).lower().startswith("g2_")
+        tf_up = str(timeframe).upper()
+        is_g2_chop = str(strategy_id).lower().startswith("g2_") or (tf_up in ("5M", "15M") and "scalp" in str(strategy_id).lower())
         round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (0.00052 if is_g2_chop else (BYBIT_TAKER_FEE * 2.0))
         dyn_spec = self.dynamic_strategies.get(strategy_id)
 
@@ -905,7 +909,7 @@ class PaperStrategyTrainerAndTester:
         natrs = test_df["NATR"].to_numpy()
         vwaps = test_df["VWAP_Dev"].to_numpy()
         n_bars = len(test_df)
-        mid_oos = max(1, n_bars // 2)  # Splits 40% OOS into 20% Validation + 20% Untouched Holdout
+        mid_oos = max(1, n_bars // 2)
 
         f_long, f_short = self._compute_vectorized_filter_masks(test_df, strategy_id, relaxed=relaxed_filter)
 
@@ -934,7 +938,7 @@ class PaperStrategyTrainerAndTester:
                     "tp2_rr": tp2_rr,
                     "trail_atr": trail_mult,
                     "strategy_id": strategy_id,
-                    "timeframe": timeframe,
+                    "timeframe": tf_up,
                     "mtf_alignment_mode": mtf_mode_label,
                     "relaxed_filter": relaxed_filter,
                 }
@@ -946,7 +950,12 @@ class PaperStrategyTrainerAndTester:
                 le_arr[1:] = (p_long[:-1] >= thresh) & f_long[1:]
                 se_arr[1:] = (p_short[:-1] >= thresh) & f_short[1:]
 
-                if mtf_mode_label != "OFF" and htf_dir_aligned is not None:
+                if is_g2_chop and htf_adx_aligned is not None:
+                    # Block Gear 2 chop fades during runaway 4H trend breakouts (ADX >= 25.0)
+                    chop_4h_ok = htf_adx_aligned < 25.0
+                    le_arr = le_arr & chop_4h_ok
+                    se_arr = se_arr & chop_4h_ok
+                elif mtf_mode_label != "OFF" and htf_dir_aligned is not None:
                     conv_boost = 0.05 if mtf_mode_label == "SOFT" else 0.08
                     vol_req = 1.10 if mtf_mode_label == "SOFT" else 1.25
                     hc_l = np.zeros(n_bars, dtype=bool)
@@ -1000,7 +1009,8 @@ class PaperStrategyTrainerAndTester:
                                 0.0,
                                 0.0,
                             ]
-                            min_sl_floor = entry * (0.0020 if is_forex else 0.0155)
+                            sl_floor_pct = 0.0020 if is_forex else (0.0038 if is_g2_chop else 0.0155)
+                            min_sl_floor = entry * sl_floor_pct
                             risk = max(sl_atr * atr, min_sl_floor)
                             if side_long:
                                 sl = entry - risk
@@ -1069,15 +1079,11 @@ class PaperStrategyTrainerAndTester:
                 net_usdt = round(float(equity - initial_capital), 2)
                 net_pct = round((net_usdt / initial_capital) * 100.0, 2)
 
-                # 3-Way Nested Temporal Holdout Verification (20% Validation + 20% Untouched Holdout)
                 val_sum = float(sum(val_pnls)) if val_pnls else net_usdt
                 holdout_sum = float(sum(holdout_pnls)) if holdout_pnls else net_usdt
                 wf_both_positive = (total_trades >= 14 and val_sum > 0.0 and holdout_sum > 0.0)
                 walk_forward_mult = 1.22 if wf_both_positive else 0.72
 
-                # Dual-Tier Scoring:
-                # Tier A: High-Frequency Edge (85-175 trades, PF >= 1.50, WR >= 50%)
-                # Tier B: High-Precision Sniper Edge (18-84 trades, PF >= 2.15, WR >= 55%)
                 sniper_floor = 12 if is_forex else 18
                 freq_floor = 45 if is_forex else 85
 
@@ -1127,6 +1133,8 @@ class PaperStrategyTrainerAndTester:
         if strategy_id in self.dynamic_strategies:
             return strategy_id
         sid = strategy_id.lower()
+        if sid.startswith("g2_"):
+            return sid
         if "trendline" in sid:
             return "trendline"
         if "donchian" in sid:
@@ -1158,8 +1166,7 @@ class PaperStrategyTrainerAndTester:
             logs = st.setdefault("last_bot_logs", [])
             logs.extend(lines)
             st["last_bot_logs"] = logs[-80:]
-            with open(state_file, "w", encoding="utf-8") as wf:
-                json.dump(st, wf, indent=2)
+            _atomic_write_json(state_file, st)
         except Exception:
             pass
 
@@ -1288,8 +1295,7 @@ class PaperStrategyTrainerAndTester:
             "held_coins": held_coins,
             "coins": analysis_items,
         }
-        with open(self.analysis_report_path, "w", encoding="utf-8") as rf:
-            json.dump(report, rf, indent=2)
+        _atomic_write_json(self.analysis_report_path, report)
 
         self._append_bot_log_to_state(os.path.join(self.paper_dir, "paper_engine_state.json"), log_entries)
         self._append_bot_log_to_state(os.path.join(self.live_dir, "live_engine_state.json"), log_entries)
@@ -1309,7 +1315,7 @@ class PaperStrategyTrainerAndTester:
         leverage = min(max(int(leverage), 1), MAX_LEVERAGE)
         test_tfs = [tf.lower() for tf in (timeframes or DEFAULT_TEST_TIMEFRAMES) if tf.lower() in TIMEFRAME_TO_BYBIT_INTERVAL]
         if not test_tfs:
-            test_tfs = ["1h", "4h"]
+            test_tfs = ["5m", "15m", "1h", "4h"]
 
         diverse_defaults = [
             "g2_range_box_rejection",
@@ -1371,11 +1377,13 @@ class PaperStrategyTrainerAndTester:
             freq_floor = 45 if is_fx else 85
 
             htf_trend = None
+            htf_adx = None
             raw_4h = self.fetch_bybit_history(symbol, timeframe="4h", days=TRAINING_WINDOW_DAYS)
             if len(raw_4h) >= 210:
                 df_4h = self.build_matrix(raw_4h, max_dd=dd_atr, expansion=exp_atr, horizon=hor_bars)
                 if not df_4h.empty:
                     htf_trend = df_4h["Supertrend"]
+                    htf_adx = df_4h["ADX"]
                 del df_4h
 
             best_candidate = None
@@ -1391,7 +1399,6 @@ class PaperStrategyTrainerAndTester:
                 if len(df) < 180:
                     continue
 
-                # 60% Train / 40% Out-of-Sample (20% Validation + 20% Untouched Holdout)
                 split = int(len(df) * 0.60)
                 train_end = max(120, split - hor_bars)
                 train_df = df.iloc[:train_end]
@@ -1408,13 +1415,20 @@ class PaperStrategyTrainerAndTester:
                 p_short = clf_short.predict_proba(X_test)[:, 1]
 
                 htf_dir_aligned = None
+                htf_adx_aligned = None
                 if tf != "4h" and htf_trend is not None and not htf_trend.empty:
                     aligned_series = htf_trend.reindex(test_df.index, method="ffill").fillna(0)
                     htf_dir_aligned = aligned_series.to_numpy(dtype=np.int8)
+                if tf != "4h" and htf_adx is not None and not htf_adx.empty:
+                    htf_adx_aligned = htf_adx.reindex(test_df.index, method="ffill").fillna(20.0).to_numpy(dtype=np.float32)
 
-                cached_tf_bundles.append((tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds, htf_dir_aligned))
+                cached_tf_bundles.append((tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds, htf_dir_aligned, htf_adx_aligned))
 
                 for strat_id in strategies_to_test:
+                    is_g2 = str(strat_id).lower().startswith("g2_")
+                    if is_g2 and tf not in ("5m", "15m"):
+                        continue
+
                     eval_res = self._simulate_strategy_on_tf(
                         test_df=test_df,
                         p_long=p_long,
@@ -1425,6 +1439,7 @@ class PaperStrategyTrainerAndTester:
                         initial_capital=initial_capital,
                         is_forex=is_fx,
                         htf_dir_aligned=htf_dir_aligned,
+                        htf_adx_aligned=htf_adx_aligned,
                     )
                     st = eval_res["stats"]
                     best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "STRICT")
@@ -1474,7 +1489,7 @@ class PaperStrategyTrainerAndTester:
             )
 
             if (not passes_either_tier) and cached_tf_bundles:
-                for tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds, htf_dir_aligned in cached_tf_bundles:
+                for tf, raw, test_df, clf_long, clf_short, p_long, p_short, f_means, f_stds, htf_dir_aligned, htf_adx_aligned in cached_tf_bundles:
                     q_thresholds = sorted(set([
                         float(np.quantile(np.maximum(p_long, p_short), 0.65)),
                         float(np.quantile(np.maximum(p_long, p_short), 0.75)),
@@ -1490,6 +1505,7 @@ class PaperStrategyTrainerAndTester:
                         initial_capital=initial_capital,
                         is_forex=is_fx,
                         htf_dir_aligned=htf_dir_aligned,
+                        htf_adx_aligned=htf_adx_aligned,
                         relaxed_filter=True,
                         extra_quantile_thresholds=q_thresholds,
                         extended_param_sweep=True,
@@ -1523,7 +1539,7 @@ class PaperStrategyTrainerAndTester:
                         }
 
             if (cur_trades < sniper_floor or cur_pnl <= 0.0) and cached_tf_bundles:
-                for tf, raw, _, _, _, _, _, _, _, htf_dir_aligned in [b for b in cached_tf_bundles if b[0] in ("30m", "1h", "4h")]:
+                for tf, raw, _, _, _, _, _, _, _, htf_dir_aligned, htf_adx_aligned in [b for b in cached_tf_bundles if b[0] in ("30m", "1h", "4h")]:
                     df_sens = self.build_matrix(raw, max_dd=1.15, expansion=0.75, horizon=14)
                     if len(df_sens) < 180:
                         continue
@@ -1610,7 +1626,6 @@ class PaperStrategyTrainerAndTester:
                 "models": best_candidate["models"],
             }
 
-            # Champion vs Challenger: always refresh if flagged for live feature drift
             is_drifted = symbol.replace("/", "").upper() in drifted_compact
             prev_champ = existing_paper_portfolio.get(symbol)
             if (not is_drifted) and isinstance(prev_champ, dict) and isinstance(prev_champ.get("models"), dict):
@@ -1648,8 +1663,12 @@ class PaperStrategyTrainerAndTester:
 
         self._adopt_winning_dynamic_strategies(trained_coins, leverage=leverage)
 
-        with open(self.paper_results_path, "w", encoding="utf-8") as f:
-            json.dump({"leverage": leverage, "training_days": TRAINING_WINDOW_DAYS, "timeframes_tested": test_tfs, "coins": trained_coins}, f, indent=2)
+        _atomic_write_json(self.paper_results_path, {
+            "leverage": leverage,
+            "training_days": TRAINING_WINDOW_DAYS,
+            "timeframes_tested": test_tfs,
+            "coins": trained_coins,
+        })
 
         self._prune_underperforming_gemini_strategies(trained_coins)
 
@@ -1664,12 +1683,10 @@ class PaperStrategyTrainerAndTester:
             "features": FEATURES,
             "portfolio": paper_portfolio,
         }
-        with open(self.paper_master_path, "w", encoding="utf-8") as f:
-            json.dump(paper_master, f, indent=2)
+        _atomic_write_json(self.paper_master_path, paper_master)
 
         hist_snapshot = os.path.join(self.paper_history_dir, f"UNIFIED_PAPER_{now_ts}.json")
-        with open(hist_snapshot, "w", encoding="utf-8") as hf:
-            json.dump(paper_master, hf, indent=2)
+        _atomic_write_json(hist_snapshot, paper_master)
         self._prune_old_trained_models(keep_latest=MAX_KEPT_MODEL_VERSIONS)
 
         self.auto_compare_with_live(trained_coins)
@@ -1724,8 +1741,7 @@ class PaperStrategyTrainerAndTester:
                 "is_paper_better": is_better,
             })
 
-        with open(self.comparison_path, "w", encoding="utf-8") as f:
-            json.dump({"generated_at": int(time.time()), "comparisons": comparisons}, f, indent=2)
+        _atomic_write_json(self.comparison_path, {"generated_at": int(time.time()), "comparisons": comparisons})
         return comparisons
 
     def _save_live_master(self, live_master: dict):
@@ -1739,10 +1755,8 @@ class PaperStrategyTrainerAndTester:
         live_master["total_net_pnl"] = round(sum(all_pnls), 2)
         live_master["exported_at"] = int(time.time())
 
-        with open(self.live_master_path, "w", encoding="utf-8") as f:
-            json.dump(live_master, f, indent=2)
-        with open(self.legacy_master_path, "w", encoding="utf-8") as f:
-            json.dump(live_master, f, indent=2)
+        _atomic_write_json(self.live_master_path, live_master)
+        _atomic_write_json(self.legacy_master_path, live_master)
 
     def move_coin_to_live_model(self, symbol: str) -> bool:
         if not os.path.exists(self.paper_results_path):
@@ -1818,8 +1832,7 @@ class PaperStrategyTrainerAndTester:
                     master["version"] = f"UNIFIED_PAPER_{len(portfolio)}C_135D"
                     master["model_accuracy_pct"] = round(sum(wrs) / len(wrs), 2) if wrs else 0.0
                     master["total_net_pnl"] = round(sum(pnls), 2)
-                    with open(self.paper_master_path, "w", encoding="utf-8") as wf:
-                        json.dump(master, wf, indent=2)
+                    _atomic_write_json(self.paper_master_path, master)
             except Exception:
                 pass
 
@@ -1832,8 +1845,7 @@ class PaperStrategyTrainerAndTester:
                     coins_map.pop(norm_sym, None)
                     coins_map.pop(norm_sym.replace("/", ""), None)
                     removed_any = True
-                    with open(self.paper_results_path, "w", encoding="utf-8") as wf:
-                        json.dump(res_data, wf, indent=2)
+                    _atomic_write_json(self.paper_results_path, res_data)
             except Exception:
                 pass
 
@@ -1847,8 +1859,7 @@ class PaperStrategyTrainerAndTester:
                 if len(new_coins) != len(coins_list):
                     cfg["coins"] = new_coins
                     removed_any = True
-                    with open(config_file, "w", encoding="utf-8") as wf:
-                        json.dump(cfg, wf, indent=2)
+                    _atomic_write_json(config_file, cfg)
             except Exception:
                 pass
 
