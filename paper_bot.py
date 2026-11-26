@@ -456,7 +456,7 @@ class PaperStrategyTrainerAndTester:
                 params["end"] = cursor_end
 
             rows = []
-            for base in ("https://api.bytick.com", "https://api.bybit.com", "https://api-demo.bybit.com"):
+            for base in ("https://api.bybit.com", "https://api.bytick.com", "https://api-demo.bybit.com"):
                 try:
                     resp = self._public_get(f"{base}/v5/market/kline", params)
                     rows = resp.get("result", {}).get("list", [])

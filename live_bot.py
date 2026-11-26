@@ -173,9 +173,9 @@ class LiveAccountTradingBot:
 
         self.is_demo = str(endpoint).lower() in ("testnet", "demo")
         self.host_candidates = (
-            ["https://api-demo.bybit.com", "https://api.bytick.com"]
+            ["https://api-demo.bybit.com", "https://api.bybit.com"]
             if self.is_demo
-            else ["https://api.bytick.com", "https://api.bybit.com"]
+            else ["https://api.bybit.com", "https://api.bytick.com"]
         )
         self.base_url = self.host_candidates[0]
         self.category = "linear"
@@ -192,6 +192,17 @@ class LiveAccountTradingBot:
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12)
         self.session.mount("https://", adapter)
+
+    def _reset_http_session(self):
+        old_s = getattr(self, "session", None)
+        s = requests.Session()
+        s.mount("https://", requests.adapters.HTTPAdapter(pool_connections=12, pool_maxsize=12))
+        self.session = s
+        try:
+            if old_s is not None:
+                old_s.close()
+        except Exception:
+            pass
 
     def _load_state(self) -> dict:
         if os.path.exists(self.state_path):
@@ -505,49 +516,53 @@ class LiveAccountTradingBot:
 
         self._sync_bybit_server_time(force=False)
         last_err = None
-        for base in self.host_candidates:
-            ts = str(int(time.time() * 1000) + self._server_time_offset_ms)
-            recv_window = "5000"
-            try:
-                if method == "GET":
-                    qs = urllib.parse.urlencode(params or {})
-                    sig = self._sign(ts, recv_window, qs)
-                    url = f"{base}{path}?{qs}" if qs else f"{base}{path}"
-                    headers = {
-                        "X-BAPI-API-KEY": self.api_key,
-                        "X-BAPI-SIGN": sig,
-                        "X-BAPI-TIMESTAMP": ts,
-                        "X-BAPI-RECV-WINDOW": recv_window,
-                    }
-                    resp = self.session.get(url, headers=headers, timeout=5.0)
-                    self._update_rate_limits(resp)
-                    if resp.status_code == 200:
-                        j_out = resp.json()
-                        if _safe_int(j_out.get("retCode"), 0) == 10002:
-                            self._sync_bybit_server_time(force=True)
-                            continue
-                        return j_out
-                else:
-                    raw_body = json.dumps(body or {})
-                    sig = self._sign(ts, recv_window, raw_body)
-                    headers = {
-                        "X-BAPI-API-KEY": self.api_key,
-                        "X-BAPI-SIGN": sig,
-                        "X-BAPI-TIMESTAMP": ts,
-                        "X-BAPI-RECV-WINDOW": recv_window,
-                        "Content-Type": "application/json",
-                    }
-                    resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=5.0)
-                    self._update_rate_limits(resp)
-                    if resp.status_code == 200:
-                        j_out = resp.json()
-                        if _safe_int(j_out.get("retCode"), 0) == 10002:
-                            self._sync_bybit_server_time(force=True)
-                            continue
-                        return j_out
-            except Exception as e:
-                last_err = e
-                continue
+        for attempt in range(2):
+            if attempt == 1:
+                self._reset_http_session()
+                time.sleep(0.75)
+            for base in self.host_candidates:
+                ts = str(int(time.time() * 1000) + self._server_time_offset_ms)
+                recv_window = "5000"
+                try:
+                    if method == "GET":
+                        qs = urllib.parse.urlencode(params or {})
+                        sig = self._sign(ts, recv_window, qs)
+                        url = f"{base}{path}?{qs}" if qs else f"{base}{path}"
+                        headers = {
+                            "X-BAPI-API-KEY": self.api_key,
+                            "X-BAPI-SIGN": sig,
+                            "X-BAPI-TIMESTAMP": ts,
+                            "X-BAPI-RECV-WINDOW": recv_window,
+                        }
+                        resp = self.session.get(url, headers=headers, timeout=5.0)
+                        self._update_rate_limits(resp)
+                        if resp.status_code == 200:
+                            j_out = resp.json()
+                            if _safe_int(j_out.get("retCode"), 0) == 10002:
+                                self._sync_bybit_server_time(force=True)
+                                continue
+                            return j_out
+                    else:
+                        raw_body = json.dumps(body or {})
+                        sig = self._sign(ts, recv_window, raw_body)
+                        headers = {
+                            "X-BAPI-API-KEY": self.api_key,
+                            "X-BAPI-SIGN": sig,
+                            "X-BAPI-TIMESTAMP": ts,
+                            "X-BAPI-RECV-WINDOW": recv_window,
+                            "Content-Type": "application/json",
+                        }
+                        resp = self.session.post(f"{base}{path}", headers=headers, data=raw_body, timeout=5.0)
+                        self._update_rate_limits(resp)
+                        if resp.status_code == 200:
+                            j_out = resp.json()
+                            if _safe_int(j_out.get("retCode"), 0) == 10002:
+                                self._sync_bybit_server_time(force=True)
+                                continue
+                            return j_out
+                except Exception as e:
+                    last_err = e
+                    continue
         if last_err:
             raise last_err
         return {}
