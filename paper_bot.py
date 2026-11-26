@@ -1,4 +1,4 @@
-﻿import os
+import os
 import gc
 import sys
 import json
@@ -17,6 +17,7 @@ MAX_LEVERAGE = 20
 DEFAULT_LEVERAGE = 10
 
 TIMEFRAME_TO_BYBIT_INTERVAL = {
+    "5m": "5",
     "15m": "15",
     "30m": "30",
     "1h": "60",
@@ -24,6 +25,7 @@ TIMEFRAME_TO_BYBIT_INTERVAL = {
 }
 
 BARS_PER_DAY = {
+    "5m": 288,
     "15m": 96,
     "30m": 48,
     "1h": 24,
@@ -39,7 +41,7 @@ FOREX_LINEAR_SYMBOLS = {
     "XAUTUSDT",
 }
 
-DEFAULT_TEST_TIMEFRAMES = ["15m", "30m", "1h", "4h"]
+DEFAULT_TEST_TIMEFRAMES = ["5m", "15m", "30m", "1h", "4h"]
 TRAINING_WINDOW_DAYS = 135   # 4.5 months (~135 days) full multi-regime coverage
 MAX_KEPT_MODEL_VERSIONS = 2  # Retain only latest 2 trained ML models on disk
 
@@ -84,6 +86,9 @@ STRATEGY_CATALOG_META = {
     "connors_rsi2_trend_pullback": {"name": "RSI-2 Trend Pullback & EMA200 Filter", "timeframes": ["1h"]},
     "keltner_ttm_squeeze_pro": {"name": "TTM Bollinger-Keltner Volatility Squeeze", "timeframes": ["1h"]},
     "cvd_orderflow_absorption": {"name": "CVD Orderflow & Volume Surge Absorption", "timeframes": ["15m"]},
+    "g2_range_box_rejection": {"name": "Range Box Boundary Rejection (5m/15m Chop)", "timeframes": ["5m", "15m"]},
+    "g2_keltner_snapback": {"name": "Keltner Channel Mean Reversion (5m/15m Chop)", "timeframes": ["5m", "15m"]},
+    "g2_bb_rsi_exhaustion": {"name": "BB Extreme + RSI Exhaustion Fade (5m/15m Chop)", "timeframes": ["5m", "15m"]},
 }
 
 
@@ -727,6 +732,42 @@ class PaperStrategyTrainerAndTester:
         p_d200 = test_df["Dist_EMA200"].to_numpy()[:-1]
         p_vwap = test_df["VWAP_Dev"].to_numpy()[:-1]
 
+        if "g2_range_box" in sid:
+            p_c = test_df["Close"].to_numpy(dtype=float)[:-1]
+            p_o = test_df["Open"].to_numpy(dtype=float)[:-1]
+            p_h = test_df["High"].to_numpy(dtype=float)[:-1]
+            p_l = test_df["Low"].to_numpy(dtype=float)[:-1]
+            p_atr = test_df["ATR"].to_numpy(dtype=float)[:-1]
+            rng_h28 = test_df["High"].rolling(28).max().to_numpy(dtype=float)[:-1]
+            rng_l28 = test_df["Low"].rolling(28).min().to_numpy(dtype=float)[:-1]
+            p_rng = np.maximum(p_h - p_l, 1e-9)
+            l_wick = (np.minimum(p_o, p_c) - p_l) / p_rng
+            u_wick = (p_h - np.maximum(p_o, p_c)) / p_rng
+            box_span = np.maximum(rng_h28 - rng_l28, 1e-9)
+            box_pos = (p_c - rng_l28) / box_span
+            valid_box = (~np.isnan(rng_h28)) & ((rng_h28 - rng_l28) > (2.2 * p_atr)) & (p_adx < 20.5)
+            long_ok[1:] = valid_box & (box_pos <= 0.15) & (l_wick >= 0.36) & (p_c > p_o)
+            short_ok[1:] = valid_box & (box_pos >= 0.85) & (u_wick >= 0.36) & (p_c < p_o)
+            return long_ok, short_ok
+
+        if "g2_keltner" in sid:
+            p_c = test_df["Close"].to_numpy(dtype=float)[:-1]
+            p_o = test_df["Open"].to_numpy(dtype=float)[:-1]
+            p_h = test_df["High"].to_numpy(dtype=float)[:-1]
+            p_l = test_df["Low"].to_numpy(dtype=float)[:-1]
+            p_d20 = test_df["Dist_EMA20"].to_numpy(dtype=float)[:-1]
+            p_body = np.abs(p_c - p_o) / np.maximum(p_h - p_l, 1e-9)
+            long_ok[1:] = (p_adx < 24.0) & (p_d20 <= -1.70) & (p_c > p_o) & (p_body >= 0.35)
+            short_ok[1:] = (p_adx < 24.0) & (p_d20 >= 1.70) & (p_c < p_o) & (p_body >= 0.35)
+            return long_ok, short_ok
+
+        if "g2_bb_rsi" in sid:
+            p_c = test_df["Close"].to_numpy(dtype=float)[:-1]
+            p_o = test_df["Open"].to_numpy(dtype=float)[:-1]
+            long_ok[1:] = (p_adx < 24.0) & (p_bbp <= 0.08) & (p_rsi <= 34.0) & (p_c > p_o)
+            short_ok[1:] = (p_adx < 24.0) & (p_bbp >= 0.92) & (p_rsi >= 66.0) & (p_c < p_o)
+            return long_ok, short_ok
+
         if "trendline" in sid:
             highs_all = test_df["High"].to_numpy(dtype=float)
             lows_all = test_df["Low"].to_numpy(dtype=float)
@@ -815,7 +856,8 @@ class PaperStrategyTrainerAndTester:
         extra_quantile_thresholds: list = None,
         extended_param_sweep: bool = False,
     ) -> dict:
-        round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (BYBIT_TAKER_FEE * 2.0)
+        is_g2_chop = str(strategy_id).lower().startswith("g2_")
+        round_trip_fee = (FOREX_HALF_SPREAD * 2.0) if is_forex else (0.00052 if is_g2_chop else (BYBIT_TAKER_FEE * 2.0))
         dyn_spec = self.dynamic_strategies.get(strategy_id)
 
         param_configs = [
@@ -870,7 +912,13 @@ class PaperStrategyTrainerAndTester:
         best_eval = None
         best_score = -9999999.0
 
-        mtf_modes_to_test = ["OFF", "SOFT", "STRICT"] if htf_dir_aligned is not None else ["OFF"]
+        if is_g2_chop:
+            param_configs = [
+                (0.20, 1.65, 0.92, False, 1.4),
+                (0.24, 1.65, 1.00, False, 1.5),
+                (0.28, 1.65, 1.10, False, 1.6),
+            ]
+        mtf_modes_to_test = ["OFF"] if is_g2_chop else (["OFF", "SOFT", "STRICT"] if htf_dir_aligned is not None else ["OFF"])
 
         for thresh, sl_atr, tp1_rr, require_htf, trail_mult in param_configs:
             for mtf_mode_label in mtf_modes_to_test:
@@ -1264,6 +1312,9 @@ class PaperStrategyTrainerAndTester:
             test_tfs = ["1h", "4h"]
 
         diverse_defaults = [
+            "g2_range_box_rejection",
+            "g2_keltner_snapback",
+            "g2_bb_rsi_exhaustion",
             "xgb_mtf_v2",
             "trendline_retest_pro",
             "xrp_donchian_breakout",

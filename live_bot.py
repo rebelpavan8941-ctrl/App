@@ -1,4 +1,4 @@
-﻿import os
+import os
 import gc
 import sys
 import json
@@ -17,6 +17,7 @@ import xgboost as xgb
 IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 TIMEFRAME_TO_BYBIT_INTERVAL = {
+    "5m": "5",
     "15m": "15",
     "30m": "30",
     "1h": "60",
@@ -569,6 +570,46 @@ class LiveAccountTradingBot:
                 return max(0.0, wb - im), (total_eq if total_eq > 0.0 else eq)
         return total_eq, total_eq
 
+    def _get_top_of_book(self, bybit_symbol: str) -> tuple:
+        """Returns (best_bid, best_ask) from Bybit v5 linear orderbook."""
+        try:
+            data = self._public_get(
+                "/v5/market/orderbook",
+                {"category": self.category, "symbol": bybit_symbol, "limit": 1},
+                timeout=2.5,
+            )
+            res = data.get("result", {}) or {}
+            bids = res.get("b", []) or []
+            asks = res.get("a", []) or []
+            bid = _safe_float(bids[0][0], 0.0) if bids else 0.0
+            ask = _safe_float(asks[0][0], 0.0) if asks else 0.0
+            return bid, ask
+        except Exception:
+            return 0.0, 0.0
+
+    def _cancel_stale_entry_orders(self, bybit_symbol: str, max_age_ms: int = 600000):
+        """Cancels resting unfilled Limit entry orders older than max_age_ms (default 10m)."""
+        try:
+            res = self._bybit_request(
+                "GET",
+                "/v5/order/realtime",
+                params={"category": self.category, "symbol": bybit_symbol, "openOnly": 0, "limit": 10},
+            )
+            now_ms = int(time.time() * 1000)
+            for ord_item in (res.get("result", {}) or {}).get("list", []) or []:
+                if ord_item.get("reduceOnly"):
+                    continue
+                created_ms = _safe_int(ord_item.get("createdTime"), now_ms)
+                oid = ord_item.get("orderId")
+                if oid and (now_ms - created_ms) >= max_age_ms:
+                    self._bybit_request(
+                        "POST",
+                        "/v5/order/cancel",
+                        body={"category": self.category, "symbol": bybit_symbol, "orderId": oid},
+                    )
+        except Exception:
+            pass
+
     def _get_instrument_filters(self, bybit_symbol: str):
         if bybit_symbol in self._instrument_cache:
             return self._instrument_cache[bybit_symbol]
@@ -981,6 +1022,48 @@ class LiveAccountTradingBot:
         sid = strategy_id.lower()
         if relaxed or "adaptive_quantile" in sid or "high_sensitivity" in sid:
             return bool((closed_bar["Dist_EMA50"] > -1.5) if side == "LONG" else (closed_bar["Dist_EMA50"] < 1.5))
+
+        if "g2_range_box" in sid:
+            adx_v = _safe_float(closed_bar.get("ADX"), 25.0)
+            atr_v = max(_safe_float(closed_bar.get("ATR"), 0.0), 1e-9)
+            rh28 = _safe_float(closed_bar.get("RangeHigh28"), 0.0)
+            rl28 = _safe_float(closed_bar.get("RangeLow28"), 0.0)
+            c_v = _safe_float(closed_bar.get("Close"), 0.0)
+            o_v = _safe_float(closed_bar.get("Open"), 0.0)
+            h_v = _safe_float(closed_bar.get("High"), 0.0)
+            l_v = _safe_float(closed_bar.get("Low"), 0.0)
+            rng_v = max(h_v - l_v, 1e-9)
+            if rh28 <= rl28 or (rh28 - rl28) <= (2.2 * atr_v) or adx_v >= 20.5:
+                return False
+            box_pos = (c_v - rl28) / max(rh28 - rl28, 1e-9)
+            if side == "LONG":
+                l_wick = (min(o_v, c_v) - l_v) / rng_v
+                return bool(box_pos <= 0.15 and l_wick >= 0.36 and c_v > o_v)
+            else:
+                u_wick = (h_v - max(o_v, c_v)) / rng_v
+                return bool(box_pos >= 0.85 and u_wick >= 0.36 and c_v < o_v)
+
+        if "g2_keltner" in sid:
+            adx_v = _safe_float(closed_bar.get("ADX"), 25.0)
+            d20_v = _safe_float(closed_bar.get("Dist_EMA20"), 0.0)
+            c_v = _safe_float(closed_bar.get("Close"), 0.0)
+            o_v = _safe_float(closed_bar.get("Open"), 0.0)
+            h_v = _safe_float(closed_bar.get("High"), 0.0)
+            l_v = _safe_float(closed_bar.get("Low"), 0.0)
+            body_v = abs(c_v - o_v) / max(h_v - l_v, 1e-9)
+            if adx_v >= 24.0 or body_v < 0.35:
+                return False
+            return bool((d20_v <= -1.70 and c_v > o_v) if side == "LONG" else (d20_v >= 1.70 and c_v < o_v))
+
+        if "g2_bb_rsi" in sid:
+            adx_v = _safe_float(closed_bar.get("ADX"), 25.0)
+            bbp_v = _safe_float(closed_bar.get("BB_PctB"), 0.5)
+            rsi_v = _safe_float(closed_bar.get("RSI_14"), 50.0)
+            c_v = _safe_float(closed_bar.get("Close"), 0.0)
+            o_v = _safe_float(closed_bar.get("Open"), 0.0)
+            if adx_v >= 24.0:
+                return False
+            return bool((bbp_v <= 0.08 and rsi_v <= 34.0 and c_v > o_v) if side == "LONG" else (bbp_v >= 0.92 and rsi_v >= 66.0 and c_v < o_v))
 
         if "donchian" in sid:
             if side == "LONG":
@@ -1550,8 +1633,14 @@ class LiveAccountTradingBot:
             )
             funding_blocked = (direction == "LONG" and fr_val > 0.0004) or (direction == "SHORT" and fr_val < -0.0004) or crowded_oi_top
 
+            is_chop_gear = str(strat_id).lower().startswith("g2_") or (interval in ("5", "15") and adx_val < 23.0)
+            if is_chop_gear and "RangeHigh28" not in closed_bar.index and len(df_feat) >= 30:
+                closed_bar = closed_bar.copy()
+                closed_bar["RangeHigh28"] = float(df_feat["High"].iloc[-30:-2].max())
+                closed_bar["RangeLow28"] = float(df_feat["Low"].iloc[-30:-2].min())
+
             effective_mtf = str(cfg.get("mtf_alignment_mode") or entry.get("mtf_alignment_mode") or mtf_mode).upper()
-            if effective_mtf == "OFF":
+            if is_chop_gear or effective_mtf == "OFF":
                 mtf_aligned = not guard_blocked
             elif effective_mtf == "SOFT":
                 mtf_aligned = (raw_4h_ok or (raw_prob >= (req_thresh + 0.04) and _safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.10)) and not guard_blocked
@@ -1623,8 +1712,9 @@ class LiveAccountTradingBot:
             clean_pts = 8.0 if (anti_chase_ok and not funding_blocked and meta_ok and not conformal_abstain) else 0.0
             setup_score = int(round(min(97.0, max(12.0, prob_pts + mtf_pts + strat_pts + adx_pts + clean_pts))))
 
-            mtf_or_momentum_ok = raw_4h_ok or (raw_prob >= effective_min_prob + 0.05 and adx_val >= 18.0)
-            grade_ok = (setup_score >= 66) and mtf_or_momentum_ok and (adx_val >= 14.5) and (learned_score >= -10.0)
+            mtf_or_momentum_ok = is_chop_gear or raw_4h_ok or (raw_prob >= effective_min_prob + 0.05 and adx_val >= 18.0)
+            min_adx_req = 8.0 if is_chop_gear else 14.5
+            grade_ok = (setup_score >= 66) and mtf_or_momentum_ok and (adx_val >= min_adx_req) and (learned_score >= -10.0)
 
             all_gates_ready = (
                 (not in_cooldown)
@@ -1711,6 +1801,7 @@ class LiveAccountTradingBot:
                     "adx_val": adx_val,
                     "fr_val": fr_val,
                     "oi_delta_4h": oi_delta_4h,
+                    "is_chop_gear": is_chop_gear,
                     "ls_skew": ls_skew,
                 })
             else:
@@ -1898,10 +1989,15 @@ class LiveAccountTradingBot:
                 _downgrade_radar(disp_sym)
                 continue
 
-            sl_atr = max(_safe_float(cfg.get("sl_atr"), 1.55) * sl_mult, 1.50)
-            tp_rr = min(max(_safe_float(cfg.get("tp1_rr"), 1.65) * tp_mult, 1.50), 1.85)
-
-            min_sl_floor = price * (0.0020 if cand["market_type"] == "FOREX" else 0.0155)
+            is_chop_cand = bool(cand.get("is_chop_gear", False))
+            if is_chop_cand:
+                sl_atr = max(_safe_float(cfg.get("sl_atr"), 1.65), 1.55)
+                tp_rr = min(max(_safe_float(cfg.get("tp1_rr"), 0.95), 0.88), 1.15)
+                min_sl_floor = price * (0.0020 if cand["market_type"] == "FOREX" else 0.0038)
+            else:
+                sl_atr = max(_safe_float(cfg.get("sl_atr"), 1.55) * sl_mult, 1.50)
+                tp_rr = min(max(_safe_float(cfg.get("tp1_rr"), 1.65) * tp_mult, 1.50), 1.85)
+                min_sl_floor = price * (0.0020 if cand["market_type"] == "FOREX" else 0.0155)
             risk_dist = max(sl_atr * atr, min_sl_floor)
 
             sim_equity = avail_usdt if avail_usdt >= 2.0 else 10.0
@@ -1951,6 +2047,7 @@ class LiveAccountTradingBot:
                     session_name=curr_session,
                     gemini_enabled=gem_shadow_on,
                     gemini_api_key=gem_shadow_key,
+                    is_chop_regime=is_chop_cand,
                 )
                 if pa_res.get("shadow_log"):
                     add_bot_log(pa_res["shadow_log"])
@@ -2027,18 +2124,79 @@ class LiveAccountTradingBot:
                 "buyLeverage": str(leverage),
                 "sellLeverage": str(leverage),
             })
-            res = self._bybit_request("POST", "/v5/order/create", body={
-                "category": self.category,
-                "symbol": bybit_sym,
-                "side": "Buy" if is_long else "Sell",
-                "orderType": "Market",
-                "qty": qty_str,
-                "timeInForce": "IOC",
-                "stopLoss": sl_str,
-                "takeProfit": tp_str,
-                "slTriggerBy": "MarkPrice",
-                "positionIdx": 0,
-            })
+            self._cancel_stale_entry_orders(bybit_sym, max_age_ms=600000)
+            if is_chop_cand:
+                best_bid, best_ask = self._get_top_of_book(bybit_sym)
+                raw_maker_px = (best_bid if best_bid > 0 else price) if is_long else (best_ask if best_ask > 0 else price)
+                maker_px_str = self._format_step(raw_maker_px, tick_size)
+                res = self._bybit_request("POST", "/v5/order/create", body={
+                    "category": self.category,
+                    "symbol": bybit_sym,
+                    "side": "Buy" if is_long else "Sell",
+                    "orderType": "Limit",
+                    "price": maker_px_str,
+                    "qty": qty_str,
+                    "timeInForce": "PostOnly",
+                    "tpslMode": "Partial",
+                    "tpOrderType": "Limit",
+                    "tpLimitPrice": tp_str,
+                    "slOrderType": "Market",
+                    "stopLoss": sl_str,
+                    "takeProfit": tp_str,
+                    "tpTriggerBy": "LastPrice",
+                    "slTriggerBy": "MarkPrice",
+                    "positionIdx": 0,
+                })
+                if res.get("retCode") != 0:
+                    res = self._bybit_request("POST", "/v5/order/create", body={
+                        "category": self.category,
+                        "symbol": bybit_sym,
+                        "side": "Buy" if is_long else "Sell",
+                        "orderType": "Limit",
+                        "price": maker_px_str,
+                        "qty": qty_str,
+                        "timeInForce": "GTC",
+                        "tpslMode": "Partial",
+                        "tpOrderType": "Limit",
+                        "tpLimitPrice": tp_str,
+                        "slOrderType": "Market",
+                        "stopLoss": sl_str,
+                        "takeProfit": tp_str,
+                        "tpTriggerBy": "LastPrice",
+                        "slTriggerBy": "MarkPrice",
+                        "positionIdx": 0,
+                    })
+                if res.get("retCode") != 0:
+                    res = self._bybit_request("POST", "/v5/order/create", body={
+                        "category": self.category,
+                        "symbol": bybit_sym,
+                        "side": "Buy" if is_long else "Sell",
+                        "orderType": "Market",
+                        "qty": qty_str,
+                        "timeInForce": "IOC",
+                        "stopLoss": sl_str,
+                        "takeProfit": tp_str,
+                        "slTriggerBy": "MarkPrice",
+                        "positionIdx": 0,
+                    })
+            else:
+                res = self._bybit_request("POST", "/v5/order/create", body={
+                    "category": self.category,
+                    "symbol": bybit_sym,
+                    "side": "Buy" if is_long else "Sell",
+                    "orderType": "Market",
+                    "qty": qty_str,
+                    "timeInForce": "IOC",
+                    "tpslMode": "Partial",
+                    "tpOrderType": "Limit",
+                    "tpLimitPrice": tp_str,
+                    "slOrderType": "Market",
+                    "stopLoss": sl_str,
+                    "takeProfit": tp_str,
+                    "tpTriggerBy": "LastPrice",
+                    "slTriggerBy": "MarkPrice",
+                    "positionIdx": 0,
+                })
             if res.get("retCode") == 0:
                 open_syms.add(bybit_sym)
                 active_pos_records.append({
