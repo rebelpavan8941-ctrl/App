@@ -1,4 +1,4 @@
-﻿import os
+import os
 import gc
 import sys
 import json

@@ -1,4 +1,4 @@
-﻿import os
+import os
 import gc
 import sys
 import json
@@ -167,9 +167,14 @@ class LiveAccountTradingBot:
         self.memory_path = os.path.join(self.live_dir, "ai_copilot_memory.json")
         self.reports_summary_path = os.path.join(self.live_dir, "live_reports_summary.json")
 
+        is_paper_dir = os.path.basename(os.path.normpath(self.live_dir)).upper() == "PAPER"
+        p_paper = os.path.join(models_dir, "PAPER", "UNIFIED_PORTFOLIO_MASTER.json")
         p1 = os.path.join(models_dir, "LIVE", "UNIFIED_PORTFOLIO_MASTER.json")
         p2 = os.path.join(models_dir, "UNIFIED_PORTFOLIO_MASTER.json")
-        self.master_path = p1 if os.path.exists(p1) else p2
+        if is_paper_dir and os.path.exists(p_paper):
+            self.master_path = p_paper
+        else:
+            self.master_path = p1 if os.path.exists(p1) else p2
 
         self.is_demo = str(endpoint).lower() in ("testnet", "demo")
         self.host_candidates = (
@@ -238,8 +243,11 @@ class LiveAccountTradingBot:
         }
 
     def _save_state(self, state: dict):
-        with open(self.state_path, "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(os.path.abspath(self.state_path)), exist_ok=True)
+        tmp_path = f"{self.state_path}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
+        os.replace(tmp_path, self.state_path)
 
     def _write_lightweight_live_summary(self, master: dict):
         try:
@@ -252,7 +260,7 @@ class LiveAccountTradingBot:
                 if isinstance(lite_entry.get("stats"), dict):
                     lite_entry["stats"] = {k: v for k, v in lite_entry["stats"].items() if k != "raw_trade_returns"}
                 lite_port[sym] = lite_entry
-            tmp_s = self.reports_summary_path + ".tmp"
+            tmp_s = f"{self.reports_summary_path}.tmp.{os.getpid()}"
             with open(tmp_s, "w", encoding="utf-8") as wf:
                 json.dump({
                     "version": master.get("version", ""),
@@ -670,7 +678,7 @@ class LiveAccountTradingBot:
         return round(min(max(scale, 0.85), 1.20), 4)
 
     @staticmethod
-    def _passes_anti_chase_guard(closed_bar: pd.Series, live_bar: pd.Series, side: str) -> tuple:
+    def _passes_anti_chase_guard(closed_bar: pd.Series, live_bar: pd.Series, side: str, is_chop_gear: bool = False) -> tuple:
         rsi = _safe_float(closed_bar.get("RSI_14"), 50.0)
         dist_ema20 = _safe_float(closed_bar.get("Dist_EMA20"), 0.0)
         ret_1h = _safe_float(closed_bar.get("Ret_1h"), 0.0)
@@ -679,13 +687,14 @@ class LiveAccountTradingBot:
         closed_px = _safe_float(closed_bar.get("Close"), 0.0)
         live_px = _safe_float(live_bar.get("Close"), closed_px)
         intrabar_move = ((live_px - closed_px) / closed_px) if closed_px > 0 else 0.0
+        max_bar_move = 0.022 if is_chop_gear else 0.012
 
         if side == "SHORT":
             if dist_ema20 < -2.35:
                 return False, f"Stretched below EMA20 ({dist_ema20:.2f} ATR)"
             if rsi < 27.0:
                 return False, f"RSI deeply oversold ({rsi:.1f} < 27)"
-            if ret_1h > 0.012 or intrabar_move > 0.009:
+            if ret_1h > max_bar_move or intrabar_move > 0.009:
                 return False, f"Sharp bounce (+{max(ret_1h, intrabar_move) * 100:.2f}%)"
             if di_spread > 10.0:
                 return False, f"Strong bullish DI (+{di_spread:.1f})"
@@ -694,7 +703,7 @@ class LiveAccountTradingBot:
                 return False, f"Stretched above EMA20 (+{dist_ema20:.2f} ATR)"
             if rsi > 73.0:
                 return False, f"RSI deeply overbought ({rsi:.1f} > 73)"
-            if ret_1h < -0.012 or intrabar_move < -0.009:
+            if ret_1h < -max_bar_move or intrabar_move < -0.009:
                 return False, f"Sharp dump ({min(ret_1h, intrabar_move) * 100:.2f}%)"
             if di_spread < -10.0:
                 return False, f"Strong bearish DI ({di_spread:.1f})"
@@ -721,8 +730,10 @@ class LiveAccountTradingBot:
                     "virtual": bool(is_virtual),
                 })
                 hist_data["trades"] = trades_list[:300]
-                with open(hist_file, "w", encoding="utf-8") as wf:
+                tmp_hf = f"{hist_file}.tmp.{os.getpid()}"
+                with open(tmp_hf, "w", encoding="utf-8") as wf:
                     json.dump(hist_data, wf, indent=2)
+                os.replace(tmp_hf, hist_file)
         except Exception:
             pass
 
@@ -741,13 +752,16 @@ class LiveAccountTradingBot:
             sl = _safe_float(vp.get("sl"), 0.0)
             tp = _safe_float(vp.get("tp"), 0.0)
             opened_ms = _safe_int(vp.get("opened_ms"), now_ms)
+            vp_is_chop = bool(vp.get("is_chop_gear", False))
+            vp_conf_regime = str(vp.get("conformal_regime") or (f"G2_CHOP_{curr_regime}" if vp_is_chop else curr_regime))
             mark = _safe_float(mark_prices.get(sym), _safe_float(vp.get("mark_price"), entry))
             if mark <= 0.0:
                 mark = entry
 
             is_long = side == "LONG"
             gross_pnl = ((mark - entry) if is_long else (entry - mark)) * qty
-            est_fees = (entry * qty + mark * qty) * 0.00055
+            fee_rate = 0.00026 if vp_is_chop else 0.00055
+            est_fees = (entry * qty + mark * qty) * fee_rate
             net_pnl = gross_pnl - est_fees
 
             tp_dist = abs(tp - entry)
@@ -765,7 +779,8 @@ class LiveAccountTradingBot:
             hit_sl = (mark <= sl) if is_long else (mark >= sl)
             hit_tp = (mark >= tp) if is_long else (mark <= tp)
             age_hours = (now_ms - opened_ms) / 3_600_000.0
-            hit_time = (age_hours >= 8.0 and tp_dist > 0.0 and profit_dist >= 0.0 and profit_dist < tp_dist * 0.25)
+            max_stagnant_h = 2.0 if vp_is_chop else 8.0
+            hit_time = (age_hours >= max_stagnant_h and tp_dist > 0.0 and profit_dist >= 0.0 and profit_dist < tp_dist * 0.25)
 
             if hit_sl or hit_tp or hit_time:
                 reason = "TP HIT" if hit_tp else ("TIME-STOP" if hit_time else "SL HIT")
@@ -774,7 +789,8 @@ class LiveAccountTradingBot:
                 if net_pnl < 0.0:
                     loss_cd[sym] = now_ms + (4 * 60 * 60 * 1000)
                 try:
-                    import ai_regime_copilot
+                    import importlib
+                    ai_regime_copilot = importlib.import_module("ai_regime_copilot")
                     ref_res = ai_regime_copilot.record_post_trade_reflection(
                         self.live_dir, sym, side, net_pnl, entry, mark
                     )
@@ -782,7 +798,11 @@ class LiveAccountTradingBot:
                         ai_regime_copilot.update_bayesian_bucket(self.live_dir, sym, curr_session, net_pnl)
                     if hasattr(ai_regime_copilot, "record_conformal_outcome"):
                         ai_regime_copilot.record_conformal_outcome(
-                            self.live_dir, curr_regime, _safe_float(vp.get("raw_prob"), 0.35), bool(net_pnl > 0.0)
+                            self.live_dir, vp_conf_regime, _safe_float(vp.get("raw_prob"), 0.35), bool(net_pnl > 0.0)
+                        )
+                    elif hasattr(ai_regime_copilot, "update_conformal_calibration"):
+                        ai_regime_copilot.update_conformal_calibration(
+                            self.live_dir, vp_conf_regime, _safe_float(vp.get("raw_prob"), 0.35), bool(net_pnl > 0.0)
                         )
                     if hasattr(ai_regime_copilot, "synthesize_failure_playbook"):
                         ai_regime_copilot.synthesize_failure_playbook(self.live_dir, max_items=6)
@@ -822,8 +842,9 @@ class LiveAccountTradingBot:
                 reflected.append(order_id)
                 side_label = "SHORT" if str(row.get("side", "")).lower() == "buy" else "LONG"
                 meta_info = entry_meta_map.pop(sym, {}) or {}
+                conf_reg = str(meta_info.get("conformal_regime") or meta_info.get("regime") or curr_regime)
                 try:
-                    import ai_regime_copilot
+                    ai_regime_copilot = __import__("ai_regime_copilot")
                     ref_res = ai_regime_copilot.record_post_trade_reflection(
                         self.live_dir,
                         sym,
@@ -839,7 +860,14 @@ class LiveAccountTradingBot:
                     if hasattr(ai_regime_copilot, "record_conformal_outcome"):
                         ai_regime_copilot.record_conformal_outcome(
                             self.live_dir,
-                            str(meta_info.get("regime", curr_regime)),
+                            conf_reg,
+                            _safe_float(meta_info.get("raw_prob"), 0.35),
+                            bool(pnl > 0.0),
+                        )
+                    elif hasattr(ai_regime_copilot, "update_conformal_calibration"):
+                        ai_regime_copilot.update_conformal_calibration(
+                            self.live_dir,
+                            conf_reg,
                             _safe_float(meta_info.get("raw_prob"), 0.35),
                             bool(pnl > 0.0),
                         )
@@ -867,8 +895,8 @@ class LiveAccountTradingBot:
             return df.sort_values("timestamp").set_index("timestamp")
 
         if is_forex_symbol(bybit_symbol) and not bybit_symbol.endswith("USDT"):
-            yf_interval = "15m" if interval == "15" else ("30m" if interval == "30" else "1h")
-            yf_range = "15d" if yf_interval in ("15m", "30m") else "60d"
+            yf_interval = "5m" if interval == "5" else ("15m" if interval == "15" else ("30m" if interval == "30" else "1h"))
+            yf_range = "5d" if yf_interval == "5m" else ("15d" if yf_interval in ("15m", "30m") else "60d")
             try:
                 y_resp = self.session.get(
                     f"https://query1.finance.yahoo.com/v8/finance/chart/{bybit_symbol}=X",
@@ -1432,7 +1460,8 @@ class LiveAccountTradingBot:
 
         gate_adjustments = {}
         try:
-            import ai_regime_copilot
+            import importlib
+            ai_regime_copilot = importlib.import_module("ai_regime_copilot")
             if hasattr(ai_regime_copilot, "evaluate_shadow_counterfactuals"):
                 gate_adjustments = ai_regime_copilot.evaluate_shadow_counterfactuals(self.live_dir, mark_prices) or {}
         except Exception:
@@ -1473,7 +1502,7 @@ class LiveAccountTradingBot:
             bybit_sym = (cfg.get("bybit_symbol") or symbol.replace("/", "")).upper()
             tf_str = (cfg.get("timeframe") or entry.get("timeframe") or "1h").lower()
             interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_str, "60")
-            active_items.append((symbol, entry, market_type, cfg, bybit_sym, interval))
+            active_items.append((symbol, entry, market_type, cfg, bybit_sym, tf_str, interval))
             fetch_tasks[(bybit_sym, interval)] = (bybit_sym, interval, 230)
             if interval != "240":
                 cached = self._trend_4h_cache.get(bybit_sym)
@@ -1511,7 +1540,7 @@ class LiveAccountTradingBot:
         coins_scanned_count = 0
         any_conformal_tight = False
 
-        for symbol, entry, market_type, cfg, bybit_sym, interval in active_items:
+        for symbol, entry, market_type, cfg, bybit_sym, tf_str, interval in active_items:
             coins_scanned_count += 1
             disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
             models_map = entry.get("models", {})
@@ -1572,7 +1601,8 @@ class LiveAccountTradingBot:
             latest_bar_ms = int(df.index[-1].timestamp() * 1000)
 
             try:
-                import ai_regime_copilot
+                import importlib
+                ai_regime_copilot = importlib.import_module("ai_regime_copilot")
                 if hasattr(ai_regime_copilot, "check_coin_feature_drift"):
                     ai_regime_copilot.check_coin_feature_drift(
                         self.live_dir,
@@ -1603,13 +1633,20 @@ class LiveAccountTradingBot:
             default_th = 0.24 if market_type == "FOREX" else 0.28
             req_thresh = _safe_float(cfg.get("long_thresh" if direction == "LONG" else "short_thresh"), default_th)
 
+            adx_val = _safe_float(closed_bar.get("ADX"), 0.0)
+            natr_val = _safe_float(closed_bar.get("NATR"), 1.5)
+            vwap_dev = _safe_float(closed_bar.get("VWAP_Dev"), 0.0)
+            is_chop_gear = str(strat_id).lower().startswith("g2_") or (interval in ("5", "15") and adx_val < 23.0)
+
             is_quarantined = (
                 now_ms < _safe_int(restricted_until_ms.get(bybit_sym), 0)
                 or now_ms < _safe_int(quarantine_mem.get(bybit_sym), 0)
             )
+            raw_cd_until = _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
+            eff_cd_until = max(0, raw_cd_until - (195 * 60 * 1000)) if is_chop_gear else raw_cd_until
             in_cooldown = (
                 is_quarantined
-                or now_ms < _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
+                or now_ms < eff_cd_until
                 or now_ms < _safe_int(agentic_veto_until_ms.get(bybit_sym), 0)
                 or bybit_sym in open_syms
             )
@@ -1623,13 +1660,12 @@ class LiveAccountTradingBot:
 
             if interval == "240":
                 trend_4h = int(closed_bar["Supertrend"])
+                adx_4h = adx_val
             else:
                 cached_4h = self._trend_4h_cache.get(bybit_sym)
                 trend_4h = cached_4h[1] if cached_4h else 0
+                adx_4h = cached_4h[2] if cached_4h else 20.0
 
-            adx_val = _safe_float(closed_bar.get("ADX"), 0.0)
-            natr_val = _safe_float(closed_bar.get("NATR"), 1.5)
-            vwap_dev = _safe_float(closed_bar.get("VWAP_Dev"), 0.0)
             raw_4h_ok = (direction == "LONG" and trend_4h == 1) or (direction == "SHORT" and trend_4h == -1)
             high_conv_rev = (raw_prob >= req_thresh + 0.06) and (_safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.15)
 
@@ -1648,21 +1684,23 @@ class LiveAccountTradingBot:
             )
             funding_blocked = (direction == "LONG" and fr_val > 0.0004) or (direction == "SHORT" and fr_val < -0.0004) or crowded_oi_top
 
-            is_chop_gear = str(strat_id).lower().startswith("g2_") or (interval in ("5", "15") and adx_val < 23.0)
-            if is_chop_gear and "RangeHigh28" not in closed_bar.index and len(df_feat) >= 30:
+            if is_chop_gear and "RangeHigh28" not in closed_bar.index and len(df) >= 30:
                 closed_bar = closed_bar.copy()
-                closed_bar["RangeHigh28"] = float(df_feat["High"].iloc[-30:-2].max())
-                closed_bar["RangeLow28"] = float(df_feat["Low"].iloc[-30:-2].min())
+                closed_bar["RangeHigh28"] = float(df["High"].iloc[-29:-1].max())
+                closed_bar["RangeLow28"] = float(df["Low"].iloc[-29:-1].min())
 
+            chop_4h_runaway = bool(is_chop_gear and adx_4h >= 25.0)
             effective_mtf = str(cfg.get("mtf_alignment_mode") or entry.get("mtf_alignment_mode") or mtf_mode).upper()
-            if is_chop_gear or effective_mtf == "OFF":
+            if is_chop_gear:
+                mtf_aligned = (not guard_blocked) and (not chop_4h_runaway)
+            elif effective_mtf == "OFF":
                 mtf_aligned = not guard_blocked
             elif effective_mtf == "SOFT":
                 mtf_aligned = (raw_4h_ok or (raw_prob >= (req_thresh + 0.04) and _safe_float(closed_bar["Vol_Surge"], 0.0) >= 1.10)) and not guard_blocked
             else:
                 mtf_aligned = (raw_4h_ok or high_conv_rev) and not guard_blocked
 
-            anti_chase_ok, chase_reason = self._passes_anti_chase_guard(closed_bar, live_bar, direction)
+            anti_chase_ok, chase_reason = self._passes_anti_chase_guard(closed_bar, live_bar, direction, is_chop_gear=is_chop_gear)
             strat_ok = self._strategy_entry_filter(
                 strat_id,
                 _safe_float(live_bar["Open"], 0.0),
@@ -1688,7 +1726,7 @@ class LiveAccountTradingBot:
             else:
                 meta_prob = 0.65
                 try:
-                    import ai_regime_copilot
+                    import ai_regime_copilot  # type: ignore[import-not-found]
                     if hasattr(ai_regime_copilot, "compute_meta_label_score"):
                         meta_prob = ai_regime_copilot.compute_meta_label_score(
                             p_long, p_short, adx_val, natr_val, vwap_dev, raw_4h_ok, curr_session
@@ -1701,13 +1739,17 @@ class LiveAccountTradingBot:
             gate_prob_delta = _safe_float(gate_adjustments.get("PROB_THRESH"), 0.0)
             base_min_prob = max((req_thresh * 0.94) + gate_prob_delta, 0.19) + session_prob_penalty
 
-            est_tp_rr = min(max(_safe_float(cfg.get("tp1_rr"), 1.65) * tp_mult, 1.50), 1.85)
+            est_tp_rr = (
+                min(max(_safe_float(cfg.get("tp1_rr"), 0.95), 0.88), 1.15)
+                if is_chop_gear
+                else min(max(_safe_float(cfg.get("tp1_rr"), 1.65) * tp_mult, 1.50), 1.85)
+            )
             conformal_regime = f"G2_CHOP_{curr_regime}" if is_chop_gear else curr_regime
             conformal_abstain = False
             effective_min_prob = base_min_prob
             kelly_scale = 1.0
             try:
-                import ai_regime_copilot
+                import ai_regime_copilot  # type: ignore[import-not-found]
                 if hasattr(ai_regime_copilot, "get_conformal_threshold_and_kelly"):
                     conformal_abstain, effective_min_prob, kelly_scale, _ = ai_regime_copilot.get_conformal_threshold_and_kelly(
                         self.live_dir, conformal_regime, raw_prob, base_min_prob, rr_ratio=est_tp_rr
@@ -1766,8 +1808,6 @@ class LiveAccountTradingBot:
                 per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): Quarantined")
                 continue
 
-            raw_cd_until = _safe_int(loss_cooldown_until_ms.get(bybit_sym), 0)
-            eff_cd_until = max(0, raw_cd_until - (195 * 60 * 1000)) if is_chop_gear else raw_cd_until
             if now_ms < eff_cd_until:
                 rem_min = max(1, int((eff_cd_until - now_ms) / 60000))
                 cd_lbl = "45m" if is_chop_gear else "4h"
@@ -1812,6 +1852,9 @@ class LiveAccountTradingBot:
                     "disp_sym": disp_sym,
                     "market_type": market_type,
                     "direction": direction,
+                    "timeframe": tf_str.upper(),
+                    "strategy_id": strat_id,
+                    "conformal_regime": conformal_regime,
                     "cfg": cfg,
                     "closed_bar": closed_bar.copy(),
                     "live_bar": live_bar.copy(),
@@ -1832,6 +1875,9 @@ class LiveAccountTradingBot:
                 if guard_blocked:
                     reasons.append("BTC 4H Guard")
                     primary_gate = "BTC_4H_GUARD"
+                elif chop_4h_runaway:
+                    reasons.append(f"4H Runaway ADX ({adx_4h:.1f}>=25)")
+                    primary_gate = "CHOP_4H_RUNAWAY"
                 elif not mtf_aligned:
                     reasons.append(f"4H MTF ({effective_mtf})")
                     primary_gate = "MTF_4H"
@@ -1848,7 +1894,7 @@ class LiveAccountTradingBot:
                     reasons.append(f"Waiting {strat_id}")
                     primary_gate = f"STRATEGY_{strat_id}"
                 if not grade_ok:
-                    reasons.append(f"Below B floor (Setup {setup_score}%<66% or ADX {adx_val:.1f}<14.5)")
+                    reasons.append(f"Below B floor (Setup {setup_score}%<66% or ADX {adx_val:.1f}<{min_adx_req:.1f})")
                     if primary_gate == "GENERAL":
                         primary_gate = "GRADE_FLOOR"
                 if conformal_abstain or raw_prob < effective_min_prob:
@@ -1873,6 +1919,9 @@ class LiveAccountTradingBot:
                                 session_name=curr_session,
                                 gemini_enabled=True,
                                 gemini_api_key=gem_shadow_key,
+                                is_chop_regime=is_chop_gear,
+                                timeframe=tf_str.upper(),
+                                strategy_name=str(strat_id),
                             )
                             if sh_res.get("shadow_log"):
                                 add_bot_log(sh_res["shadow_log"])
@@ -2105,7 +2154,6 @@ class LiveAccountTradingBot:
                 add_bot_log(msg)
                 continue
 
-            # Clear any previous block-layer state since trade is executing cleanly
             notified_block_layers.pop(f"{bybit_sym}_{cand['direction']}", None)
 
             if not live_orders_armed:
@@ -2121,6 +2169,8 @@ class LiveAccountTradingBot:
                     "unrealized_pnl": 0.0,
                     "opened_ms": now_ms,
                     "raw_prob": cand["raw_prob"],
+                    "is_chop_gear": is_chop_cand,
+                    "conformal_regime": cand["conformal_regime"],
                     "oi_delta_4h": cand["oi_delta_4h"],
                     "ls_skew": cand["ls_skew"],
                 }
@@ -2137,7 +2187,7 @@ class LiveAccountTradingBot:
                     f"[DRY-RUN SIMULATED] (Grade {cand['grade']} • {cand['conv_pct']}% • {curr_session}): {bybit_sym} {cand['direction']} "
                     f"qty={qty_str} @ ~{price:.4f} | SL={sl_str} | TP={tp_str} ({tp_rr:.2f}R • No Exchange Order)"
                 )
-                break
+                continue
 
             self._bybit_request("POST", "/v5/position/set-leverage", body={
                 "category": self.category,
@@ -2235,6 +2285,8 @@ class LiveAccountTradingBot:
                     "raw_prob": cand["raw_prob"],
                     "session": curr_session,
                     "regime": curr_regime,
+                    "conformal_regime": cand["conformal_regime"],
+                    "is_chop_gear": is_chop_cand,
                     "oi_delta_4h": cand["oi_delta_4h"],
                     "ls_skew": cand["ls_skew"],
                 }
