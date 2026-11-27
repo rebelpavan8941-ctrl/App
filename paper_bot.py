@@ -1340,9 +1340,8 @@ class PaperStrategyTrainerAndTester:
     ) -> dict:
         self.dynamic_strategies = self._load_dynamic_strategies()
         leverage = min(max(int(leverage), 1), MAX_LEVERAGE)
-        test_tfs = [tf.lower() for tf in (timeframes or DEFAULT_TEST_TIMEFRAMES) if tf.lower() in TIMEFRAME_TO_BYBIT_INTERVAL]
-        if not test_tfs:
-            test_tfs = ["5m", "15m", "1h", "4h"]
+        raw_tfs = [tf.lower() for tf in (timeframes or ["15m", "1h", "4h"]) if tf.lower() in TIMEFRAME_TO_BYBIT_INTERVAL]
+        test_tfs = [tf for tf in raw_tfs if tf != "5m"] or ["15m", "1h", "4h"]
 
         diverse_defaults = [
             "g2_range_box_rejection",
@@ -1365,7 +1364,7 @@ class PaperStrategyTrainerAndTester:
         strategies_to_test = []
         for s in raw_strats:
             arch = self._filter_archetype_key(s)
-            if arch not in seen_archetypes:
+            if arch not in seen_archetypes and len(strategies_to_test) < 12:
                 seen_archetypes.add(arch)
                 strategies_to_test.append(s)
 
