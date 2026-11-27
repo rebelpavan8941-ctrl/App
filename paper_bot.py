@@ -1153,7 +1153,7 @@ class PaperStrategyTrainerAndTester:
             return "supertrend"
         if "vwap" in sid or "poc" in sid or "fvg" in sid or "liq_sweep" in sid or "orb" in sid:
             return "vwap_smc"
-        return "default"
+        return sid
 
     def _append_bot_log_to_state(self, state_file: str, lines: list):
         if not lines:
@@ -1218,9 +1218,16 @@ class PaperStrategyTrainerAndTester:
             sniper_min = 12 if is_fx else 18
             freq_min = 45 if is_fx else 85
 
+            g2_sub = cdata.get("gear2_model") if isinstance(cdata.get("gear2_model"), dict) else {}
+            g2_trades = int(g2_sub.get("trades", 0))
+            g2_pf = float(g2_sub.get("profit_factor", 0.0))
+            g2_wr = float(g2_sub.get("win_rate_pct", 0.0))
+            g2_pnl = float(g2_sub.get("net_pnl_usdt", 0.0))
+            qualifies_g2 = (g2_trades >= sniper_min and g2_pf >= 1.45 and g2_wr >= 52.0 and g2_pnl > 0.0)
+
             qualifies_freq = (trades >= freq_min and pf >= 1.50 and wr >= 50.0 and pnl > 0.0)
             qualifies_sniper = (sniper_min <= trades < freq_min and pf >= 2.15 and wr >= 55.0 and pnl > 0.0)
-            qualifies = (qualifies_freq or qualifies_sniper) and (wf_ok or pf >= 2.30)
+            qualifies = ((qualifies_freq or qualifies_sniper) and (wf_ok or pf >= 2.30)) or qualifies_g2
 
             archetype = "HIGH-FREQ" if qualifies_freq else ("SNIPER-HIGH-PF" if qualifies_sniper else "SUB-THRESHOLD")
             meta_tag = " + MetaML" if has_meta else ""
@@ -1231,10 +1238,17 @@ class PaperStrategyTrainerAndTester:
                 l_pf = float(l_data.get("profit_factor", 0.0))
                 l_pnl = float(l_data.get("net_pnl_usdt", l_data.get("net_pnl", 0.0)))
                 l_trades = int(l_data.get("trades", 0))
+                l_g2 = l_data.get("gear2_model") if isinstance(l_data.get("gear2_model"), dict) else {}
+                g2_upgraded = qualifies_g2 and (
+                    not l_g2
+                    or g2_pnl > float(l_g2.get("net_pnl_usdt", 0.0)) * 1.02
+                    or g2_pf > float(l_g2.get("profit_factor", 0.0))
+                )
                 beats_live = (
                     (pf > l_pf and pnl >= l_pnl * 0.90)
                     or (pnl > l_pnl * 1.05 and pf >= l_pf * 0.92)
                     or (l_trades < sniper_min and trades >= sniper_min and pf >= 1.50)
+                    or g2_upgraded
                 )
                 should_promote = qualifies and beats_live
                 reason = (
@@ -1386,7 +1400,8 @@ class PaperStrategyTrainerAndTester:
                     htf_adx = df_4h["ADX"]
                 del df_4h
 
-            best_candidate = None
+            best_g1_candidate = None
+            best_g2_candidate = None
             all_tf_runs = []
             cached_tf_bundles = []
 
@@ -1458,10 +1473,12 @@ class PaperStrategyTrainerAndTester:
                         "net_pnl_usdt": st["net_pnl_usdt"],
                     })
 
-                    if best_candidate is None or eval_res["score"] > best_candidate["score"]:
+                    target_best = best_g2_candidate if is_g2 else best_g1_candidate
+                    if target_best is None or eval_res["score"] > target_best["score"]:
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
                         cfg["strategy"] = f"{strat_name} ({tf.upper()} • MTF:{best_mtf})"
+                        cfg["is_chop_gear"] = bool(is_g2)
                         meta_model = self._fit_meta_labeler(eval_res.get("meta_samples", []))
                         models_payload = {
                             "long": self._serialize_booster(clf_long),
@@ -1471,19 +1488,24 @@ class PaperStrategyTrainerAndTester:
                         }
                         if meta_model is not None:
                             models_payload["meta"] = meta_model
-                        best_candidate = {
+                        cand_obj = {
                             "score": eval_res["score"],
                             "strategy_id": strat_id,
                             "strategy_name": strat_name,
                             "timeframe": tf.upper(),
+                            "is_chop_gear": bool(is_g2),
                             "stats": st,
                             "cfg": cfg,
                             "models": models_payload,
                         }
+                        if is_g2:
+                            best_g2_candidate = cand_obj
+                        else:
+                            best_g1_candidate = cand_obj
 
-            cur_trades = best_candidate["stats"]["trades"] if best_candidate else 0
-            cur_pnl = best_candidate["stats"]["net_pnl_usdt"] if best_candidate else -999.0
-            cur_pf = best_candidate["stats"]["profit_factor"] if best_candidate else 0.0
+            cur_trades = best_g1_candidate["stats"]["trades"] if best_g1_candidate else 0
+            cur_pnl = best_g1_candidate["stats"]["net_pnl_usdt"] if best_g1_candidate else -999.0
+            cur_pf = best_g1_candidate["stats"]["profit_factor"] if best_g1_candidate else 0.0
             passes_either_tier = (cur_trades >= freq_floor and cur_pf >= 1.50 and cur_pnl > 0.0) or (
                 sniper_floor <= cur_trades < freq_floor and cur_pf >= 2.15 and cur_pnl > 0.0
             )
@@ -1512,7 +1534,7 @@ class PaperStrategyTrainerAndTester:
                     )
                     st = eval_res["stats"]
                     best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "OFF")
-                    if best_candidate is None or eval_res["score"] > best_candidate["score"]:
+                    if best_g1_candidate is None or eval_res["score"] > best_g1_candidate["score"]:
                         cur_trades = st["trades"]
                         cur_pnl = st["net_pnl_usdt"]
                         cur_pf = st["profit_factor"]
@@ -1528,7 +1550,7 @@ class PaperStrategyTrainerAndTester:
                         }
                         if meta_model is not None:
                             models_payload["meta"] = meta_model
-                        best_candidate = {
+                        best_g1_candidate = {
                             "score": eval_res["score"],
                             "strategy_id": "xgb_adaptive_quantile",
                             "strategy_name": "Adaptive Tuned XGBoost",
@@ -1576,7 +1598,7 @@ class PaperStrategyTrainerAndTester:
                     )
                     st = eval_res["stats"]
                     best_mtf = eval_res["cfg"].get("mtf_alignment_mode", "OFF")
-                    if best_candidate is None or eval_res["score"] > best_candidate["score"]:
+                    if best_g1_candidate is None or eval_res["score"] > best_g1_candidate["score"]:
                         cfg = dict(eval_res["cfg"])
                         cfg["bybit_symbol"] = symbol.replace("/", "").upper()
                         cfg["strategy"] = f"High-Sensitivity XGBoost ({tf.upper()} • MTF:{best_mtf})"
@@ -1589,7 +1611,7 @@ class PaperStrategyTrainerAndTester:
                         }
                         if meta_model is not None:
                             models_payload["meta"] = meta_model
-                        best_candidate = {
+                        best_g1_candidate = {
                             "score": eval_res["score"],
                             "strategy_id": "xgb_high_sensitivity",
                             "strategy_name": "High-Sensitivity XGBoost",
@@ -1603,8 +1625,30 @@ class PaperStrategyTrainerAndTester:
             del cached_tf_bundles, raw_4h
             gc.collect()
 
+            best_candidate = best_g1_candidate if best_g1_candidate is not None else best_g2_candidate
             if best_candidate is None:
                 continue
+
+            g2_bundle = None
+            if best_g2_candidate is not None:
+                g2_st = best_g2_candidate["stats"]
+                g2_mtf = best_g2_candidate["cfg"].get("mtf_alignment_mode", "OFF")
+                g2_bundle = {
+                    "strategy": f"{best_g2_candidate['strategy_name']} ({best_g2_candidate['timeframe']} ? CHOP)",
+                    "strategy_id": best_g2_candidate["strategy_id"],
+                    "timeframe": best_g2_candidate["timeframe"],
+                    "mtf_alignment_mode": g2_mtf,
+                    "is_chop_gear": True,
+                    "win_rate_pct": g2_st["win_rate_pct"],
+                    "profit_factor": g2_st["profit_factor"],
+                    "net_pnl_pct": g2_st["net_pnl_pct"],
+                    "net_pnl_usdt": g2_st["net_pnl_usdt"],
+                    "net_pnl": g2_st["net_pnl_usdt"],
+                    "trades": g2_st["trades"],
+                    "stats": g2_st,
+                    "config": best_g2_candidate["cfg"],
+                    "models": best_g2_candidate["models"],
+                }
 
             st = best_candidate["stats"]
             best_mtf_mode = best_candidate["cfg"].get("mtf_alignment_mode", "STRICT")
@@ -1624,7 +1668,10 @@ class PaperStrategyTrainerAndTester:
                 "tested_matrix": all_tf_runs,
                 "config": best_candidate["cfg"],
                 "models": best_candidate["models"],
+                "is_chop_gear": bool(best_candidate.get("is_chop_gear", False))
             }
+            if g2_bundle is not None:
+                coin_entry["gear2_model"] = g2_bundle
 
             is_drifted = symbol.replace("/", "").upper() in drifted_compact
             prev_champ = existing_paper_portfolio.get(symbol)
@@ -1650,8 +1697,16 @@ class PaperStrategyTrainerAndTester:
                 )
                 old_valid = (old_trades >= freq_floor and old_pf >= 1.50) or (sniper_floor <= old_trades < freq_floor and old_pf >= 2.15)
                 if not improved and old_valid and old_pnl > 0.0:
+                    prev_g2 = prev_champ.get("gear2_model") if isinstance(prev_champ.get("gear2_model"), dict) else None
                     coin_entry = dict(prev_champ)
                     coin_entry["tested_matrix"] = all_tf_runs
+                    if g2_bundle is not None:
+                        if prev_g2 is None or float(g2_bundle.get("net_pnl_usdt", 0.0)) >= float(prev_g2.get("net_pnl_usdt", 0.0)):
+                            coin_entry["gear2_model"] = g2_bundle
+                        else:
+                            coin_entry["gear2_model"] = prev_g2
+                    elif prev_g2 is not None:
+                        coin_entry["gear2_model"] = prev_g2
 
             total_net_pnl += float(coin_entry.get("net_pnl_usdt", 0.0))
             win_rates.append(float(coin_entry.get("win_rate_pct", 0.0)))
@@ -1791,7 +1846,21 @@ class PaperStrategyTrainerAndTester:
         if isinstance(models_copy.get("short"), dict):
             models_copy["short"] = self._sanitize_xgb_model_json(models_copy["short"])
 
-        portfolio[norm_sym] = {
+        g2_live_bundle = None
+        if isinstance(coin_bundle.get("gear2_model"), dict):
+            g2_src = dict(coin_bundle["gear2_model"])
+            g2_stats = dict(g2_src.get("stats", {}))
+            g2_stats.pop("raw_trade_returns", None)
+            g2_models = dict(g2_src.get("models", {}))
+            if isinstance(g2_models.get("long"), dict):
+                g2_models["long"] = self._sanitize_xgb_model_json(g2_models["long"])
+            if isinstance(g2_models.get("short"), dict):
+                g2_models["short"] = self._sanitize_xgb_model_json(g2_models["short"])
+            g2_src["stats"] = g2_stats
+            g2_src["models"] = g2_models
+            g2_live_bundle = g2_src
+
+        live_entry = {
             "market": coin_bundle.get("market", classify_market(norm_sym)),
             "strategy": coin_bundle.get("strategy", "XGBoost 1H/4H Momentum"),
             "strategy_id": coin_bundle.get("strategy_id", "xgb_mtf_v2"),
@@ -1806,7 +1875,11 @@ class PaperStrategyTrainerAndTester:
             "stats": stats,
             "config": coin_bundle["config"],
             "models": models_copy,
+            "is_chop_gear": bool(coin_bundle.get("is_chop_gear", False))
         }
+        if g2_live_bundle is not None:
+            live_entry["gear2_model"] = g2_live_bundle
+        portfolio[norm_sym] = live_entry
 
         self._save_live_master(live_master)
         return True

@@ -259,6 +259,8 @@ class LiveAccountTradingBot:
                 lite_entry = {k: v for k, v in entry.items() if k not in ("models", "tested_matrix")}
                 if isinstance(lite_entry.get("stats"), dict):
                     lite_entry["stats"] = {k: v for k, v in lite_entry["stats"].items() if k != "raw_trade_returns"}
+                if isinstance(lite_entry.get("gear2_model"), dict):
+                    lite_entry["gear2_model"] = {k: v for k, v in lite_entry["gear2_model"].items() if k != "models"}
                 lite_port[sym] = lite_entry
             tmp_s = f"{self.reports_summary_path}.tmp.{os.getpid()}"
             with open(tmp_s, "w", encoding="utf-8") as wf:
@@ -1108,6 +1110,30 @@ class LiveAccountTradingBot:
                 return False
             return bool((bbp_v <= 0.08 and rsi_v <= 34.0 and c_v > o_v) if side == "LONG" else (bbp_v >= 0.92 and rsi_v >= 66.0 and c_v < o_v))
 
+        if "trendline" in sid:
+            swing_lows = closed_bar.get("SwingLows")
+            swing_highs = closed_bar.get("SwingHighs")
+            adx_v = _safe_float(closed_bar.get("ADX"), 0.0)
+            atr_v = max(_safe_float(closed_bar.get("ATR"), 0.0), 1e-9)
+            c_v = _safe_float(closed_bar.get("Close"), 0.0)
+            o_v = _safe_float(closed_bar.get("Open"), 0.0)
+            c_bar_idx = _safe_int(closed_bar.get("ClosedBarIdx"), -1)
+            if adx_v < 17.0 or c_bar_idx < 0:
+                return False
+            if side == "LONG" and isinstance(swing_lows, list) and len(swing_lows) >= 2:
+                (i1, p1), (i2, p2) = swing_lows[-2], swing_lows[-1]
+                if i2 > i1 and p2 > p1:
+                    tl_px = p2 + ((p2 - p1) / float(i2 - i1)) * float(c_bar_idx - i2)
+                    dist_a = (c_v - tl_px) / atr_v
+                    return bool(-0.25 <= dist_a <= 0.65 and c_v > o_v)
+            elif side == "SHORT" and isinstance(swing_highs, list) and len(swing_highs) >= 2:
+                (i1, p1), (i2, p2) = swing_highs[-2], swing_highs[-1]
+                if i2 > i1 and p2 < p1:
+                    tl_px = p2 + ((p2 - p1) / float(i2 - i1)) * float(c_bar_idx - i2)
+                    dist_a = (tl_px - c_v) / atr_v
+                    return bool(-0.25 <= dist_a <= 0.65 and c_v < o_v)
+            return False
+
         if "donchian" in sid:
             if side == "LONG":
                 return bool(
@@ -1198,11 +1224,33 @@ class LiveAccountTradingBot:
         except Exception:
             return False
 
+    def _get_pending_entry_order_symbols(self) -> set:
+        if not self.api_key or not self.api_secret:
+            return set()
+        pending = set()
+        try:
+            res = self._bybit_request(
+                "GET",
+                "/v5/order/realtime",
+                params={"category": self.category, "settleCoin": "USDT", "openOnly": 0, "limit": 20},
+            )
+            for ord_item in (res.get("result", {}) or {}).get("list", []) or []:
+                if not ord_item.get("reduceOnly"):
+                    sym = str(ord_item.get("symbol", "")).upper()
+                    if sym:
+                        pending.add(sym)
+        except Exception:
+            pass
+        return pending
+
     def sync_positions_and_trail_stops(self, state: dict, trail_ratio: float = 0.45, add_bot_log=None) -> list:
+        if not self.api_key or not self.api_secret:
+            return []
         res = self._bybit_request("GET", "/v5/position/list", {"category": self.category, "settleCoin": "USDT"})
         tp1_done_map = state.setdefault("tp1_partial_done", {})
         native_trail_map = state.setdefault("native_trail_set", {})
         pos_opened_map = state.setdefault("position_opened_ms", {})
+        entry_meta_map = state.setdefault("position_entry_meta", {})
         now_ms = int(time.time() * 1000)
         active_list = []
 
@@ -1234,7 +1282,9 @@ class LiveAccountTradingBot:
                         native_trail_map[pos_key] = True
 
                 age_hours = (now_ms - opened_ms) / 3_600_000.0
-                if filters and age_hours >= 8.0 and tp_dist > 0.0 and profit_dist < (tp_dist * 0.25):
+                pos_is_chop = bool((entry_meta_map.get(bybit_sym) or {}).get("is_chop_gear", False))
+                max_stagnant_h = 2.0 if pos_is_chop else 8.0
+                if filters and age_hours >= max_stagnant_h and tp_dist > 0.0 and profit_dist < (tp_dist * 0.25):
                     qty_step, _, _, tick_size = filters
                     if profit_dist >= 0.0:
                         close_side = "Sell" if side == "LONG" else "Buy"
@@ -1455,7 +1505,9 @@ class LiveAccountTradingBot:
             )
         )
 
-        self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log, curr_session=curr_session, curr_regime=curr_regime)
+        has_api_creds = bool(self.api_key and self.api_secret)
+        if has_api_creds:
+            self._record_recent_stop_losses_and_reflect(state, now_ms, add_bot_log, curr_session=curr_session, curr_regime=curr_regime)
         funding_rates, mark_prices = self._fetch_tickers_cached() if (crypto_enabled or forex_enabled) else ({}, {})
 
         gate_adjustments = {}
@@ -1467,14 +1519,17 @@ class LiveAccountTradingBot:
         except Exception:
             gate_adjustments = {}
 
-        bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
-        bal_ret_code = _safe_int(bal_res.get("retCode"), -1) if bal_res else -1
-        if bal_ret_code != 0:
-            bal_msg = bal_res.get("retMsg", "Unable to fetch Unified USDT balance")
-            err_str = f"Bybit Wallet API Error [{bal_ret_code}]: {BYBIT_ERROR_HINTS.get(bal_ret_code, bal_msg)}"
-            order_rejections.append(err_str)
-            add_bot_log(err_str)
-        avail_usdt, total_equity_usdt = self._extract_wallet_metrics(bal_res) if bal_ret_code == 0 else (0.0, 0.0)
+        if has_api_creds:
+            bal_res = self._bybit_request("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": "USDT"})
+            bal_ret_code = _safe_int(bal_res.get("retCode"), -1) if bal_res else -1
+            if bal_ret_code != 0:
+                bal_msg = bal_res.get("retMsg", "Unable to fetch Unified USDT balance")
+                err_str = f"Bybit Wallet API Error [{bal_ret_code}]: {BYBIT_ERROR_HINTS.get(bal_ret_code, bal_msg)}"
+                order_rejections.append(err_str)
+                add_bot_log(err_str)
+            avail_usdt, total_equity_usdt = self._extract_wallet_metrics(bal_res) if bal_ret_code == 0 else (0.0, 0.0)
+        else:
+            avail_usdt, total_equity_usdt = 10000.0, 10000.0
 
         peak_equity = _safe_float(state.get("peak_equity_usdt"), 0.0)
         if total_equity_usdt > peak_equity:
@@ -1487,8 +1542,9 @@ class LiveAccountTradingBot:
         sl_mult, tp_mult, trail_ratio = self._regime_exit_multipliers(btc_adx, btc_natr, btc_macro_bearish)
         open_positions = self.sync_positions_and_trail_stops(state, trail_ratio=trail_ratio, add_bot_log=add_bot_log)
         virtual_positions = self._sync_virtual_positions(state, mark_prices, trail_ratio, now_ms, add_bot_log, curr_session=curr_session, curr_regime=curr_regime)
+        pending_order_syms = self._get_pending_entry_order_symbols() if live_orders_armed else set()
         active_pos_records = list(open_positions) + list(virtual_positions)
-        open_syms = {p["symbol"] for p in active_pos_records}
+        open_syms = {p["symbol"] for p in active_pos_records} | pending_order_syms
 
         active_items = []
         fetch_tasks = {}
@@ -1504,6 +1560,13 @@ class LiveAccountTradingBot:
             interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_str, "60")
             active_items.append((symbol, entry, market_type, cfg, bybit_sym, tf_str, interval))
             fetch_tasks[(bybit_sym, interval)] = (bybit_sym, interval, 230)
+            g2_sub = entry.get("gear2_model")
+            if isinstance(g2_sub, dict) and isinstance(g2_sub.get("models"), dict):
+                g2_cfg = g2_sub.get("config", {}) or {}
+                g2_tf_str = str(g2_cfg.get("timeframe") or g2_sub.get("timeframe") or "5m").lower()
+                g2_int = TIMEFRAME_TO_BYBIT_INTERVAL.get(g2_tf_str, "5")
+                if (bybit_sym, g2_int) not in fetch_tasks:
+                    fetch_tasks[(bybit_sym, g2_int)] = (bybit_sym, g2_int, 230)
             if interval != "240":
                 cached = self._trend_4h_cache.get(bybit_sym)
                 if not cached or (time.time() - cached[0]) >= 600.0:
@@ -1543,6 +1606,44 @@ class LiveAccountTradingBot:
         for symbol, entry, market_type, cfg, bybit_sym, tf_str, interval in active_items:
             coins_scanned_count += 1
             disp_sym = symbol if "/" in symbol else (f"{bybit_sym[:-4]}/USDT" if bybit_sym.endswith("USDT") else bybit_sym)
+
+            # Dual-Gear Regime Switcher: Automatically shift to 5m/15m Gear 2 chop model when ADX < 20.5 & 4H ADX < 25.0
+            active_entry = entry
+            active_cfg = cfg
+            active_tf_str = tf_str
+            active_interval = interval
+            booster_prefix = f"{bybit_sym}_g1"
+            gear_badge = ""
+
+            g2_sub = entry.get("gear2_model")
+            primary_is_g2 = bool(entry.get("is_chop_gear", False)) or str(cfg.get("strategy_id") or entry.get("strategy_id") or "").lower().startswith("g2_")
+            if (not primary_is_g2) and isinstance(g2_sub, dict) and isinstance(g2_sub.get("models"), dict):
+                g2_models_chk = g2_sub.get("models", {})
+                if is_valid_xgb_model(g2_models_chk.get("long")) and is_valid_xgb_model(g2_models_chk.get("short")):
+                    df_g1_chk = fetched_candles.get((bybit_sym, interval), pd.DataFrame())
+                    cached_4h_chk = self._trend_4h_cache.get(bybit_sym)
+                    adx_4h_chk = cached_4h_chk[2] if cached_4h_chk else 20.0
+                    g1_adx_chk = 25.0
+                    if len(df_g1_chk) >= 210:
+                        df_g1_feat = self.build_features(df_g1_chk)
+                        if len(df_g1_feat) >= 2:
+                            g1_adx_chk = _safe_float(df_g1_feat.iloc[-2].get("ADX"), 25.0)
+                    if g1_adx_chk < 20.5 and adx_4h_chk < 25.0:
+                        g2_cfg_cand = g2_sub.get("config", {}) or {}
+                        g2_tf_cand = str(g2_cfg_cand.get("timeframe") or g2_sub.get("timeframe") or "5m").lower()
+                        g2_int_cand = TIMEFRAME_TO_BYBIT_INTERVAL.get(g2_tf_cand, "5")
+                        if len(fetched_candles.get((bybit_sym, g2_int_cand), pd.DataFrame())) >= 210:
+                            active_entry = g2_sub
+                            active_cfg = g2_cfg_cand
+                            active_tf_str = g2_tf_cand
+                            active_interval = g2_int_cand
+                            booster_prefix = f"{bybit_sym}_g2"
+                            gear_badge = f" [G2-{g2_tf_cand.upper()}]"
+
+            entry = active_entry
+            cfg = active_cfg
+            tf_str = active_tf_str
+            interval = active_interval
             models_map = entry.get("models", {})
             long_data = models_map.get("long") or models_map.get("long_model")
             short_data = models_map.get("short") or models_map.get("short_model")
@@ -1618,8 +1719,8 @@ class LiveAccountTradingBot:
             try:
                 x_row = df.iloc[[-2]][features].to_numpy(dtype="float32")
                 dmat = xgb.DMatrix(x_row, feature_names=features)
-                p_long = float(self._load_booster(f"{bybit_sym}_long", long_data).predict(dmat)[0])
-                p_short = float(self._load_booster(f"{bybit_sym}_short", short_data).predict(dmat)[0])
+                p_long = float(self._load_booster(f"{booster_prefix}_long", long_data).predict(dmat)[0])
+                p_short = float(self._load_booster(f"{booster_prefix}_short", short_data).predict(dmat)[0])
             except Exception as e:
                 err_msg = f"{bybit_sym}: Booster error - {e}"
                 diagnostics.append(err_msg)
@@ -1684,10 +1785,20 @@ class LiveAccountTradingBot:
             )
             funding_blocked = (direction == "LONG" and fr_val > 0.0004) or (direction == "SHORT" and fr_val < -0.0004) or crowded_oi_top
 
-            if is_chop_gear and "RangeHigh28" not in closed_bar.index and len(df) >= 30:
+            if (is_chop_gear or "trendline" in str(strat_id).lower()) and len(df) >= 30:
                 closed_bar = closed_bar.copy()
-                closed_bar["RangeHigh28"] = float(df["High"].iloc[-29:-1].max())
-                closed_bar["RangeLow28"] = float(df["Low"].iloc[-29:-1].min())
+                if is_chop_gear and "RangeHigh28" not in closed_bar.index:
+                    closed_bar["RangeHigh28"] = float(df["High"].iloc[-29:-1].max())
+                    closed_bar["RangeLow28"] = float(df["Low"].iloc[-29:-1].min())
+                if "trendline" in str(strat_id).lower():
+                    h_arr = df["High"].to_numpy(dtype=float)
+                    l_arr = df["Low"].to_numpy(dtype=float)
+                    c_bar_idx = len(df) - 2
+                    s_lows = [(j, float(l_arr[j])) for j in range(3, max(4, c_bar_idx - 2)) if l_arr[j] == np.min(l_arr[j - 3:j + 4])]
+                    s_highs = [(j, float(h_arr[j])) for j in range(3, max(4, c_bar_idx - 2)) if h_arr[j] == np.max(h_arr[j - 3:j + 4])]
+                    closed_bar["SwingLows"] = s_lows
+                    closed_bar["SwingHighs"] = s_highs
+                    closed_bar["ClosedBarIdx"] = c_bar_idx
 
             chop_4h_runaway = bool(is_chop_gear and adx_4h >= 25.0)
             effective_mtf = str(cfg.get("mtf_alignment_mode") or entry.get("mtf_alignment_mode") or mtf_mode).upper()
@@ -1766,7 +1877,11 @@ class LiveAccountTradingBot:
             prob_pts = min(36.0, max(0.0, (prob_ratio - 0.55) * 45.0))
             mtf_pts = 24.0 if mtf_aligned else (8.0 if raw_4h_ok else 0.0)
             strat_pts = 20.0 if strat_ok else 4.0
-            adx_pts = min(9.0, max(0.0, (adx_val / 28.0) * 9.0))
+            adx_pts = (
+                min(9.0, max(0.0, ((25.0 - adx_val) / 14.0) * 9.0))
+                if is_chop_gear
+                else min(9.0, max(0.0, (adx_val / 28.0) * 9.0))
+            )
             clean_pts = 8.0 if (anti_chase_ok and not funding_blocked and meta_ok and not conformal_abstain) else 0.0
             setup_score = int(round(min(97.0, max(12.0, prob_pts + mtf_pts + strat_pts + adx_pts + clean_pts))))
 
@@ -1838,7 +1953,7 @@ class LiveAccountTradingBot:
                 else:
                     grade_tag = "B+"
 
-                per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}% READY)")
+                per_coin_summaries.append(f"{bybit_sym}{gear_badge} {direction} ({conv_pct}% READY)")
                 candidates.append({
                     "edge": quality_edge,
                     "conv_pct": conv_pct,
@@ -1945,7 +2060,7 @@ class LiveAccountTradingBot:
                         pass
 
                 short_why = reasons[0] if reasons else "Waiting"
-                per_coin_summaries.append(f"{bybit_sym} {direction} ({conv_pct}%): {short_why}")
+                per_coin_summaries.append(f"{bybit_sym}{gear_badge} {direction} ({conv_pct}%): {short_why}")
                 block_msg = f"{bybit_sym} {direction} ({conv_pct}%): {', '.join(reasons)} [ADX:{adx_val:.1f}]"
                 diagnostics.append(block_msg)
                 emit_layer_block_alert(bybit_sym, direction, primary_gate, block_msg)
@@ -2340,6 +2455,12 @@ class LiveAccountTradingBot:
         else:
             state["last_bot_logs"] = bot_logs[-60:]
 
+        for map_key in ("last_shadow_eval_ms", "traded_candle_ts", "last_trade_epoch_ms", "last_notified_block_layer", "tp1_partial_done", "native_trail_set"):
+            m_obj = state.get(map_key)
+            if isinstance(m_obj, dict) and len(m_obj) > 80:
+                for k_old in list(m_obj.keys())[:-60]:
+                    m_obj.pop(k_old, None)
+
         state["coins_scanned"] = coins_scanned_count
         state["radar_signals"] = radar_signals
         state["last_diagnostics"] = diagnostics[-25:]
@@ -2389,7 +2510,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) >= 2 and sys.argv[1] == "--kill":
         print(json.dumps({"ok": True, "closed": bot.emergency_close_all()}))
-    elif api_key and api_secret:
+    elif (api_key and api_secret) or (not bool(runtime_cfg.get("live_orders_armed", False))):
         out = bot.run_live_cycle(
             leverage=_safe_int(runtime_cfg.get("leverage"), 10),
             risk_per_trade_pct=_safe_float(runtime_cfg.get("risk_per_trade_pct"), 1.5),
