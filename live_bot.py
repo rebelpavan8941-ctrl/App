@@ -1,4 +1,16 @@
 import os
+
+import threading as _at_threading
+import uuid as _at_uuid
+_ATOMIC_IO_LOCK = _at_threading.Lock()
+
+def _locked_replace(src_tmp: str, dst_path: str):
+    os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
+    with _ATOMIC_IO_LOCK:
+        _locked_replace(src_tmp, dst_path)
+
+import threading
+import uuid
 import gc
 import sys
 import json
@@ -244,10 +256,10 @@ class LiveAccountTradingBot:
 
     def _save_state(self, state: dict):
         os.makedirs(os.path.dirname(os.path.abspath(self.state_path)), exist_ok=True)
-        tmp_path = f"{self.state_path}.tmp.{os.getpid()}"
+        tmp_path = f"{self.state_path}.tmp.{os.getpid()}_{_at_threading.get_ident()}_{_at_uuid.uuid4().hex[:8]}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
-        os.replace(tmp_path, self.state_path)
+        _locked_replace(tmp_path, self.state_path)
 
     def _write_lightweight_live_summary(self, master: dict):
         try:
@@ -262,7 +274,7 @@ class LiveAccountTradingBot:
                 if isinstance(lite_entry.get("gear2_model"), dict):
                     lite_entry["gear2_model"] = {k: v for k, v in lite_entry["gear2_model"].items() if k != "models"}
                 lite_port[sym] = lite_entry
-            tmp_s = f"{self.reports_summary_path}.tmp.{os.getpid()}"
+            tmp_s = f"{self.reports_summary_path}.tmp.{os.getpid()}_{_at_threading.get_ident()}_{_at_uuid.uuid4().hex[:8]}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}"
             with open(tmp_s, "w", encoding="utf-8") as wf:
                 json.dump({
                     "version": master.get("version", ""),
@@ -271,7 +283,7 @@ class LiveAccountTradingBot:
                     "total_net_pnl": master.get("total_net_pnl", 0.0),
                     "portfolio": lite_port,
                 }, wf, indent=2)
-            os.replace(tmp_s, self.reports_summary_path)
+            _locked_replace(tmp_s, self.reports_summary_path)
         except Exception:
             pass
 
@@ -732,10 +744,10 @@ class LiveAccountTradingBot:
                     "virtual": bool(is_virtual),
                 })
                 hist_data["trades"] = trades_list[:300]
-                tmp_hf = f"{hist_file}.tmp.{os.getpid()}"
+                tmp_hf = f"{hist_file}.tmp.{os.getpid()}_{_at_threading.get_ident()}_{_at_uuid.uuid4().hex[:8]}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}"
                 with open(tmp_hf, "w", encoding="utf-8") as wf:
                     json.dump(hist_data, wf, indent=2)
-                os.replace(tmp_hf, hist_file)
+                _locked_replace(tmp_hf, hist_file)
         except Exception:
             pass
 

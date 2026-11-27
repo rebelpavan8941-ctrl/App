@@ -1,4 +1,16 @@
 import os
+
+import threading as _at_threading
+import uuid as _at_uuid
+_ATOMIC_IO_LOCK = _at_threading.Lock()
+
+def _locked_replace(src_tmp: str, dst_path: str):
+    os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
+    with _ATOMIC_IO_LOCK:
+        _locked_replace(src_tmp, dst_path)
+
+import threading
+import uuid
 import gc
 import sys
 import json
@@ -117,10 +129,10 @@ def _is_legacy_yahoo_forex(symbol: str) -> bool:
 
 def _atomic_write_json(path: str, payload: dict):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp_path = f"{path}.tmp.{os.getpid()}"
+    tmp_path = f"{path}.tmp.{os.getpid()}_{_at_threading.get_ident()}_{_at_uuid.uuid4().hex[:8]}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}"
     with open(tmp_path, "w", encoding="utf-8") as wf:
         json.dump(payload, wf, indent=2)
-    os.replace(tmp_path, path)
+    _locked_replace(tmp_path, path)
 
 
 class PaperStrategyTrainerAndTester:
@@ -446,7 +458,8 @@ class PaperStrategyTrainerAndTester:
         bybit_sym = symbol.replace("/", "").upper()
         tf_key = timeframe.lower()
         interval = TIMEFRAME_TO_BYBIT_INTERVAL.get(tf_key, "60")
-        target_bars = (days * BARS_PER_DAY.get(tf_key, 24)) + 210
+        eff_days = min(days, 40) if tf_key == "5m" else (min(days, 75) if tf_key == "15m" else days)
+        target_bars = (eff_days * BARS_PER_DAY.get(tf_key, 24)) + 210
         max_pages = max(14, int(np.ceil(target_bars / 950.0)) + 2)
 
         collected = {}
