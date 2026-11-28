@@ -1100,10 +1100,16 @@ def fetch_live_snapshot(live_dir: str, models_dir: str, api_key: str, api_secret
     def _safe_pnl_call():
         if not live_orders_armed:
             return {}
+        now_t = time.time()
+        cache_entry = getattr(fetch_live_snapshot, "_pnl_cache", None)
+        if cache_entry and (now_t - cache_entry[0]) < 15.0:
+            return cache_entry[1]
         try:
-            return _bybit_signed_get(api_key, api_secret, endpoint, "/v5/position/closed-pnl", "category=linear&limit=50")
+            res_p = _bybit_signed_get(api_key, api_secret, endpoint, "/v5/position/closed-pnl", "category=linear&limit=50")
+            fetch_live_snapshot._pnl_cache = (now_t, res_p)
+            return res_p
         except Exception:
-            return {}
+            return cache_entry[1] if cache_entry else {}
 
     with ThreadPoolExecutor(max_workers=3) as ex:
         fut_w = ex.submit(test_bybit_wallet, api_key, api_secret, endpoint)
