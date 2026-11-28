@@ -3038,7 +3038,9 @@ def evaluate_active_strategies_health_json(strategies_json: str) -> str:
         is_breakout = any(k in sid for k in ("donchian", "breakout", "orb", "turtle"))
         is_scalp = (tf == "15M")
 
-        if wr < 56.0:
+        if wr <= 0.0:
+            reason = None
+        elif wr < 56.0:
             reason = f"Underperforming: Win rate ({wr:.1f}%) dropped below 56.0% minimum threshold."
         elif is_low_vol_chop and is_breakout:
             reason = "Regime Mismatch: Low-volatility sideways market is causing false breakout whipsaws."

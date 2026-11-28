@@ -1645,6 +1645,9 @@ class PaperStrategyTrainerAndTester:
             if best_g2_candidate is not None:
                 g2_st = best_g2_candidate["stats"]
                 g2_mtf = best_g2_candidate["cfg"].get("mtf_alignment_mode", "OFF")
+                g2_cfg_fixed = dict(best_g2_candidate["cfg"])
+                g2_cfg_fixed["timeframe"] = str(best_g2_candidate["timeframe"]).lower()
+                g2_cfg_fixed["is_chop_gear"] = True
                 g2_bundle = {
                     "strategy": f"{best_g2_candidate['strategy_name']} ({best_g2_candidate['timeframe']} ? CHOP)",
                     "strategy_id": best_g2_candidate["strategy_id"],
@@ -1658,7 +1661,7 @@ class PaperStrategyTrainerAndTester:
                     "net_pnl": g2_st["net_pnl_usdt"],
                     "trades": g2_st["trades"],
                     "stats": g2_st,
-                    "config": best_g2_candidate["cfg"],
+                    "config": g2_cfg_fixed,
                     "models": best_g2_candidate["models"],
                 }
 

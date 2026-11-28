@@ -743,7 +743,7 @@ class LiveAccountTradingBot:
                     "closed_at_ms": closed_ms,
                     "virtual": bool(is_virtual),
                 })
-                hist_data["trades"] = trades_list[:300]
+                hist_data["trades"] = trades_list[:2000]
                 tmp_hf = f"{hist_file}.tmp.{os.getpid()}_{_at_threading.get_ident()}_{_at_uuid.uuid4().hex[:8]}_{threading.get_ident()}_{uuid.uuid4().hex[:8]}"
                 with open(tmp_hf, "w", encoding="utf-8") as wf:
                     json.dump(hist_data, wf, indent=2)
@@ -839,7 +839,7 @@ class LiveAccountTradingBot:
         reflected = state.setdefault("reflected_closed_ids", [])
         entry_meta_map = state.setdefault("position_entry_meta", {})
         try:
-            res = self._bybit_request("GET", "/v5/position/closed-pnl", {"category": self.category, "limit": 10})
+            res = self._bybit_request("GET", "/v5/position/closed-pnl", {"category": self.category, "limit": 50})
         except Exception:
             return
         for row in res.get("result", {}).get("list", []):
@@ -1090,7 +1090,7 @@ class LiveAccountTradingBot:
             h_v = _safe_float(closed_bar.get("High"), 0.0)
             l_v = _safe_float(closed_bar.get("Low"), 0.0)
             rng_v = max(h_v - l_v, 1e-9)
-            if rh28 <= rl28 or (rh28 - rl28) <= (2.2 * atr_v) or adx_v >= 20.5:
+            if rh28 <= rl28 or (rh28 - rl28) <= (1.8 * atr_v) or adx_v >= 23.5:
                 return False
             box_pos = (c_v - rl28) / max(rh28 - rl28, 1e-9)
             if side == "LONG":
@@ -1575,7 +1575,7 @@ class LiveAccountTradingBot:
             g2_sub = entry.get("gear2_model")
             if isinstance(g2_sub, dict) and isinstance(g2_sub.get("models"), dict):
                 g2_cfg = g2_sub.get("config", {}) or {}
-                g2_tf_str = str(g2_cfg.get("timeframe") or g2_sub.get("timeframe") or "5m").lower()
+                g2_tf_str = str(g2_sub.get("timeframe") or g2_cfg.get("timeframe") or "5m").lower()
                 g2_int = TIMEFRAME_TO_BYBIT_INTERVAL.get(g2_tf_str, "5")
                 if (bybit_sym, g2_int) not in fetch_tasks:
                     fetch_tasks[(bybit_sym, g2_int)] = (bybit_sym, g2_int, 230)
@@ -1640,9 +1640,9 @@ class LiveAccountTradingBot:
                         df_g1_feat = self.build_features(df_g1_chk)
                         if len(df_g1_feat) >= 2:
                             g1_adx_chk = _safe_float(df_g1_feat.iloc[-2].get("ADX"), 25.0)
-                    if g1_adx_chk < 20.5 and adx_4h_chk < 25.0:
+                    if g1_adx_chk < 23.5 and adx_4h_chk < 27.0:
                         g2_cfg_cand = g2_sub.get("config", {}) or {}
-                        g2_tf_cand = str(g2_cfg_cand.get("timeframe") or g2_sub.get("timeframe") or "5m").lower()
+                        g2_tf_cand = str(g2_sub.get("timeframe") or g2_cfg_cand.get("timeframe") or "5m").lower()
                         g2_int_cand = TIMEFRAME_TO_BYBIT_INTERVAL.get(g2_tf_cand, "5")
                         if len(fetched_candles.get((bybit_sym, g2_int_cand), pd.DataFrame())) >= 210:
                             active_entry = g2_sub

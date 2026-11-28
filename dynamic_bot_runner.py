@@ -1102,10 +1102,10 @@ def fetch_live_snapshot(live_dir: str, models_dir: str, api_key: str, api_secret
             return {}
         now_t = time.time()
         cache_entry = getattr(fetch_live_snapshot, "_pnl_cache", None)
-        if cache_entry and (now_t - cache_entry[0]) < 15.0:
+        if cache_entry and (now_t - cache_entry[0]) < 8.0:
             return cache_entry[1]
         try:
-            res_p = _bybit_signed_get(api_key, api_secret, endpoint, "/v5/position/closed-pnl", "category=linear&limit=50")
+            res_p = _bybit_signed_get(api_key, api_secret, endpoint, "/v5/position/closed-pnl", "category=linear&limit=100")
             fetch_live_snapshot._pnl_cache = (now_t, res_p)
             return res_p
         except Exception:
@@ -1149,102 +1149,184 @@ def fetch_live_snapshot(live_dir: str, models_dir: str, api_key: str, api_secret
     except Exception:
         pass
 
+    def _compute_ist_and_manual_cutoffs():
+        from datetime import datetime, timezone, timedelta
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
+        ist_now = datetime.now(ist_tz)
+        # Sunday night 12:00 AM IST == Monday 00:00:00 IST
+        days_since_mon = ist_now.weekday()
+        week_start_dt = ist_now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_mon)
+        month_start_dt = ist_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        year_start_dt = ist_now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        auto_week_ms = int(week_start_dt.timestamp() * 1000)
+        auto_month_ms = int(month_start_dt.timestamp() * 1000)
+        auto_year_ms = int(year_start_dt.timestamp() * 1000)
+
+        legacy_reset_ms = 0
+        reset_file = os.path.join(live_dir, "reports_reset_ts.txt")
+        if os.path.exists(reset_file):
+            try:
+                with open(reset_file, "r", encoding="utf-8") as rf:
+                    legacy_reset_ms = int(rf.read().strip() or "0")
+            except Exception:
+                legacy_reset_ms = 0
+
+        resets_obj = {}
+        resets_json_file = os.path.join(live_dir, "report_resets.json")
+        if os.path.exists(resets_json_file):
+            try:
+                with open(resets_json_file, "r", encoding="utf-8-sig") as rjf:
+                    resets_obj = json.load(rjf) or {}
+            except Exception:
+                resets_obj = {}
+
+        m_week = int(resets_obj.get("weekly_reset_ms", 0) or 0)
+        m_month = int(resets_obj.get("monthly_reset_ms", 0) or 0)
+        m_year = int(resets_obj.get("yearly_reset_ms", 0) or 0)
+        m_overall = int(resets_obj.get("overall_reset_ms", legacy_reset_ms) or 0)
+
+        return {
+            "Weekly": max(auto_week_ms, m_week, m_overall),
+            "Monthly": max(auto_month_ms, m_month, m_overall),
+            "Yearly": max(auto_year_ms, m_year, m_overall),
+            "Overall": m_overall,
+        }
+
+    period_summaries = {"Weekly": [], "Monthly": [], "Yearly": [], "Overall": []}
     closed_summary = []
-    if live_orders_armed:
-        # ACTUAL LIVE EXCHANGE REPORTS ONLY (never mixed with Dry-Run)
-        try:
-            if pnl_data.get("retCode") == 0:
-                by_sym = {}
-                reset_ts_ms = 0
-                reset_file = os.path.join(live_dir, "reports_reset_ts.txt")
-                if os.path.exists(reset_file):
-                    try:
-                        with open(reset_file, "r", encoding="utf-8") as rf:
-                            reset_ts_ms = int(rf.read().strip() or "0")
-                    except Exception:
-                        reset_ts_ms = 0
-
-                merged_positions = []
-                for row in pnl_data.get("result", {}).get("list", []):
-                    updated_ms = int(row.get("updatedTime", 0) or row.get("createdTime", 0) or 0)
-                    if reset_ts_ms > 0 and updated_ms > 0 and updated_ms <= reset_ts_ms:
-                        continue
-                    raw_sym = row.get("symbol", "")
-                    disp_sym = f"{raw_sym[:-4]}/USDT" if raw_sym.endswith("USDT") else raw_sym
-                    close_side = str(row.get("side", "")).upper()
-                    avg_entry = _safe_float(row.get("avgEntryPrice", 0) or 0)
-                    cpnl = _safe_float(row.get("closedPnl", 0) or 0)
-
-                    matched_bucket = None
-                    for b in merged_positions:
-                        if b["symbol"] == disp_sym and b["side"] == close_side:
-                            same_entry = (avg_entry > 0.0 and b["entry"] > 0.0 and abs(avg_entry - b["entry"]) / b["entry"] <= 0.0003)
-                            within_24h = (updated_ms > 0 and b["ts"] > 0 and abs(updated_ms - b["ts"]) <= 86_400_000)
-                            if same_entry and within_24h:
-                                matched_bucket = b
-                                break
-                    if matched_bucket is not None:
-                        matched_bucket["pnl"] = round(matched_bucket["pnl"] + cpnl, 4)
-                    else:
-                        merged_positions.append({
-                            "symbol": disp_sym,
-                            "side": close_side,
-                            "entry": avg_entry,
-                            "ts": updated_ms,
-                            "pnl": round(cpnl, 4),
-                        })
-
-                for mp in merged_positions:
-                    disp_sym = mp["symbol"]
-                    cpnl = mp["pnl"]
-                    rec = by_sym.setdefault(disp_sym, {"symbol": disp_sym, "strategy": "XGBoost MTF", "pnl": 0.0, "realized_pnl": 0.0, "wins": 0, "losses": 0, "trades": 0, "win_rate_pct": 0.0})
-                    rec["pnl"] = round(rec["pnl"] + cpnl, 4)
-                    rec["realized_pnl"] = rec["pnl"]
-                    if cpnl >= 0:
-                        rec["wins"] += 1
-                    else:
-                        rec["losses"] += 1
-                    rec["trades"] = rec["wins"] + rec["losses"]
-                    rec["win_rate_pct"] = round((rec["wins"] / max(rec["trades"], 1)) * 100.0, 1)
-                closed_summary = [v for v in by_sym.values() if v.get("trades", 0) > 0]
-        except Exception:
-            pass
-    else:
-        # VIRTUAL DRY-RUN REPORTS ONLY (auto-switched when Exchange Live Orders is OFF)
-        try:
-            reset_ts_ms = 0
-            reset_file = os.path.join(live_dir, "reports_reset_ts.txt")
-            if os.path.exists(reset_file):
-                try:
-                    with open(reset_file, "r", encoding="utf-8") as rf:
-                        reset_ts_ms = int(rf.read().strip() or "0")
-                except Exception:
-                    reset_ts_ms = 0
-
-            hist_file = os.path.join(live_dir, "live_reports_history.json")
-            if os.path.exists(hist_file):
+    try:
+        hist_file = os.path.join(live_dir, "live_reports_history.json")
+        hist_data = {"trades": []}
+        if os.path.exists(hist_file):
+            try:
                 with open(hist_file, "r", encoding="utf-8-sig") as hf:
-                    h_obj = json.load(hf)
-                v_trades = [t for t in (h_obj.get("trades") or []) if t.get("virtual")]
-                by_v = {}
-                for vt in v_trades:
-                    closed_ms = int(vt.get("closed_at_ms", 0) or 0)
-                    if reset_ts_ms > 0 and closed_ms > 0 and closed_ms <= reset_ts_ms:
-                        continue
-                    sym = f"{vt.get('symbol', '')} [DRY]"
-                    pnl = _safe_float(vt.get("net_pnl", 0.0))
-                    rec = by_v.setdefault(sym, {"symbol": sym, "strategy": "Dry-Run Sim", "pnl": 0.0, "realized_pnl": 0.0, "wins": 0, "losses": 0, "trades": 0, "win_rate_pct": 0.0})
-                    rec["pnl"] = round(rec["pnl"] + pnl, 4)
-                    rec["realized_pnl"] = rec["pnl"]
-                    if pnl >= 0:
-                        rec["wins"] += 1
-                    else:
-                        rec["losses"] += 1
-                    rec["trades"] = rec["wins"] + rec["losses"]
-                    rec["win_rate_pct"] = round((rec["wins"] / max(rec["trades"], 1)) * 100.0, 1)
-                closed_summary = [v for v in by_v.values() if v.get("trades", 0) > 0]
-        except Exception:
-            pass
+                    loaded = json.load(hf)
+                    if isinstance(loaded, dict):
+                        hist_data = loaded
+            except Exception:
+                hist_data = {"trades": []}
+
+        trades_list = hist_data.setdefault("trades", [])
+
+        # Merge fresh Bybit closed-pnl rows permanently into live_reports_history.json
+        if live_orders_armed and pnl_data.get("retCode") == 0:
+            merged_positions = []
+            for row in pnl_data.get("result", {}).get("list", []):
+                updated_ms = int(row.get("updatedTime", 0) or row.get("createdTime", 0) or 0)
+                raw_sym = row.get("symbol", "")
+                disp_sym = f"{raw_sym[:-4]}/USDT" if raw_sym.endswith("USDT") else raw_sym
+                close_side = str(row.get("side", "")).upper()
+                avg_entry = _safe_float(row.get("avgEntryPrice", 0) or 0)
+                cpnl = _safe_float(row.get("closedPnl", 0) or 0)
+                oid = str(row.get("orderId", "") or "").strip()
+
+                matched_bucket = None
+                for b in merged_positions:
+                    if b["symbol"] == disp_sym and b["side"] == close_side:
+                        same_entry = (avg_entry > 0.0 and b["entry"] > 0.0 and abs(avg_entry - b["entry"]) / b["entry"] <= 0.0003)
+                        within_24h = (updated_ms > 0 and b["ts"] > 0 and abs(updated_ms - b["ts"]) <= 86_400_000)
+                        if same_entry and within_24h:
+                            matched_bucket = b
+                            break
+                if matched_bucket is not None:
+                    matched_bucket["pnl"] = round(matched_bucket["pnl"] + cpnl, 4)
+                    if updated_ms > matched_bucket["ts"]:
+                        matched_bucket["ts"] = updated_ms
+                else:
+                    bucket_key = f"BYBIT_{disp_sym}_{close_side}_{int(updated_ms // 60000)}_{round(avg_entry, 4)}" if updated_ms > 0 else (oid or f"BYBIT_{disp_sym}_{round(cpnl, 4)}")
+                    merged_positions.append({
+                        "id": bucket_key,
+                        "symbol": disp_sym,
+                        "side": close_side,
+                        "entry": avg_entry,
+                        "ts": updated_ms,
+                        "pnl": round(cpnl, 4),
+                    })
+
+            history_changed = False
+            by_id = {str(t.get("id")): t for t in trades_list if isinstance(t, dict) and t.get("id")}
+            for mp in merged_positions:
+                mid = mp["id"]
+                if mid in by_id:
+                    existing_t = by_id[mid]
+                    if abs(_safe_float(existing_t.get("net_pnl"), 0.0) - mp["pnl"]) > 1e-5:
+                        existing_t["net_pnl"] = mp["pnl"]
+                        history_changed = True
+                else:
+                    # Also skip if an exact orderId/timestamp duplicate already exists from live_bot
+                    dup_close = any(
+                        (not t.get("virtual"))
+                        and t.get("symbol") == mp["symbol"]
+                        and abs(int(t.get("closed_at_ms", 0) or 0) - mp["ts"]) <= 120_000
+                        and abs(_safe_float(t.get("net_pnl"), 0.0) - mp["pnl"]) <= 0.002
+                        for t in trades_list
+                    )
+                    if not dup_close:
+                        new_rec = {
+                            "id": mid,
+                            "symbol": mp["symbol"],
+                            "side": mp["side"],
+                            "net_pnl": mp["pnl"],
+                            "closed_at_ms": mp["ts"],
+                            "virtual": False,
+                        }
+                        trades_list.insert(0, new_rec)
+                        by_id[mid] = new_rec
+                        history_changed = True
+
+            if history_changed:
+                trades_list.sort(key=lambda x: int(x.get("closed_at_ms", 0) or 0), reverse=True)
+                hist_data["trades"] = trades_list[:2000]
+                tmp_hf = f"{hist_file}.tmp.{os.getpid()}_{_at_threading.get_ident()}_{_at_uuid.uuid4().hex[:8]}"
+                with open(tmp_hf, "w", encoding="utf-8") as wf:
+                    json.dump(hist_data, wf, indent=2)
+                _locked_replace(tmp_hf, hist_file)
+
+        cutoffs = _compute_ist_and_manual_cutoffs()
+        relevant_trades = [
+            t for t in trades_list
+            if isinstance(t, dict) and (bool(t.get("virtual", False)) == (not live_orders_armed))
+        ]
+        for period_name, min_ts in cutoffs.items():
+            by_sym = {}
+            for tr in relevant_trades:
+                closed_ms = int(tr.get("closed_at_ms", 0) or 0)
+                if min_ts > 0 and closed_ms > 0 and closed_ms < min_ts:
+                    continue
+                if min_ts > 0 and closed_ms == 0:
+                    continue
+                raw_s = str(tr.get("symbol", "")).strip()
+                if not raw_s:
+                    continue
+                disp_s = raw_s if live_orders_armed else f"{raw_s} [DRY]"
+                pnl = _safe_float(tr.get("net_pnl", 0.0))
+                rec = by_sym.setdefault(disp_s, {
+                    "symbol": disp_s,
+                    "strategy": "XGBoost MTF" if live_orders_armed else "Dry-Run Sim",
+                    "pnl": 0.0,
+                    "realized_pnl": 0.0,
+                    "wins": 0,
+                    "losses": 0,
+                    "trades": 0,
+                    "win_rate_pct": 0.0,
+                })
+                rec["pnl"] = round(rec["pnl"] + pnl, 4)
+                rec["realized_pnl"] = rec["pnl"]
+                if pnl >= 0.0:
+                    rec["wins"] += 1
+                else:
+                    rec["losses"] += 1
+                rec["trades"] = rec["wins"] + rec["losses"]
+                rec["win_rate_pct"] = round((rec["wins"] / max(rec["trades"], 1)) * 100.0, 1)
+            period_summaries[period_name] = sorted(
+                [v for v in by_sym.values() if v.get("trades", 0) > 0],
+                key=lambda x: x["trades"],
+                reverse=True,
+            )
+        closed_summary = period_summaries["Overall"]
+    except Exception:
+        pass
 
     try:
         import radar_engine
@@ -1296,6 +1378,7 @@ def fetch_live_snapshot(live_dir: str, models_dir: str, api_key: str, api_secret
         l1_learning_event = None
     w_res["layer1_learning_event"] = l1_learning_event
     w_res["closed_summary"] = closed_summary
+    w_res["period_summaries"] = period_summaries
     w_res["signals"] = signals
     w_res["ml_connected"] = ml_connected
     w_res["ml_model_version"] = ml_version
