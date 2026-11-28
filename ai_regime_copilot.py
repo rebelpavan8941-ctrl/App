@@ -4,12 +4,12 @@ import os
 
 import threading as _at_threading
 import uuid as _at_uuid
-_ATOMIC_IO_LOCK = _at_threading.Lock()
+_ATOMIC_IO_LOCK = _at_threading.RLock()
 
 def _locked_replace(src_tmp: str, dst_path: str):
     os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
     with _ATOMIC_IO_LOCK:
-        _locked_replace(src_tmp, dst_path)
+        os.replace(src_tmp, dst_path)
 
 import glob
 import json
