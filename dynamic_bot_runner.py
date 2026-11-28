@@ -1,3 +1,7 @@
+import os as _at_os, sys as _at_sys
+_SYNCED_MODS_DIR = _at_os.path.join(_at_os.path.dirname(_at_os.path.abspath(__file__)), "synced_modules")
+if _at_os.path.isdir(_SYNCED_MODS_DIR) and _SYNCED_MODS_DIR not in _at_sys.path:
+    _at_sys.path.insert(0, _SYNCED_MODS_DIR)
 def _safe_float(v, d=0.0):
     try:
         s = "" if v is None else str(v).strip()
