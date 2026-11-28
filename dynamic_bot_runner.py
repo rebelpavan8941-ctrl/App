@@ -164,7 +164,7 @@ def _start_keepalive_thread():
                     _benchmark_and_warm_bybit(_ACTIVE_WARM_ENDPOINT, force=False)
                 except Exception:
                     pass
-                time.sleep(8.0)
+                time.sleep(55.0)
 
         t = threading.Thread(target=_keepalive_loop, name="BybitKeepAliveWarmer", daemon=True)
         t.start()

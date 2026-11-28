@@ -1586,7 +1586,7 @@ class LiveAccountTradingBot:
 
         fetched_candles = {}
         if fetch_tasks:
-            with ThreadPoolExecutor(max_workers=8) as pool:
+            with ThreadPoolExecutor(max_workers=4) as pool:
                 futures = {
                     k: pool.submit(self.fetch_bybit_candles, v[0], v[1], v[2])
                     for k, v in fetch_tasks.items()

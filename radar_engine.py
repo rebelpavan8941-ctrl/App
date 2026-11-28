@@ -339,7 +339,7 @@ def get_fast_radar_signals(
 
     fetched = {}
     if tasks:
-        with ThreadPoolExecutor(max_workers=8) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             futs = {k: pool.submit(_fetch_candles, v[0], v[1], v[2], is_demo) for k, v in tasks.items()}
             for k, f in futs.items():
                 try:
